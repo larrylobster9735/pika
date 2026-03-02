@@ -1,115 +1,118 @@
+import Perception
 import SwiftUI
 import UserNotifications
 
 @MainActor
 struct ContentView: View {
-    @Bindable var manager: AppManager
+    @Perception.Bindable var manager: AppManager
     @State private var visibleToast: String? = nil
     @State private var navPath: [Screen] = []
     @State private var isCallScreenPresented = false
     @State private var videoPipeline = VideoCallPipeline()
 
     var body: some View {
-        let appState = manager.state
-        let router = appState.router
+        WithPerceptionTracking {
+            let appState = manager.state
+            let router = appState.router
 
-        Group {
-            if manager.isRestoringSession {
-                LoadingView()
-            } else {
-                switch router.defaultScreen {
-                case .login:
-                    LoginView(
-                        state: loginState(from: appState),
-                        onCreateAccount: { manager.dispatch(.createAccount) },
-                        onLogin: { manager.login(nsec: $0) },
-                        onBunkerLogin: { manager.loginWithBunker(bunkerUri: $0) },
-                        onNostrConnectLogin: { manager.loginWithNostrConnect() },
-                        onResetNostrConnectPairing: { manager.resetNostrConnectPairing() }
-                    )
-                default:
-                    NavigationStack(path: $navPath) {
-                        screenView(
-                            manager: manager,
-                            state: appState,
-                            screen: router.defaultScreen,
-                            onOpenCallScreen: {
-                                isCallScreenPresented = true
-                            }
+            Group {
+                if manager.isRestoringSession {
+                    LoadingView()
+                } else {
+                    switch router.defaultScreen {
+                    case .login:
+                        LoginView(
+                            state: loginState(from: appState),
+                            onCreateAccount: { manager.dispatch(.createAccount) },
+                            onLogin: { manager.login(nsec: $0) },
+                            onBunkerLogin: { manager.loginWithBunker(bunkerUri: $0) },
+                            onNostrConnectLogin: { manager.loginWithNostrConnect() },
+                            onResetNostrConnectPairing: { manager.resetNostrConnectPairing() }
                         )
-                        .navigationDestination(for: Screen.self) { screen in
+                    default:
+                        NavigationStack(path: $navPath) {
                             screenView(
                                 manager: manager,
                                 state: appState,
-                                screen: screen,
+                                screen: router.defaultScreen,
                                 onOpenCallScreen: {
                                     isCallScreenPresented = true
                                 }
                             )
+                            .navigationDestination(for: Screen.self) { screen in
+                                screenView(
+                                    manager: manager,
+                                    state: appState,
+                                    screen: screen,
+                                    onOpenCallScreen: {
+                                        isCallScreenPresented = true
+                                    }
+                                )
+                            }
                         }
-                    }
-                    .onAppear {
-                        // Initial mount: seed the path from Rust.
-                        navPath = manager.state.router.screenStack
-                    }
-                    // Drive native navigation from Rust's router, but avoid feeding those changes
-                    // back to Rust as "platform pops".
-                    .onChange(of: manager.state.router.screenStack) { _, new in
-                        navPath = new
-                    }
-                    .onChange(of: navPath) { old, new in
-                        // Ignore Rust-driven syncs.
-                        if new == manager.state.router.screenStack { return }
-                        // Only report platform-initiated pops (e.g. swipe-back).
-                        if new.count < old.count {
-                            manager.dispatch(.updateScreenStack(stack: new))
+                        .onAppear {
+                            // Initial mount: seed the path from Rust.
+                            navPath = manager.state.router.screenStack
                         }
+                        // Drive native navigation from Rust's router, but avoid feeding those changes
+                        // back to Rust as "platform pops".
+                        .onChangeCompat(of: manager.state.router.screenStack) { new in
+                            navPath = new
+                        }
+                        .onChangeCompat(of: navPath, withOld: { old, new in
+                            // Ignore Rust-driven syncs.
+                            if new == manager.state.router.screenStack { return }
+                            // Only report platform-initiated pops (e.g. swipe-back).
+                            if new.count < old.count {
+                                manager.dispatch(.updateScreenStack(stack: new))
+                            }
+                        })
                     }
                 }
             }
-        }
-        .overlay(alignment: .top) {
-            toastOverlay
-        }
-        .animation(.easeInOut(duration: 0.25), value: visibleToast)
-        .onAppear {
-            videoPipeline.configure(core: manager.core)
-            if let call = manager.state.activeCall, call.shouldAutoPresentCallScreen {
-                isCallScreenPresented = true
+            .overlay(alignment: .top) {
+                toastOverlay
             }
-            videoPipeline.syncWithCallState(manager.state.activeCall)
-            visibleToast = manager.state.toast
-        }
-        .onChange(of: manager.state.toast) { _, new in
-            withAnimation { visibleToast = new }
-        }
-        .onChange(of: manager.state.currentChat?.chatId) { _, newChatId in
-            AppDelegate.activeChatId = newChatId
-        }
-        .onChange(of: manager.state.activeCall) { old, new in
-            videoPipeline.syncWithCallState(new)
-
-            guard let new else {
-                isCallScreenPresented = false
-                // Clear call notifications when the call ends/is rejected.
-                if let chatId = old?.chatId {
-                    clearDeliveredNotifications(forChatId: chatId)
+            .animation(.easeInOut(duration: 0.25), value: visibleToast)
+            .onAppear {
+                videoPipeline.configure(core: manager.core)
+                if let call = manager.state.activeCall, call.shouldAutoPresentCallScreen {
+                    isCallScreenPresented = true
                 }
-                return
+                videoPipeline.syncWithCallState(manager.state.activeCall)
+                visibleToast = manager.state.toast
             }
+            .onChangeCompat(of: manager.state.toast) { new in
+                withAnimation { visibleToast = new }
+            }
+            .onChangeCompat(of: manager.state.currentChat?.chatId) { newChatId in
+                AppDelegate.activeChatId = newChatId
+            }
+            .onChangeCompat(of: manager.state.activeCall, withOld: { old, new in
+                videoPipeline.syncWithCallState(new)
 
-            guard new.shouldAutoPresentCallScreen else { return }
-            let callChanged = old?.callId != new.callId
-            let statusChanged = old?.status != new.status
-            if callChanged || statusChanged {
-                isCallScreenPresented = true
-            }
-        }
-        .fullScreenCover(isPresented: $isCallScreenPresented) {
-            callScreenOverlay(state: manager.state)
-                .overlay(alignment: .top) {
-                    toastOverlay
+                guard let new else {
+                    isCallScreenPresented = false
+                    // Clear call notifications when the call ends/is rejected.
+                    if let chatId = old?.chatId {
+                        clearDeliveredNotifications(forChatId: chatId)
+                    }
+                    return
                 }
+
+                guard new.shouldAutoPresentCallScreen else { return }
+                let callChanged = old?.callId != new.callId
+                let statusChanged = old?.status != new.status
+                if callChanged || statusChanged {
+                    isCallScreenPresented = true
+                }
+            })
+            .fullScreenCover(isPresented: $isCallScreenPresented) {
+                callScreenOverlay(state: manager.state)
+                    .overlay(alignment: .top) {
+                        toastOverlay
+                    }
+            }
         }
     }
 

@@ -101,7 +101,7 @@ struct NewGroupChatView: View {
                             }
                         }
                     }
-                    .scrollBounceBehavior(.always)
+                    .modifier(ScrollBounceAlwaysModifier())
                     .frame(maxHeight: 300)
                 } header: {
                     if state.isFetchingFollowList {

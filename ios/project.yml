@@ -2,7 +2,7 @@ name: Pika
 options:
   bundleIdPrefix: org.pikachat
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "16.0"
   createIntermediateGroups: true
 
 settings:
@@ -25,6 +25,9 @@ packages:
   MarkdownUI:
     url: https://github.com/gonzalezreal/swift-markdown-ui
     from: "2.4.0"
+  Perception:
+    url: https://github.com/pointfreeco/swift-perception
+    from: "1.0.0"
 
 targets:
   Pika:
@@ -49,6 +52,7 @@ targets:
       - framework: Frameworks/PikaCore.xcframework
         embed: false
       - package: MarkdownUI
+      - package: Perception
       - target: PikaNotificationService
     postBuildScripts:
       - name: "Stamp build number"

@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Accelerate
+import Perception
 
 struct VoiceMessageView: View {
     let attachment: ChatMediaAttachment
@@ -10,10 +11,12 @@ struct VoiceMessageView: View {
     @State private var player = VoiceMessagePlayer()
 
     var body: some View {
-        if let localPath = attachment.localPath {
-            playerContent(localPath: localPath)
-        } else {
-            downloadRow
+        WithPerceptionTracking {
+            if let localPath = attachment.localPath {
+                playerContent(localPath: localPath)
+            } else {
+                downloadRow
+            }
         }
     }
 
@@ -88,7 +91,7 @@ struct VoiceMessageView: View {
 
 // MARK: - Playback helper
 
-@Observable
+@Perceptible
 @MainActor
 final class VoiceMessagePlayer: NSObject {
     private(set) var isPlaying = false

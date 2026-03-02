@@ -111,7 +111,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
             }
         }
         .onAppear { loader.load(url: url) }
-        .onChange(of: url) { _, newUrl in loader.load(url: newUrl) }
+        .onChangeCompat(of: url) { newUrl in loader.load(url: newUrl) }
     }
 }
 

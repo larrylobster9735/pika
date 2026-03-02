@@ -64,13 +64,7 @@ struct ChatInputBar: View {
                             isInputFocused = true
                         }
                     }
-                    .onKeyPress(.return, phases: .down) { keyPress in
-                        if keyPress.modifiers.contains(.shift) {
-                            return .ignored
-                        }
-                        onSend()
-                        return .handled
-                    }
+                    .modifier(ReturnKeyPressModifier(onSend: onSend))
                     .overlay(alignment: .topLeading) {
                         if messageText.isEmpty {
                             Text("Message")

@@ -1,8 +1,9 @@
 import AVFoundation
 import Accelerate
+import Perception
 import Speech
 
-@Observable
+@Perceptible
 @MainActor
 final class VoiceRecorder {
     private(set) var isRecording = false

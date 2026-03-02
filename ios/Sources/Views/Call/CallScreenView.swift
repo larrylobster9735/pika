@@ -44,7 +44,7 @@ struct CallScreenView: View {
         .onAppear {
             updateProximityMonitoring()
         }
-        .onChange(of: call.shouldEnableProximityLock) { _, _ in
+        .onChangeCompat(of: call.shouldEnableProximityLock) {
             updateProximityMonitoring()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)) { _ in

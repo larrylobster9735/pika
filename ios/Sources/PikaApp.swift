@@ -92,7 +92,7 @@ struct PikaApp: App {
                         manager.dispatch(.openChat(chatId: chatId))
                     }
                 }
-                .onChange(of: scenePhase) { _, phase in
+                .onChangeCompat(of: scenePhase) { phase in
                     if phase == .active {
                         manager.onForeground()
                         if let chatId = AppDelegate.activeChatId {
