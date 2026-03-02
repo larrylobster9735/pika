@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::{Mutex, OnceLock};
 
 use pikahut::testing::scenarios::public::{self, PublicUiPlatform};
 use pikahut::testing::{Requirement, emit_skip, skip_if_missing_env, skip_if_missing_requirements};
@@ -39,9 +40,18 @@ fn skip_if_missing(requirements: &[Requirement], env_vars: &[&'static str]) -> b
     false
 }
 
+fn public_lane_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[test]
 #[ignore = "nondeterministic public relay flow"]
 fn ui_e2e_public_android() -> Result<()> {
+    let _guard = public_lane_lock()
+        .lock()
+        .expect("public selector lock poisoned");
+
     if skip_if_missing(
         &[
             Requirement::PublicNetwork,
@@ -63,6 +73,10 @@ fn ui_e2e_public_android() -> Result<()> {
 #[test]
 #[ignore = "nondeterministic public relay flow"]
 fn ui_e2e_public_ios() -> Result<()> {
+    let _guard = public_lane_lock()
+        .lock()
+        .expect("public selector lock poisoned");
+
     if skip_if_missing(
         &[
             Requirement::PublicNetwork,
@@ -84,6 +98,10 @@ fn ui_e2e_public_ios() -> Result<()> {
 #[test]
 #[ignore = "nondeterministic public relay flow"]
 fn ui_e2e_public_all() -> Result<()> {
+    let _guard = public_lane_lock()
+        .lock()
+        .expect("public selector lock poisoned");
+
     if skip_if_missing(
         &[
             Requirement::PublicNetwork,
@@ -107,6 +125,10 @@ fn ui_e2e_public_all() -> Result<()> {
 #[test]
 #[ignore = "nondeterministic deployed bot flow"]
 fn deployed_bot_call_flow() -> Result<()> {
+    let _guard = public_lane_lock()
+        .lock()
+        .expect("public selector lock poisoned");
+
     if skip_if_missing(&[Requirement::PublicNetwork], &[]) {
         return Ok(());
     }

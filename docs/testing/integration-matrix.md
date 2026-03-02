@@ -5,38 +5,20 @@ read_when:
   - planning test migration work
 ---
 
-# Integration Test Matrix (Library-First Migration)
+# Integration Test Matrix (Phase 1 Library-First Closeout)
 
-This matrix locks the migration scope for the library-first `pikahut::testing` rollout.
+This matrix is the canonical ownership map for integration coverage.
 
-- Canonical execution model: Rust tests and Rust scenario helpers in `crates/pikahut/tests/*` and `crates/pikahut/src/testing/scenarios/*`.
-- Compatibility rule: existing `just` targets and shell scripts remain callable during migration, but they dispatch into the same Rust-owned scenario/test internals.
-- Tier meanings:
-  - `deterministic`: required in pre-merge unless capability is unavailable.
-  - `heavy`: deterministic but expensive; can be path-scoped in pre-merge and always in nightly.
-  - `nondeterministic`: ignored by default; selected in nightly/manual runs.
-  - `manual`: intentionally user-driven tooling, still backed by shared library primitives.
-- Status labels used below:
-  - `complete-selector`: flow has a concrete Rust selector in `crates/pikahut/tests/*`.
-  - `complete-manual-selector`: flow has a manual-tier selector contract in `integration_manual`.
-  - `complete-wrapper`: shell/just entrypoint is retained only as a selector-dispatch wrapper.
+- Canonical execution model: selectors under `crates/pikahut/tests/integration_*.rs` that call `pikahut::testing` APIs and scenario modules.
+- Compatibility rule: `just` and shell wrappers are retained only as thin selector dispatchers.
+- Shared-fixture pooling remains out of scope for this phase (strict fixture mode only).
 
-## As-Built Status Snapshot (2026-03-01)
+## Tier Definitions
 
-| Flow | Status | Selector / Gap owner |
-| --- | --- | --- |
-| CLI smoke local | complete-selector | `integration_deterministic::cli_smoke_local` |
-| CLI smoke media | complete-selector | `integration_deterministic::cli_smoke_media_local` |
-| Local UI E2E (android/ios/desktop) | complete-selector | `integration_deterministic::{ui_e2e_local_android,ui_e2e_local_ios,ui_e2e_local_desktop}` |
-| Interop rust baseline (non-manual) | complete-selector | `integration_deterministic::interop_rust_baseline` |
-| OpenClaw deterministic scenarios | complete-selector | `integration_deterministic::openclaw_scenario_*` |
-| OpenClaw gateway E2E | complete-selector | `integration_openclaw::openclaw_gateway_e2e` |
-| Public UI E2E (all/ios/android) | complete-selector | `integration_public::ui_e2e_public_*` |
-| Deployed-bot call flow | complete-selector | `integration_public::deployed_bot_call_flow` |
-| Primal nightly smoke | complete-selector | `integration_primal::primal_nostrconnect_smoke` |
-| Interop manual helper | complete-manual-selector | `integration_manual::manual_interop_rust_runbook_contract` |
-| Primal lab manual tools | complete-manual-selector | `integration_manual::manual_primal_lab_runbook_contract` |
-| `tools/*` and `pikachat-openclaw/scripts/*` wrappers | complete-wrapper | wrappers dispatch into selectors/scenario library, not independent lanes |
+- `deterministic`: required in pre-merge lanes unless capability-gated skip applies.
+- `heavy`: deterministic but expensive; usually path-scoped or nightly.
+- `nondeterministic`: public/deployed infrastructure dependent, `#[ignore]`, lane-selected.
+- `manual`: runbook-contract selectors and developer-driven tooling.
 
 ## Capability Keys
 
@@ -45,62 +27,75 @@ This matrix locks the migration scope for the library-first `pikahut::testing` r
 - `android`: Android SDK + emulator/AVD required.
 - `openclaw-repo`: `openclaw/openclaw` checkout available.
 - `interop-rust-repo`: `marmot-interop-lab-rust` checkout available.
-- `primal-repo`: local/CI Primal iOS repo checkout available.
+- `primal-repo`: local Primal iOS repo available (manual lab tooling only).
 - `secret-pika-test-nsec`: `PIKA_TEST_NSEC` available.
 - `public-network`: internet/public relay reachability available.
 
 ## Canonical Mapping
 
-| Current entrypoint | Current invocation | Target Rust test/selector | Tier | Owner lane | Required capabilities | Notes |
+| Entrypoint | Invocation contract | Selector | Tier | Owner lane | Required capabilities | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `just cli-smoke` | `cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture` | `cargo test -p pikahut --test integration_deterministic cli_smoke_local` | deterministic | pre-merge-pikachat | none | Local relay fixture, no external services. |
-| `just cli-smoke-media` | `cargo test -p pikahut --test integration_deterministic cli_smoke_media_local -- --ignored --nocapture` | `cargo test -p pikahut --test integration_deterministic cli_smoke_media_local` | nondeterministic | manual | public-network | Uses Blossom upload path and public network. |
-| `just android-ui-e2e-local` | `cargo run -q -p pikahut -- test ui-e2e-local --platform android` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_android -- --ignored` | heavy | nightly-pika-ui-android and manual | android | Skip with explicit reason when Android tools/AVD are missing. |
-| `just ios-ui-e2e-local` | `cargo run -q -p pikahut -- test ui-e2e-local --platform ios` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_ios -- --ignored` | heavy | nightly macOS/manual | host-macos, xcode | Skip with explicit reason on non-macOS/no simulator. |
-| `just desktop-e2e-local` | `cargo run -q -p pikahut -- test ui-e2e-local --platform desktop` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop` | deterministic | pre-merge-pikachat | none | Uses local relay+bot fixture. |
-| `just interop-rust-baseline` | `cargo run -q -p pikahut -- test interop-rust-baseline` | `cargo test -p pikahut --test integration_deterministic interop_rust_baseline -- --ignored` | heavy | nightly/manual | interop-rust-repo | Skip with explicit reason if external repo missing. |
-| `just interop-rust-manual` | `cargo run -q -p pikahut -- test interop-rust-baseline --manual` | `cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored` | manual | manual only | interop-rust-repo, android or xcode | Manual-mode helper remains; selector codifies runbook contract and gating. |
-| `just openclaw-pikachat-deterministic` (invite/chat) | `pikahut test scenario invite-and-chat` | `cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat` | deterministic | pre-merge-pikachat | none | Rust scenario executed in local deterministic fixture. |
-| `just openclaw-pikachat-deterministic` (rust bot) | `pikahut test scenario invite-and-chat-rust-bot` | `cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_rust_bot` | deterministic | pre-merge-pikachat | none | Same scenario module as CLI wrapper. |
-| `just openclaw-pikachat-deterministic` (daemon) | `pikahut test scenario invite-and-chat-daemon` | `cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon` | deterministic | pre-merge-pikachat | none | Same scenario module as CLI wrapper. |
-| `just openclaw-pikachat-deterministic` (audio) | `pikahut test scenario audio-echo` | `cargo test -p pikahut --test integration_deterministic openclaw_scenario_audio_echo` | deterministic | pre-merge-pikachat | none | Deterministic local audio echo contract. |
-| `just pre-merge-pikachat` (rebase regression: invalid event) | selector-only | `cargo test -p pikahut --test integration_deterministic post_rebase_invalid_event_rejection_boundary -- --ignored` | deterministic | pre-merge-pikachat | none | Validates integration boundary rejects invalid relay-auth invite payloads via core regression test wiring. |
-| `just pre-merge-pikachat` (rebase regression: logout/session) | selector-only | `cargo test -p pikahut --test integration_deterministic post_rebase_logout_session_convergence_boundary -- --ignored` | deterministic | pre-merge-pikachat | none | Validates logout/session convergence behavior via deterministic selector wiring. |
-| `just openclaw-pikachat-e2e` | `pikahut test openclaw-e2e` | `cargo test -p pikahut --test integration_openclaw openclaw_gateway_e2e -- --ignored` | heavy | pre-merge path-scoped + nightly-pikachat | openclaw-repo, public-network | Preserve OpenClaw config/log/state artifacts on failure. |
-| `just nightly-pikachat` | `just openclaw-pikachat-e2e` | `cargo test -p pikahut --test integration_openclaw openclaw_gateway_e2e -- --ignored --nocapture` | heavy | nightly-pikachat | openclaw-repo, public-network | Nightly canonical selector. |
-| `just e2e-public-relays` | `./tools/ui-e2e-public --platform all` | `cargo test -p pikahut --test integration_public ui_e2e_public_all -- --ignored` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, android, host-macos, xcode | Unified Rust orchestration for public UI E2E. |
-| `just ios-ui-e2e` | `./tools/ui-e2e-public --platform ios` | `cargo test -p pikahut --test integration_public ui_e2e_public_ios -- --ignored` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, host-macos, xcode | iOS-only public relay path. |
-| `just android-ui-e2e` | `./tools/ui-e2e-public --platform android` | `cargo test -p pikahut --test integration_public ui_e2e_public_android -- --ignored` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, android | Android-only public relay path. |
-| `just e2e-deployed-bot` | `cargo test -p pika_core --test e2e_calls call_deployed_bot -- --ignored --nocapture` | `cargo test -p pikahut --test integration_public deployed_bot_call_flow -- --ignored` | nondeterministic | nightly-pika-e2e/manual | secret-pika-test-nsec, public-network | Keep legacy `pika_core` test callable during migration. |
-| `just nightly-primal-ios-interop` | `./tools/primal-ios-interop-nightly` | `cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored` | heavy | nightly-primal-ios-interop | host-macos, xcode, primal-repo | Single confidence smoke: URL handoff + marker-file contract. |
-| `just primal-ios-lab` | `./tools/primal-ios-interop-lab run` | `cargo test -p pikahut --test integration_manual manual_primal_lab_runbook_contract -- --ignored` | manual | manual only | host-macos, xcode, primal-repo | Manual lab remains; selector codifies runbook contract and prerequisites. |
-| `just primal-ios-lab-patch-primal` | `./tools/primal-ios-interop-lab patch-primal` | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, primal-repo | Kept out of CI by design. |
-| `just primal-ios-lab-seed-capture` | `./tools/primal-ios-interop-lab seed-capture` | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Explicitly manual-only; not part of nightly CI. |
-| `just primal-ios-lab-seed-reset` | `./tools/primal-ios-interop-lab seed-reset` | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Explicitly manual-only; not part of nightly CI. |
-| `just primal-ios-lab-dump-debug` | `./tools/primal-ios-interop-lab dump-debug` | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Debug support retained after CI simplification. |
-| `pikachat-openclaw/scripts/phase1.sh` | wrapper to `run-scenario.sh invite-and-chat` | `integration_deterministic::openclaw_scenario_invite_and_chat` | deterministic | pre-merge-pikachat | none | Script remains compatibility wrapper only. |
-| `pikachat-openclaw/scripts/phase2.sh` | wrapper to `run-scenario.sh invite-and-chat-rust-bot` | `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot` | deterministic | pre-merge-pikachat | none | Script remains compatibility wrapper only. |
-| `pikachat-openclaw/scripts/phase3.sh` | wrapper to `run-scenario.sh invite-and-chat-daemon` | `integration_deterministic::openclaw_scenario_invite_and_chat_daemon` | deterministic | pre-merge-pikachat | none | Script remains compatibility wrapper only. |
-| `pikachat-openclaw/scripts/phase3_audio.sh` | wrapper to `pikahut test scenario audio-echo` | `integration_deterministic::openclaw_scenario_audio_echo` | deterministic | pre-merge-pikachat | none | Script remains compatibility wrapper only. |
-| `pikachat-openclaw/scripts/phase4_openclaw_pikachat.sh` | wrapper to `run-openclaw-e2e.sh` | `integration_openclaw::openclaw_gateway_e2e` | heavy | pre-merge path-scoped + nightly-pikachat | openclaw-repo, public-network | Script remains compatibility wrapper only. |
-| `pikachat-openclaw/scripts/run-scenario.sh` | generic wrapper to `pikahut test scenario <name>` | `testing::scenarios::openclaw::*` | deterministic | pre-merge-pikachat | varies by scenario | Thin wrapper target only. |
-| `pikachat-openclaw/scripts/run-openclaw-e2e.sh` | generic wrapper to `pikahut test openclaw-e2e` | `testing::scenarios::openclaw::gateway_e2e` | heavy | pre-merge path-scoped + nightly-pikachat | openclaw-repo, public-network | Thin wrapper target only. |
+| `just cli-smoke` | `cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture` | `integration_deterministic::cli_smoke_local` | deterministic | pre-merge-pikachat | none | Local relay fixture. |
+| `just cli-smoke-media` | `cargo test -p pikahut --test integration_deterministic cli_smoke_media_local -- --ignored --nocapture` | `integration_deterministic::cli_smoke_media_local` | nondeterministic | manual/nightly | public-network | Media upload/download path. |
+| `just android-ui-e2e-local` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_android -- --ignored --nocapture` | `integration_deterministic::ui_e2e_local_android` | heavy | nightly-pika-ui-android/manual | android | Capability-gated skip when Android tooling is absent. |
+| `just ios-ui-e2e-local` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_ios -- --ignored --nocapture` | `integration_deterministic::ui_e2e_local_ios` | heavy | manual | host-macos, xcode | Capability-gated skip on non-macOS or missing Xcode. |
+| `just desktop-e2e-local` | `cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture` | `integration_deterministic::ui_e2e_local_desktop` | deterministic | pre-merge-pikachat/manual | none | Local deterministic desktop UI contract. |
+| `just interop-rust-baseline` | `cargo test -p pikahut --test integration_deterministic interop_rust_baseline -- --ignored --nocapture` | `integration_deterministic::interop_rust_baseline` | heavy | nightly/manual | interop-rust-repo | Capability-gated skip when interop repo is missing; fails fast on workspace/harness MDK revision skew. |
+| `just interop-rust-manual` | `cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored --nocapture` | `integration_manual::manual_interop_rust_runbook_contract` | manual | manual only | interop-rust-repo | Manual runbook contract selector. |
+| `just openclaw-pikachat-deterministic` (invite/chat) | selector command | `integration_deterministic::openclaw_scenario_invite_and_chat` | deterministic | pre-merge-pikachat | none | Rust scenario module owns orchestration. |
+| `just openclaw-pikachat-deterministic` (rust bot) | selector command | `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot` | deterministic | pre-merge-pikachat | none | Rust scenario module owns orchestration. |
+| `just openclaw-pikachat-deterministic` (daemon) | selector command | `integration_deterministic::openclaw_scenario_invite_and_chat_daemon` | deterministic | pre-merge-pikachat | none | Rust scenario module owns orchestration. |
+| `just openclaw-pikachat-deterministic` (audio) | selector command | `integration_deterministic::openclaw_scenario_audio_echo` | deterministic | pre-merge-pikachat | none | Deterministic local audio echo contract. |
+| `just pre-merge-pikachat` rebase boundary checks | selector command | `integration_deterministic::post_rebase_invalid_event_rejection_boundary`, `integration_deterministic::post_rebase_logout_session_convergence_boundary` | deterministic | pre-merge-pikachat | none | Regression boundaries pinned to deterministic lane. |
+| `just openclaw-pikachat-e2e` | `cargo test -p pikahut --test integration_openclaw openclaw_gateway_e2e -- --ignored --nocapture` | `integration_openclaw::openclaw_gateway_e2e` | heavy | pre-merge path-scoped + nightly-pikachat | openclaw-repo, public-network | Preserves OpenClaw logs/config artifacts on failure. |
+| `just nightly-pikachat` | `just openclaw-pikachat-e2e` | `integration_openclaw::openclaw_gateway_e2e` | heavy | nightly-pikachat | openclaw-repo, public-network | Canonical nightly OpenClaw selector. |
+| `just e2e-public-relays` | `cargo test -p pikahut --test integration_public ui_e2e_public_all -- --ignored --nocapture` | `integration_public::ui_e2e_public_all` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, android, host-macos, xcode | Unified public UI flow. |
+| `just ios-ui-e2e` | `cargo test -p pikahut --test integration_public ui_e2e_public_ios -- --ignored --nocapture` | `integration_public::ui_e2e_public_ios` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, host-macos, xcode | iOS-only public relay path. |
+| `just android-ui-e2e` | `cargo test -p pikahut --test integration_public ui_e2e_public_android -- --ignored --nocapture` | `integration_public::ui_e2e_public_android` | nondeterministic | nightly/manual | secret-pika-test-nsec, public-network, android | Android-only public relay path. |
+| `just e2e-deployed-bot` | `cargo test -p pikahut --test integration_public deployed_bot_call_flow -- --ignored --nocapture` | `integration_public::deployed_bot_call_flow` | nondeterministic | nightly-pika-e2e/manual | secret-pika-test-nsec, public-network | Selector-owned lane contract implemented directly via `pikahut::testing` public scenario code. |
+| `just nightly-pika-e2e` | `integration_public` aggregate + targeted call-path selectors | all selectors in `integration_public`, `integration_deterministic::call_over_local_moq_relay_boundary`, `integration_deterministic::call_with_pikachat_daemon_boundary` | nondeterministic + heavy | nightly-pika-e2e | selector-specific capabilities | Nightly public coverage plus explicit call-path regression boundaries from `pika_core::e2e_calls`. |
+| `just nightly-primal-ios-interop` | `cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture` | `integration_primal::primal_nostrconnect_smoke` | heavy | nightly-primal-ios-interop | host-macos, xcode, public-network | Rust scenario clones into an isolated checkout under scenario state and validates marker/log artifacts without mutating a default local repo. |
+| `just primal-ios-lab` | manual tooling + selector contract | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode, primal-repo | Manual lab remains intentionally non-CI. |
+| `just primal-ios-lab-patch-primal` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, primal-repo | Manual-only helper command. |
+| `just primal-ios-lab-seed-capture` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Manual-only helper command. |
+| `just primal-ios-lab-seed-reset` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Manual-only helper command. |
+| `just primal-ios-lab-dump-debug` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual only | host-macos, xcode | Manual-only helper command. |
+| `tools/cli-smoke` | wrapper (default) | `integration_deterministic::cli_smoke_local` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `tools/cli-smoke --with-media` | wrapper (media) | `integration_deterministic::cli_smoke_media_local` | nondeterministic | compatibility wrapper | public-network | Thin selector launcher. |
+| `tools/ui-e2e-local --platform ios` | wrapper | `integration_deterministic::ui_e2e_local_ios` | heavy | compatibility wrapper | host-macos, xcode | Thin selector launcher. |
+| `tools/ui-e2e-local --platform android` | wrapper | `integration_deterministic::ui_e2e_local_android` | heavy | compatibility wrapper | android | Thin selector launcher. |
+| `tools/ui-e2e-local --platform desktop` | wrapper | `integration_deterministic::ui_e2e_local_desktop` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `tools/ui-e2e-public --platform all` | wrapper | `integration_public::ui_e2e_public_all` | nondeterministic | compatibility wrapper | selector-specific capabilities | Thin selector launcher. |
+| `tools/ui-e2e-public --platform ios` | wrapper | `integration_public::ui_e2e_public_ios` | nondeterministic | compatibility wrapper | selector-specific capabilities | Thin selector launcher. |
+| `tools/ui-e2e-public --platform android` | wrapper | `integration_public::ui_e2e_public_android` | nondeterministic | compatibility wrapper | selector-specific capabilities | Thin selector launcher. |
+| `tools/interop-rust-baseline` | wrapper (default) | `integration_deterministic::interop_rust_baseline` | heavy | compatibility wrapper | interop-rust-repo | Thin selector launcher. |
+| `tools/interop-rust-baseline --manual` | wrapper (manual) | `integration_manual::manual_interop_rust_runbook_contract` | manual | compatibility wrapper | interop-rust-repo | Thin selector launcher. |
+| `tools/primal-ios-interop-nightly` | wrapper | `integration_primal::primal_nostrconnect_smoke` | heavy | compatibility wrapper | selector-specific capabilities | Thin selector launcher. |
+| `pikachat-openclaw/scripts/phase1.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat` | deterministic | compatibility wrapper | none | Thin alias to selector wrapper. |
+| `pikachat-openclaw/scripts/phase2.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot` | deterministic | compatibility wrapper | none | Thin alias to selector wrapper. |
+| `pikachat-openclaw/scripts/phase3.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_daemon` | deterministic | compatibility wrapper | none | Thin alias to selector wrapper. |
+| `pikachat-openclaw/scripts/phase3_audio.sh` | wrapper | `integration_deterministic::openclaw_scenario_audio_echo` | deterministic | compatibility wrapper | none | Thin alias to selector wrapper. |
+| `pikachat-openclaw/scripts/phase4_openclaw_pikachat.sh` | wrapper | `integration_openclaw::openclaw_gateway_e2e` | heavy | compatibility wrapper | openclaw-repo, public-network | Thin alias to selector wrapper. |
+| `pikachat-openclaw/scripts/run-scenario.sh invite-and-chat` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `pikachat-openclaw/scripts/run-scenario.sh invite-and-chat-rust-bot` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `pikachat-openclaw/scripts/run-scenario.sh invite-and-chat-daemon` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_daemon` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `pikachat-openclaw/scripts/run-scenario.sh audio-echo` | wrapper | `integration_deterministic::openclaw_scenario_audio_echo` | deterministic | compatibility wrapper | none | Thin selector launcher. |
+| `pikachat-openclaw/scripts/run-openclaw-e2e.sh` | wrapper | `integration_openclaw::openclaw_gateway_e2e` | heavy | compatibility wrapper | openclaw-repo, public-network | Thin selector launcher. |
 
-## Workflow Lane Targeting (Current Contract)
+## Lane Contract Summary
 
-| Lane | Canonical selectors |
+| Lane | Selector contract |
 | --- | --- |
-| `pre-merge-pikachat` | deterministic `integration_deterministic` selectors; optional path-scoped `integration_openclaw::openclaw_gateway_e2e` when OpenClaw/plugin paths changed |
-| `pre-merge` fixture lane | `cargo test -p pikahut` plus harness unit tests that enforce capability/skip behavior |
+| `pre-merge-pikachat` | deterministic selectors + deterministic OpenClaw scenario selectors |
+| `check-pikachat-openclaw-e2e` (path-scoped) | `integration_openclaw::openclaw_gateway_e2e` |
 | `nightly-pikachat` | `integration_openclaw::openclaw_gateway_e2e` |
-| `nightly-pika-e2e` | ignored heavy selectors including public/deployed call flows |
+| `nightly-pika-e2e` | full `integration_public` selector target + call-path boundary selectors (`call_over_local_moq_relay_boundary`, `call_with_pikachat_daemon_boundary`) |
 | `nightly-pika-ui-android` | `integration_deterministic::ui_e2e_local_android` |
-| `nightly-primal-ios-interop` | `integration_primal::primal_nostrconnect_smoke` only |
-| `integration_manual` lane | `integration_manual::manual_interop_rust_runbook_contract`, `integration_manual::manual_primal_lab_runbook_contract` (manual-only recipe) |
+| `nightly-primal-ios-interop` | `integration_primal::primal_nostrconnect_smoke` |
+| `integration-manual` | two `integration_manual` runbook selectors |
 
 ## Migration Notes
 
-- Until the migration is complete, legacy just/script entrypoints remain as compatibility shims.
-- Capability-dependent tests must skip with explicit reason text instead of failing by default.
-- Failure artifact expectations (logs, config snapshots, emitted URLs) are required for heavy and nondeterministic lanes.
-- Wrapper retention/removal policy is documented in `docs/testing/wrapper-deprecation-policy.md`.
+- Phase-1 closeout keeps compatibility wrappers but removes wrapper-owned orchestration.
+- Guardrails enforce selector/docs/lane alignment and prevent regression to legacy CLI harness paths.
+- Shared fixture pooling optimization is explicitly deferred to follow-up work.

@@ -226,3 +226,57 @@ fn post_rebase_logout_session_convergence_boundary() -> Result<()> {
     context.mark_success();
     Ok(())
 }
+
+#[test]
+#[ignore = "nightly call-path regression selector"]
+fn call_over_local_moq_relay_boundary() -> Result<()> {
+    let mut context = TestContext::builder("regression-call-over-local-moq-relay")
+        .artifact_policy(ArtifactPolicy::PreserveOnFailure)
+        .build()?;
+    let runner = CommandRunner::new(&context);
+    runner.run(
+        &CommandSpec::cargo()
+            .cwd(workspace_root())
+            .args([
+                "test",
+                "-p",
+                "pika_core",
+                "--test",
+                "e2e_calls",
+                "call_over_local_moq_relay",
+                "--",
+                "--ignored",
+                "--nocapture",
+            ])
+            .capture_name("regression-call-over-local-moq-relay"),
+    )?;
+    context.mark_success();
+    Ok(())
+}
+
+#[test]
+#[ignore = "nightly call-path regression selector"]
+fn call_with_pikachat_daemon_boundary() -> Result<()> {
+    let mut context = TestContext::builder("regression-call-with-pikachat-daemon")
+        .artifact_policy(ArtifactPolicy::PreserveOnFailure)
+        .build()?;
+    let runner = CommandRunner::new(&context);
+    runner.run(
+        &CommandSpec::cargo()
+            .cwd(workspace_root())
+            .args([
+                "test",
+                "-p",
+                "pika_core",
+                "--test",
+                "e2e_calls",
+                "call_with_pikachat_daemon",
+                "--",
+                "--ignored",
+                "--nocapture",
+            ])
+            .capture_name("regression-call-with-pikachat-daemon"),
+    )?;
+    context.mark_success();
+    Ok(())
+}

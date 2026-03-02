@@ -5,16 +5,20 @@ read_when:
   - debugging CI selector failures
 ---
 
-# CI Selector Mapping (Library-First Integration)
+# CI Selector Mapping (Phase 1 Library-First Closeout)
 
-This document defines the exact Rust test selectors used by CI lanes after migrating to `pikahut::testing`.
+This document defines the selector contract for integration coverage in CI and nightly lanes.
+
+- Canonical rule: lanes invoke `cargo test -p pikahut --test integration_* ...`.
+- Compatibility wrappers (`tools/*`, `pikachat-openclaw/scripts/*`) are allowed for DX only, but lane ownership remains selector-driven.
+- Legacy CLI harness entrypoints (`cargo run -q -p pikahut -- test ...` / `pikahut test ...`) are out of contract.
 
 ## Pre-Merge Lanes
 
-| Lane / recipe | Rust selectors |
+| Lane / recipe | Canonical selectors |
 | --- | --- |
-| `pre-merge-pikachat` | `integration_deterministic::cli_smoke_local` + `integration_deterministic::post_rebase_invalid_event_rejection_boundary` + `integration_deterministic::post_rebase_logout_session_convergence_boundary` + `openclaw-pikachat-deterministic` selectors |
-| `openclaw-pikachat-deterministic` | `integration_deterministic::openclaw_scenario_invite_and_chat`, `openclaw_scenario_invite_and_chat_rust_bot`, `openclaw_scenario_invite_and_chat_daemon`, `openclaw_scenario_audio_echo` |
+| `pre-merge-pikachat` | `integration_deterministic::cli_smoke_local`, `integration_deterministic::post_rebase_invalid_event_rejection_boundary`, `integration_deterministic::post_rebase_logout_session_convergence_boundary`, and all `openclaw-pikachat-deterministic` selectors |
+| `openclaw-pikachat-deterministic` | `integration_deterministic::openclaw_scenario_invite_and_chat`, `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot`, `integration_deterministic::openclaw_scenario_invite_and_chat_daemon`, `integration_deterministic::openclaw_scenario_audio_echo` |
 | Path-scoped heavy OpenClaw lane (`check-pikachat-openclaw-e2e`) | `integration_openclaw::openclaw_gateway_e2e` |
 | `android-ui-e2e-local` | `integration_deterministic::ui_e2e_local_android` |
 | `ios-ui-e2e-local` | `integration_deterministic::ui_e2e_local_ios` |
@@ -23,31 +27,22 @@ This document defines the exact Rust test selectors used by CI lanes after migra
 
 ## Nightly Lanes
 
-| Lane / recipe | Rust selectors |
+| Lane / recipe | Canonical selectors |
 | --- | --- |
-| `nightly-pika-e2e` | `cargo test -p pika_core --tests -- --ignored --nocapture` + `cargo test -p pikahut --test integration_public -- --ignored --nocapture` |
+| `nightly-pika-e2e` | `integration_public::ui_e2e_public_android`, `integration_public::ui_e2e_public_ios`, `integration_public::ui_e2e_public_all`, `integration_public::deployed_bot_call_flow`, `integration_deterministic::call_over_local_moq_relay_boundary`, `integration_deterministic::call_with_pikachat_daemon_boundary` |
 | `nightly-pikachat` | `integration_openclaw::openclaw_gateway_e2e` |
 | `nightly-pika-ui-android` | `integration_deterministic::ui_e2e_local_android` |
 | `nightly-primal-ios-interop` | `integration_primal::primal_nostrconnect_smoke` |
 
-## Manual-Only Selectors
+## Manual-Only Lane
 
-| Lane / recipe | Rust selectors |
+| Lane / recipe | Canonical selectors |
 | --- | --- |
 | `integration-manual` | `integration_manual::manual_interop_rust_runbook_contract`, `integration_manual::manual_primal_lab_runbook_contract` |
 
-## Nondeterministic/Manual Selectors
-
-| Flow | Selector |
-| --- | --- |
-| Public UI E2E (all) | `integration_public::ui_e2e_public_all` |
-| Public UI E2E (iOS) | `integration_public::ui_e2e_public_ios` |
-| Public UI E2E (Android) | `integration_public::ui_e2e_public_android` |
-| Deployed bot call flow | `integration_public::deployed_bot_call_flow` |
-
 ## Policy Notes
 
-- Deterministic tests are preferred for pre-merge gates.
-- Heavy and nondeterministic selectors are `#[ignore]` and lane-selected explicitly.
-- Capability-dependent selectors must skip with explicit reason text using `pikahut::testing::Capabilities`.
-- Legacy scripts remain compatibility wrappers only; selector execution is now the CI contract.
+- Deterministic selectors are preferred for pre-merge gates.
+- Heavy and nondeterministic selectors remain `#[ignore]` and must be lane-selected explicitly.
+- Capability-dependent selectors must skip with explicit reason text via `pikahut::testing` requirement helpers.
+- Manual contracts are selectors in `integration_manual`; interactive/manual tooling remains out-of-band from CI lanes.

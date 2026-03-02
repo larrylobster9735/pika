@@ -311,15 +311,15 @@ nightly:
     just nightly-pikachat
     @echo "nightly complete"
 
-# Nightly E2E (Rust): run all `#[ignore]` tests (local call tests + deployed bot call).
+# Nightly E2E (Rust): public selectors + focused call-path regression boundaries.
 nightly-pika-e2e:
     set -euo pipefail; \
-    if [ -z "${PIKA_TEST_NSEC:-}" ]; then \
-      echo "note: PIKA_TEST_NSEC not set; call_deployed_bot will skip"; \
+    if [ -z "${PIKA_UI_E2E_NSEC:-}" ] && [ -z "${PIKA_TEST_NSEC:-}" ]; then \
+      echo "note: neither PIKA_UI_E2E_NSEC nor PIKA_TEST_NSEC is set in the shell; deployed-bot selector may still run if .env defaults provide credentials"; \
     fi; \
-    cargo build -p pikachat; \
-    cargo test -p pika_core --tests -- --ignored --nocapture; \
-    cargo test -p pikahut --test integration_public -- --ignored --nocapture
+    cargo test -p pikahut --test integration_public -- --ignored --nocapture; \
+    cargo test -p pikahut --test integration_deterministic call_over_local_moq_relay_boundary -- --ignored --nocapture; \
+    cargo test -p pikahut --test integration_deterministic call_with_pikachat_daemon_boundary -- --ignored --nocapture
 
 # Nightly lane: full OpenClaw integration E2E (gateway + real sidecar wiring).
 nightly-pikachat:
@@ -738,7 +738,7 @@ interop-rust-baseline:
 
 # Interactive interop test (manual send/receive with local bot).
 interop-rust-manual:
-    cargo run -q -p pikahut -- test interop-rust-baseline --manual
+    cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored --nocapture
 
 # ── pika-relay (local Nostr relay + Blossom server) ─────────────────────────
 

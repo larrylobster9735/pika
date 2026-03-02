@@ -12,6 +12,7 @@ pub mod fixture;
 pub mod scenarios;
 pub mod selector;
 pub mod tenant;
+pub(crate) mod util;
 
 pub use capabilities::{Capabilities, RequireOutcome, Requirement, SkipReason};
 pub use command::{CommandOutput, CommandRunner, CommandSpec};

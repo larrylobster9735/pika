@@ -4,8 +4,35 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-if [ "$#" -eq 0 ]; then
-  exec cargo test -p pikahut --test integration_deterministic interop_rust_baseline -- --ignored --nocapture
+manual=0
+
+usage() {
+  cat >&2 <<'USAGE'
+usage:
+  ./tools/interop-rust-baseline [--manual]
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manual)
+      manual=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unsupported argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$manual" -eq 1 ]; then
+  exec cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored --nocapture
 fi
 
-exec cargo run -q -p pikahut -- test interop-rust-baseline "$@"
+exec cargo test -p pikahut --test integration_deterministic interop_rust_baseline -- --ignored --nocapture

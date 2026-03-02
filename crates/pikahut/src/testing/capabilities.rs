@@ -3,6 +3,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::util::{
+    command_exists, default_code_checkout_dir, env_truthy, env_var_present, non_empty_env_path,
+    resolve_openclaw_dir_default,
+};
+
 /// Environment capability snapshot used for test gating.
 ///
 /// # Examples
@@ -252,19 +257,6 @@ impl Capabilities {
     }
 }
 
-fn command_exists(binary: &str) -> bool {
-    let candidate = Path::new(binary);
-    if candidate.is_absolute() || binary.contains('/') {
-        return candidate.is_file();
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(binary))
-        .any(|path| path.is_file())
-}
-
 fn android_avd_exists(avd_name: &str) -> bool {
     if !command_exists("emulator") {
         return false;
@@ -329,62 +321,24 @@ fn extract_udid_from_line(line: &str) -> Option<String> {
 }
 
 fn resolve_openclaw_dir(workspace_root: &Path) -> PathBuf {
-    if let Ok(from_env) = std::env::var("OPENCLAW_DIR")
-        && !from_env.trim().is_empty()
-    {
-        return PathBuf::from(from_env);
+    if let Some(path) = non_empty_env_path("OPENCLAW_DIR") {
+        return path;
     }
-
-    let direct = workspace_root.join("openclaw");
-    if direct.join("package.json").is_file() {
-        return direct;
-    }
-
-    workspace_root
-        .parent()
-        .map(|parent| parent.join("openclaw"))
-        .unwrap_or(direct)
+    resolve_openclaw_dir_default(workspace_root)
 }
 
 fn resolve_interop_rust_dir() -> PathBuf {
-    if let Ok(from_env) = std::env::var("PIKACHAT_INTEROP_RUST_DIR")
-        && !from_env.trim().is_empty()
-    {
-        return PathBuf::from(from_env);
+    if let Some(path) = non_empty_env_path("PIKACHAT_INTEROP_RUST_DIR") {
+        return path;
     }
-
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join("code/marmot-interop-lab-rust")
+    default_code_checkout_dir("marmot-interop-lab-rust")
 }
 
 fn resolve_primal_repo_dir() -> PathBuf {
-    if let Ok(from_env) = std::env::var("PIKA_PRIMAL_SRC_DIR")
-        && !from_env.trim().is_empty()
-    {
-        return PathBuf::from(from_env);
+    if let Some(path) = non_empty_env_path("PIKA_PRIMAL_SRC_DIR") {
+        return path;
     }
-
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join("code/primal-ios-app")
-}
-
-fn env_var_present(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    default_code_checkout_dir("primal-ios-app")
 }
 
 #[cfg(test)]

@@ -6,13 +6,14 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{self, ProfileName};
 use crate::health;
+use crate::testing::util::default_code_checkout_dir;
 use crate::testing::{
     ArtifactPolicy, CommandRunner, CommandSpec, FixtureSpec, TenantNamespace, TestContext,
     start_fixture,
 };
 
 use super::artifacts::{self, CommandOutcomeRecord};
-use super::common::{check_mdk_skew, dirs_home, extract_field, parse_url_port};
+use super::common::{check_mdk_skew, extract_field, parse_url_port};
 use super::types::{InteropRustBaselineRequest, ScenarioRunOutput};
 
 fn build_context(state_dir: Option<PathBuf>, keep: bool) -> Result<TestContext> {
@@ -39,11 +40,8 @@ pub async fn run_interop_rust_baseline(
             .ok()
             .map(PathBuf::from)
     });
-    let rust_interop_dir = rust_interop_dir.unwrap_or_else(|| {
-        dirs_home()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join("code/marmot-interop-lab-rust")
-    });
+    let rust_interop_dir =
+        rust_interop_dir.unwrap_or_else(|| default_code_checkout_dir("marmot-interop-lab-rust"));
 
     if !rust_interop_dir.is_dir() {
         bail!(
@@ -52,7 +50,7 @@ pub async fn run_interop_rust_baseline(
         );
     }
 
-    check_mdk_skew(&rust_interop_dir)?;
+    check_mdk_skew(&root, &rust_interop_dir)?;
 
     let explicit_state = args.state_dir.or_else(|| {
         std::env::var("PIKA_INTEROP_STATE_DIR")

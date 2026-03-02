@@ -7,7 +7,7 @@ read_when:
 
 # Library-First Migration Checklist
 
-Status for `todos/pikahut-library-first-integration-tests.md`.
+Status for Phase-1 closeout (`todos/pikahut-phase1-library-migration-closeout.md`).
 
 ## Completed Selector-Backed Coverage
 
@@ -28,5 +28,6 @@ Status for `todos/pikahut-library-first-integration-tests.md`.
 
 ## Notes
 
+- Canonical closeout docs live in `docs/testing/phase1-library-migration-closeout.md`, `docs/testing/integration-matrix.md`, and `docs/testing/ci-selectors.md`.
 - This checklist intentionally distinguishes selector-backed coverage from manual-only gaps so CI/docs do not hide unfinished migration work.
 - Manual QA sign-off remains the final gate and cannot be auto-completed in unattended mode.

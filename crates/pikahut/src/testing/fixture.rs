@@ -219,7 +219,14 @@ impl Drop for FixtureHandle {
             return;
         }
 
-        let _ = runtime_fixture::down_sync(&self.state_dir);
+        let state_dir = self.state_dir.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(handle.spawn_blocking(move || {
+                let _ = runtime_fixture::down_sync(&state_dir);
+            }));
+        } else {
+            let _ = runtime_fixture::down_sync(&state_dir);
+        }
         self.started = false;
     }
 }

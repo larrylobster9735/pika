@@ -1,57 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bech32::{Bech32, Hrp};
+use rand::RngCore;
 
-struct CommandOutput {
-    output: Output,
-    command: String,
-}
-
-fn run_output(cmd: &mut Command, context: &str) -> Result<Output> {
-    let command_output = run_output_raw(cmd, context)?;
-    if !command_output.output.status.success() {
-        let desc = command_output.command;
-        bail!(
-            "{context}: `{desc}` failed with status {}\nstdout:\n{}\nstderr:\n{}",
-            command_output.output.status,
-            String::from_utf8_lossy(&command_output.output.stdout),
-            String::from_utf8_lossy(&command_output.output.stderr)
-        );
-    }
-    Ok(command_output.output)
-}
-
-fn run_output_raw(cmd: &mut Command, context: &str) -> Result<CommandOutput> {
-    let desc = command_description(cmd);
-    let output = cmd
-        .output()
-        .with_context(|| format!("{context}: spawn failed for `{desc}`"))?;
-    Ok(CommandOutput {
-        output,
-        command: desc,
-    })
-}
-
-fn command_description(cmd: &Command) -> String {
-    let mut parts = Vec::new();
-    parts.push(cmd.get_program().to_string_lossy().to_string());
-    parts.extend(cmd.get_args().map(|arg| arg.to_string_lossy().to_string()));
-    parts.join(" ")
-}
+use crate::testing::util::{non_empty_env_path, resolve_openclaw_dir_default};
 
 pub(crate) fn command_exists(binary: &str) -> bool {
-    let candidate = Path::new(binary);
-    if candidate.is_absolute() || binary.contains('/') {
-        return candidate.is_file();
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(binary))
-        .any(|path| path.is_file())
+    crate::testing::util::command_exists(binary)
 }
 
 pub(crate) fn pick_free_port() -> Result<u16> {
@@ -84,25 +41,10 @@ pub(crate) fn resolve_openclaw_dir(root: &Path, cli_value: Option<PathBuf>) -> R
     if let Some(dir) = cli_value {
         return Ok(dir);
     }
-    if let Ok(from_env) = std::env::var("OPENCLAW_DIR")
-        && !from_env.trim().is_empty()
-    {
-        return Ok(PathBuf::from(from_env));
+    if let Some(path) = non_empty_env_path("OPENCLAW_DIR") {
+        return Ok(path);
     }
-
-    let direct = root.join("openclaw");
-    if direct.join("package.json").is_file() {
-        return Ok(direct);
-    }
-
-    if let Some(parent) = root.parent() {
-        let sibling = parent.join("openclaw");
-        if sibling.join("package.json").is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    Ok(direct)
+    Ok(resolve_openclaw_dir_default(root))
 }
 
 pub(crate) fn resolve_ui_client_nsec(root: &Path) -> Result<String> {
@@ -121,53 +63,21 @@ pub(crate) fn resolve_ui_client_nsec(root: &Path) -> Result<String> {
         }
     }
 
-    if !command_exists("python3") {
-        bail!("python3 is required to generate an ephemeral nsec for local UI E2E");
-    }
-
-    let script = r#"
-import secrets
-CHARSET='qpzry9x8gf2tvdw0s3jn54khce6mua7l'
-def bech32_polymod(values):
-  GEN=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
-  chk=1
-  for v in values:
-    b=chk>>25;chk=((chk&0x1ffffff)<<5)^v
-    for i in range(5): chk^=GEN[i] if((b>>i)&1)else 0
-  return chk
-def bech32_hrp_expand(hrp):
-  return [ord(x)>>5 for x in hrp]+[0]+[ord(x)&31 for x in hrp]
-def bech32_create_checksum(hrp,data):
-  values=bech32_hrp_expand(hrp)+data
-  polymod=bech32_polymod(values+[0,0,0,0,0,0])^1
-  return [(polymod>>5*(5-i))&31 for i in range(6)]
-def convertbits(data,frombits,tobits,pad=True):
-  acc=0;bits=0;ret=[];maxv=(1<<tobits)-1
-  for b in data:
-    acc=(acc<<frombits)|b;bits+=frombits
-    while bits>=tobits: bits-=tobits;ret.append((acc>>bits)&maxv)
-  if pad and bits: ret.append((acc<<(tobits-bits))&maxv)
-  return ret
-sk=secrets.token_bytes(32)
-data5=convertbits(list(sk),8,5,True)
-combined=data5+bech32_create_checksum('nsec',data5)
-print('nsec'+'1'+''.join([CHARSET[d] for d in combined]))
-"#;
-
-    let output = run_output(
-        Command::new("python3").arg("-c").arg(script),
-        "generate ephemeral nsec",
-    )?;
-    let generated = String::from_utf8(output.stdout)?.trim().to_string();
-    if generated.is_empty() {
-        bail!("python nsec generator returned empty output");
-    }
-    if !generated.starts_with("nsec1") {
-        bail!("python nsec generator returned invalid bech32 nsec: {generated}");
-    }
+    let generated = generate_ephemeral_nsec()?;
     eprintln!(
         "note: generated ephemeral local e2e nsec (set PIKA_UI_E2E_NSEC or .pikachat-test-nsec to override)"
     );
+    Ok(generated)
+}
+
+fn generate_ephemeral_nsec() -> Result<String> {
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let hrp = Hrp::parse("nsec").context("parse nsec bech32 prefix")?;
+    let generated = bech32::encode::<Bech32>(hrp, &secret).context("encode bech32 nsec")?;
+    if !generated.starts_with("nsec1") {
+        bail!("generated invalid bech32 nsec: {generated}");
+    }
     Ok(generated)
 }
 
@@ -176,13 +86,7 @@ pub(crate) fn in_ci() -> bool {
 }
 
 pub(crate) fn env_truthy(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| {
-            let s = v.trim().to_ascii_lowercase();
-            s == "1" || s == "true" || s == "yes" || s == "on"
-        })
-        .unwrap_or(false)
+    crate::testing::util::env_truthy(key)
 }
 
 pub(crate) fn extract_udid(output: &str) -> Option<String> {
@@ -197,63 +101,163 @@ pub(crate) fn extract_udid(output: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-pub(crate) fn check_mdk_skew(rust_interop_dir: &Path) -> Result<()> {
-    let mdk_dir = std::env::var("MDK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs_home().unwrap_or_default().join("code/mdk"));
-
-    if !mdk_dir.join(".git").is_dir() {
-        return Ok(());
+fn parse_mdk_rev_from_toml(
+    text: &str,
+    dependencies_path: &[&str],
+    context: &str,
+) -> Result<Option<String>> {
+    let parsed: toml::Value = toml::from_str(text).with_context(|| format!("parse {context}"))?;
+    let mut cursor = &parsed;
+    for key in dependencies_path {
+        let Some(next) = cursor.get(*key) else {
+            return Ok(None);
+        };
+        cursor = next;
     }
-
-    let mdk_head = String::from_utf8(
-        run_output(
-            Command::new("git")
-                .current_dir(&mdk_dir)
-                .args(["rev-parse", "HEAD"]),
-            "read mdk git HEAD",
-        )?
-        .stdout,
-    )?
-    .trim()
-    .to_string();
-
-    let harness_cargo = rust_interop_dir.join("rust_harness/Cargo.toml");
-    let harness_text = fs::read_to_string(&harness_cargo)
-        .with_context(|| format!("read {}", harness_cargo.display()))?;
-    let harness_toml: toml::Value = toml::from_str(&harness_text)
-        .with_context(|| format!("parse {}", harness_cargo.display()))?;
-
-    let harness_rev = harness_toml
-        .get("dependencies")
-        .and_then(|deps| deps.get("mdk-core"))
+    let rev = cursor
+        .get("mdk-core")
         .and_then(|dep| dep.get("rev"))
         .and_then(toml::Value::as_str)
         .filter(|rev| rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()))
         .map(str::to_string);
+    Ok(rev)
+}
 
-    let Some(harness_rev) = harness_rev else {
+fn workspace_mdk_rev(workspace_root: &Path) -> Result<Option<String>> {
+    let workspace_cargo = workspace_root.join("Cargo.toml");
+    let workspace_text = fs::read_to_string(&workspace_cargo)
+        .with_context(|| format!("read {}", workspace_cargo.display()))?;
+    parse_mdk_rev_from_toml(
+        &workspace_text,
+        &["workspace", "dependencies"],
+        &workspace_cargo.display().to_string(),
+    )
+}
+
+fn harness_mdk_rev(rust_interop_dir: &Path) -> Result<Option<String>> {
+    let harness_cargo = rust_interop_dir.join("rust_harness/Cargo.toml");
+    let harness_text = fs::read_to_string(&harness_cargo)
+        .with_context(|| format!("read {}", harness_cargo.display()))?;
+    parse_mdk_rev_from_toml(
+        &harness_text,
+        &["dependencies"],
+        &harness_cargo.display().to_string(),
+    )
+}
+
+pub(crate) fn check_mdk_skew(workspace_root: &Path, rust_interop_dir: &Path) -> Result<()> {
+    let Some(workspace_rev) = workspace_mdk_rev(workspace_root)? else {
+        return Ok(());
+    };
+    let Some(harness_rev) = harness_mdk_rev(rust_interop_dir)? else {
         return Ok(());
     };
 
-    if mdk_head != harness_rev {
+    if workspace_rev != harness_rev {
         bail!(
-            "MDK version skew detected\n  pika uses local MDK at: {} (HEAD={})\n  rust harness pins MDK rev: {}\nfix: align one side before interop conclusions",
-            mdk_dir.display(),
-            mdk_head,
+            "MDK version skew detected\n  pika workspace pins MDK rev: {}\n  rust harness pins MDK rev: {}\nfix: align one side before interop conclusions",
+            workspace_rev,
             harness_rev,
         );
     }
 
-    println!("ok: MDK rev aligned: {mdk_head}");
+    println!("ok: MDK rev aligned: {workspace_rev}");
     Ok(())
 }
 
 pub(crate) fn extract_field(line: &str, key: &str) -> Option<String> {
     let value = line.split(key).nth(1)?;
     Some(value.split_whitespace().next()?.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{
+        extract_udid, generate_ephemeral_nsec, parse_mdk_rev_from_toml, parse_url_port,
+        pick_free_port, tail_lines,
+    };
+
+    #[test]
+    fn parse_mdk_rev_from_workspace_dependencies() {
+        let text = r#"
+[workspace]
+[workspace.dependencies]
+mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "d9f372743625de17f6fcd81eecd5084917a8ebb1" }
+"#;
+        let rev = parse_mdk_rev_from_toml(text, &["workspace", "dependencies"], "workspace")
+            .expect("parse should succeed")
+            .expect("rev should exist");
+        assert_eq!(rev, "d9f372743625de17f6fcd81eecd5084917a8ebb1");
+    }
+
+    #[test]
+    fn parse_mdk_rev_returns_none_when_missing() {
+        let text = r#"
+[workspace]
+[workspace.dependencies]
+tokio = "1"
+"#;
+        let rev = parse_mdk_rev_from_toml(text, &["workspace", "dependencies"], "workspace")
+            .expect("parse should succeed");
+        assert!(rev.is_none());
+    }
+
+    #[test]
+    fn parse_mdk_rev_filters_invalid_hashes() {
+        let text = r#"
+[dependencies]
+mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "not-a-sha" }
+"#;
+        let rev = parse_mdk_rev_from_toml(text, &["dependencies"], "harness")
+            .expect("parse should succeed");
+        assert!(rev.is_none());
+    }
+
+    #[test]
+    fn parse_url_port_extracts_port() {
+        assert_eq!(
+            parse_url_port("ws://127.0.0.1:7777").expect("parse port"),
+            7777
+        );
+    }
+
+    #[test]
+    fn parse_url_port_rejects_missing_port() {
+        let err = parse_url_port("ws://127.0.0.1").expect_err("missing port should fail");
+        assert!(err.to_string().contains("URL has no port"));
+    }
+
+    #[test]
+    fn pick_free_port_returns_bindable_port() {
+        let port = pick_free_port().expect("pick port");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("port should be bindable");
+        drop(listener);
+    }
+
+    #[test]
+    fn extract_udid_parses_ios_sim_ensure_output() {
+        let output = "ok: ios simulator ready (udid=C128E86D-D60E-44B6-B8C4-EC3480D6BC9F)\n";
+        assert_eq!(
+            extract_udid(output),
+            Some("C128E86D-D60E-44B6-B8C4-EC3480D6BC9F".to_string())
+        );
+    }
+
+    #[test]
+    fn tail_lines_reads_requested_suffix() {
+        let temp = tempfile::NamedTempFile::new().expect("temp file");
+        let mut file = std::fs::File::create(temp.path()).expect("open temp");
+        writeln!(file, "a\nb\nc").expect("write temp");
+        assert_eq!(tail_lines(temp.path(), 2), "b\nc");
+    }
+
+    #[test]
+    fn generate_ephemeral_nsec_returns_valid_bech32() {
+        let generated = generate_ephemeral_nsec().expect("generate nsec");
+        assert!(generated.starts_with("nsec1"));
+        assert!(generated.len() > "nsec1".len());
+    }
 }

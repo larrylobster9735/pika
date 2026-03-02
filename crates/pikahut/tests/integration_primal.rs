@@ -18,7 +18,6 @@ fn primal_nostrconnect_smoke() -> Result<()> {
         &[
             Requirement::HostMacOs,
             Requirement::Xcode,
-            Requirement::PrimalRepo,
             Requirement::PublicNetwork,
         ],
     ) {
