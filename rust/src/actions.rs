@@ -118,6 +118,16 @@ pub enum AppAction {
         chat_id: String,
         name: String,
     },
+    SaveGroupProfile {
+        chat_id: String,
+        name: String,
+        about: String,
+    },
+    UploadGroupProfileImage {
+        chat_id: String,
+        image_base64: String,
+        mime_type: String,
+    },
 
     // Hypernote
     HypernoteAction {
@@ -148,6 +158,7 @@ pub enum AppAction {
     // UI
     ClearToast,
     EnableDeveloperMode,
+    WipeProfileCache,
     VoiceRecordingStart,
     VoiceRecordingPause,
     VoiceRecordingResume,
@@ -235,6 +246,8 @@ impl AppAction {
             AppAction::RemoveGroupMembers { .. } => "RemoveGroupMembers",
             AppAction::LeaveGroup { .. } => "LeaveGroup",
             AppAction::RenameGroup { .. } => "RenameGroup",
+            AppAction::SaveGroupProfile { .. } => "SaveGroupProfile",
+            AppAction::UploadGroupProfileImage { .. } => "UploadGroupProfileImage",
 
             // Hypernote
             AppAction::HypernoteAction { .. } => "HypernoteAction",
@@ -248,6 +261,7 @@ impl AppAction {
             // UI
             AppAction::ClearToast => "ClearToast",
             AppAction::EnableDeveloperMode => "EnableDeveloperMode",
+            AppAction::WipeProfileCache => "WipeProfileCache",
             AppAction::VoiceRecordingStart => "VoiceRecordingStart",
             AppAction::VoiceRecordingPause => "VoiceRecordingPause",
             AppAction::VoiceRecordingResume => "VoiceRecordingResume",

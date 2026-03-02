@@ -1,152 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Quick smoke test: two users, local relay, send+receive.
-#
-# Starts its own pika-relay on a free port, runs the test, then cleans up.
-# Uses pikahub for relay lifecycle.
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-. tools/lib/pikahub.sh
 
 with_media=0
-external_relay=""
+relay=""
+state_dir=""
 
-usage() {
-  cat >&2 <<EOF
-usage: ./tools/cli-smoke [--relay <ws://...>] [--with-media]
-
-If --relay is omitted, a local pika-relay is started automatically.
-EOF
-}
-
-while [ "$#" -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    --relay)
-      external_relay="${2:-}"
-      shift 2
-      ;;
     --with-media)
       with_media=1
       shift
       ;;
+    --relay)
+      relay="${2:-}"
+      if [[ -z "$relay" ]]; then
+        echo "error: --relay requires a value" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --relay=*)
+      relay="${1#*=}"
+      shift
+      ;;
+    --state-dir)
+      state_dir="${2:-}"
+      if [[ -z "$state_dir" ]]; then
+        echo "error: --state-dir requires a value" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --state-dir=*)
+      state_dir="${1#*=}"
+      shift
+      ;;
     -h|--help)
-      usage
+      cat >&2 <<USAGE
+usage:
+  ./tools/cli-smoke [--with-media] [--relay URL] [--state-dir PATH]
+USAGE
       exit 0
       ;;
     *)
-      usage
+      echo "error: unsupported argument: $1" >&2
+      echo "hint: supported flags are --with-media, --relay, --state-dir" >&2
       exit 2
       ;;
   esac
 done
 
-STATE_DIR="$(mktemp -d /tmp/pikachat-smoke.XXXXXX)"
-
-cleanup() {
-  pikahub_down "$STATE_DIR"
-}
-trap cleanup EXIT
-
-# ── Relay ────────────────────────────────────────────────────────────────────
-
-if [ -n "$external_relay" ]; then
-  relay="$external_relay"
-else
-  pikahub_up relay "$STATE_DIR"
-  relay="$RELAY_URL"
-  echo "relay: $relay"
+if [[ -n "$relay" ]]; then
+  export PIKAHUT_CLI_SMOKE_RELAY="$relay"
+fi
+if [[ -n "$state_dir" ]]; then
+  export PIKAHUT_CLI_SMOKE_STATE_DIR="$state_dir"
 fi
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-CLI="cargo run -q -p pikachat --"
-
-json_get() {
-  local expr="$1"
-  python3 -c "
-import json,sys
-obj=json.load(sys.stdin)
-print($expr)
-"
-}
-
-# ── Test ─────────────────────────────────────────────────────────────────────
-
-echo "=== Alice: create identity ==="
-ALICE="$($CLI --state-dir "$STATE_DIR/alice" --relay "$relay" identity)"
-ALICE_PK="$(echo "$ALICE" | json_get "obj['pubkey']")"
-echo "Alice pubkey: $ALICE_PK"
-
-echo "=== Bob: create identity ==="
-BOB="$($CLI --state-dir "$STATE_DIR/bob" --relay "$relay" identity)"
-BOB_PK="$(echo "$BOB" | json_get "obj['pubkey']")"
-echo "Bob pubkey: $BOB_PK"
-
-echo "=== Both: publish key packages ==="
-$CLI --state-dir "$STATE_DIR/alice" --relay "$relay" publish-kp
-$CLI --state-dir "$STATE_DIR/bob" --relay "$relay" publish-kp
-
-echo "=== Alice: invite Bob ==="
-INVITE="$($CLI --state-dir "$STATE_DIR/alice" --relay "$relay" invite --peer "$BOB_PK")"
-GROUP="$(echo "$INVITE" | json_get "obj['nostr_group_id']")"
-echo "Group: $GROUP"
-
-echo "=== Bob: sync welcomes (listen 3s) ==="
-$CLI --state-dir "$STATE_DIR/bob" --relay "$relay" listen --timeout 3 --lookback 300 >/dev/null || true
-
-echo "=== Bob: check welcomes ==="
-WELCOMES="$($CLI --state-dir "$STATE_DIR/bob" --relay "$relay" welcomes)"
-echo "$WELCOMES"
-WRAPPER="$(echo "$WELCOMES" | json_get "obj['welcomes'][0]['wrapper_event_id']")"
-
-echo "=== Bob: accept welcome ==="
-$CLI --state-dir "$STATE_DIR/bob" --relay "$relay" accept-welcome --wrapper-event-id "$WRAPPER"
-
-echo "=== Alice: send message ==="
-$CLI --state-dir "$STATE_DIR/alice" --relay "$relay" send --group "$GROUP" --content "hello from alice"
-
-echo "=== Bob: sync inbox (listen 3s) ==="
-$CLI --state-dir "$STATE_DIR/bob" --relay "$relay" listen --timeout 3 --lookback 300 >/dev/null || true
-
-echo "=== Bob: read messages ==="
-$CLI --state-dir "$STATE_DIR/bob" --relay "$relay" messages --group "$GROUP"
-
-if [ "$with_media" -eq 1 ]; then
-  echo "=== Alice: send media ==="
-  MEDIA_SRC="$STATE_DIR/sample-media.txt"
-  printf "hello media %s\n" "$(date +%s)" >"$MEDIA_SRC"
-  $CLI --state-dir "$STATE_DIR/alice" --relay "$relay" \
-    send \
-    --group "$GROUP" \
-    --media "$MEDIA_SRC" \
-    --mime-type "text/plain" \
-    --content "media from alice"
-
-  echo "=== Bob: sync media message (listen 5s) ==="
-  $CLI --state-dir "$STATE_DIR/bob" --relay "$relay" listen --timeout 5 --lookback 300 >/dev/null || true
-
-  echo "=== Bob: read messages with media ==="
-  BOB_MSGS="$($CLI --state-dir "$STATE_DIR/bob" --relay "$relay" messages --group "$GROUP")"
-  echo "$BOB_MSGS"
-
-  MEDIA_MSG_ID="$(echo "$BOB_MSGS" | json_get "next((m['message_id'] for m in reversed(obj['messages']) if len(m.get('media', [])) > 0), '')")"
-  if [ -z "${MEDIA_MSG_ID:-}" ]; then
-    echo "error: could not find media attachment in Bob's messages" >&2
-    exit 1
-  fi
-
-  echo "=== Bob: download/decrypt media ==="
-  MEDIA_OUT="$STATE_DIR/bob-downloaded-media.txt"
-  $CLI --state-dir "$STATE_DIR/bob" --relay "$relay" \
-    download-media "$MEDIA_MSG_ID" \
-    --output "$MEDIA_OUT"
-
-  if ! cmp -s "$MEDIA_SRC" "$MEDIA_OUT"; then
-    echo "error: downloaded media does not match source file" >&2
-    exit 1
-  fi
+if [[ "$with_media" -eq 1 ]]; then
+  exec cargo test -p pikahut --test integration_deterministic cli_smoke_media_local -- --ignored --nocapture
 fi
 
-echo "=== SMOKE TEST PASSED ==="
+exec cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture

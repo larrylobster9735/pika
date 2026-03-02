@@ -28,6 +28,7 @@ pub struct State {
     my_npub: String,
     conversation: views::conversation::State,
     group_info: Option<views::group_info::State>,
+    group_profile: Option<views::group_profile::State>,
     optimistic_selected_chat_id: Option<String>,
     pub show_call_screen: bool,
     profile_toast: Option<String>,
@@ -51,6 +52,7 @@ pub enum Message {
     ChatRail(views::chat_rail::Message),
     Conversation(views::conversation::Message),
     GroupInfo(views::group_info::Message),
+    GroupProfile(views::group_profile::Message),
     NewChat(views::new_chat::Message),
     NewGroup(views::new_group_chat::Message),
     MyProfile(views::my_profile::Message),
@@ -114,6 +116,7 @@ impl State {
             my_npub,
             conversation: views::conversation::State::new(),
             group_info: None,
+            group_profile: None,
             optimistic_selected_chat_id: None,
             show_call_screen: false,
             profile_toast: None,
@@ -160,6 +163,27 @@ impl State {
             // After SaveMyProfile completes, dispatch the deferred image upload.
             if let Some(action) = profile.take_deferred_upload() {
                 manager.dispatch(action);
+            }
+        }
+
+        // Sync group_profile drafts when group profile state updates.
+        if let Some(ref mut gp_state) = self.group_profile {
+            if let Some(chat) = new_state.current_chat.as_ref() {
+                if let Some(profile) = chat.my_group_profile.as_ref() {
+                    gp_state.sync_profile(profile);
+                }
+            }
+            if let Some(views::group_profile::Event::UploadGroupProfileImage {
+                chat_id,
+                image_base64,
+                mime_type,
+            }) = gp_state.take_deferred_upload()
+            {
+                manager.dispatch(AppAction::UploadGroupProfileImage {
+                    chat_id,
+                    image_base64,
+                    mime_type,
+                });
             }
         }
 
@@ -643,7 +667,54 @@ impl State {
                             views::group_info::Event::OpenPeerProfile { pubkey } => {
                                 manager.dispatch(AppAction::OpenPeerProfile { pubkey });
                             }
+                            views::group_info::Event::EditGroupProfile => {
+                                if let Some(chat) = &state.current_chat {
+                                    self.group_profile = Some(views::group_profile::State::new(
+                                        chat.chat_id.clone(),
+                                        chat.my_group_profile.as_ref(),
+                                    ));
+                                }
+                            }
                         }
+                    }
+                }
+            }
+
+            // ── Group profile ────────────────────────────────────────
+            Message::GroupProfile(msg) => {
+                if let Some(ref mut gp_state) = self.group_profile {
+                    let (event, task) = gp_state.update(msg);
+                    if let Some(event) = event {
+                        match event {
+                            views::group_profile::Event::SaveGroupProfile {
+                                chat_id,
+                                name,
+                                about,
+                            } => {
+                                manager.dispatch(AppAction::SaveGroupProfile {
+                                    chat_id,
+                                    name,
+                                    about,
+                                });
+                            }
+                            views::group_profile::Event::UploadGroupProfileImage {
+                                chat_id,
+                                image_base64,
+                                mime_type,
+                            } => {
+                                manager.dispatch(AppAction::UploadGroupProfileImage {
+                                    chat_id,
+                                    image_base64,
+                                    mime_type,
+                                });
+                            }
+                            views::group_profile::Event::Close => {
+                                self.group_profile = None;
+                            }
+                        }
+                    }
+                    if let Some(task) = task {
+                        return Some(Event::Task(task.map(Message::GroupProfile)));
                     }
                 }
             }
@@ -886,6 +957,13 @@ impl State {
                     cache,
                 )
                 .map(Message::MyProfile)
+        } else if let Some(ref gp_state) = self.group_profile {
+            let pic = state
+                .current_chat
+                .as_ref()
+                .and_then(|c| c.my_group_profile.as_ref())
+                .and_then(|p| p.picture_url.as_deref());
+            gp_state.view(pic, cache).map(Message::GroupProfile)
         } else if matches!(route.detail_pane, DesktopDetailPane::GroupInfo { .. }) {
             if let (Some(ref gi_state), Some(chat)) = (&self.group_info, &state.current_chat) {
                 let my_pubkey = match &state.auth {

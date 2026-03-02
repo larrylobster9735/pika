@@ -3,6 +3,7 @@ mod call_runtime;
 mod chat_media;
 mod chat_media_db;
 mod config;
+mod group_profile;
 mod interop;
 mod profile;
 mod profile_db;
@@ -38,7 +39,9 @@ use crate::state::{
 };
 use crate::updates::{AppUpdate, CoreMsg, InternalEvent};
 
-use mdk_core::encrypted_media::types::{EncryptedMediaUpload, MediaReference};
+use mdk_core::encrypted_media::types::{
+    EncryptedMediaUpload, MediaProcessingOptions, MediaReference,
+};
 use mdk_core::prelude::{message_types, GroupId, MessageProcessingResult, NostrGroupConfigData};
 use mdk_storage_traits::groups::Pagination;
 
@@ -211,22 +214,28 @@ enum AppMessageKind {
     Reaction,
     Hypernote,
     HypernoteResponse,
+    GroupProfile,
 }
 
 impl AppMessageKind {
     fn increments_unread(&self) -> bool {
         match self {
             Self::Chat | Self::Hypernote => true,
-            Self::TypingIndicator | Self::CallSignal | Self::Reaction | Self::HypernoteResponse => {
-                false
-            }
+            Self::TypingIndicator
+            | Self::CallSignal
+            | Self::Reaction
+            | Self::HypernoteResponse
+            | Self::GroupProfile => false,
         }
     }
 
     fn increments_loaded(&self) -> bool {
         match self {
             Self::Chat | Self::Reaction | Self::Hypernote => true,
-            Self::TypingIndicator | Self::CallSignal | Self::HypernoteResponse => false,
+            Self::TypingIndicator
+            | Self::CallSignal
+            | Self::HypernoteResponse
+            | Self::GroupProfile => false,
         }
     }
 
@@ -236,7 +245,7 @@ impl AppMessageKind {
     fn is_chat_visible(&self) -> bool {
         match self {
             Self::Chat | Self::Reaction | Self::Hypernote | Self::HypernoteResponse => true,
-            Self::TypingIndicator | Self::CallSignal => false,
+            Self::TypingIndicator | Self::CallSignal | Self::GroupProfile => false,
         }
     }
 }
@@ -264,6 +273,7 @@ fn classify_app_message(msg: &message_types::Message) -> Option<AppMessageKind> 
         Kind::Custom(CALL_SIGNAL_KIND_NUM) => Some(AppMessageKind::CallSignal),
         Kind::Custom(hn::HYPERNOTE_KIND) => Some(AppMessageKind::Hypernote),
         Kind::Custom(hn::HYPERNOTE_ACTION_RESPONSE_KIND) => Some(AppMessageKind::HypernoteResponse),
+        Kind::Metadata => Some(AppMessageKind::GroupProfile),
         _ => None,
     };
     classified.or_else(|| {
@@ -372,21 +382,26 @@ impl ProfileCache {
     fn display_picture_url(&self, data_dir: &str, pubkey_hex: &str) -> Option<String> {
         if self.picture_url.is_some() {
             let path = profile_pics::cached_path(data_dir, pubkey_hex);
-            if let Ok(meta) = path.metadata() {
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                return Some(format!(
-                    "{}?v={}",
-                    profile_pics::path_to_file_url(&path),
-                    mtime
-                ));
+            if let url @ Some(_) = profile_pics::file_url_with_mtime(&path) {
+                return url;
             }
         }
         self.picture_url.clone()
+    }
+
+    /// Like `display_picture_url` but for per-group profile pics.
+    /// Group pictures are encrypted, so we never return the raw remote URL.
+    fn display_group_picture_url(
+        &self,
+        data_dir: &str,
+        chat_id: &str,
+        pubkey_hex: &str,
+    ) -> Option<String> {
+        if self.picture_url.is_some() {
+            let path = profile_pics::group_cached_path(data_dir, chat_id, pubkey_hex);
+            return profile_pics::file_url_with_mtime(&path);
+        }
+        None
     }
 }
 
@@ -543,7 +558,8 @@ pub struct AppCore {
     last_typing_sent: HashMap<String, i64>,
 
     // Nostr kind:0 profile cache (survives across session refreshes).
-    profiles: HashMap<String, ProfileCache>, // hex pubkey -> cached profile
+    profiles: HashMap<String, ProfileCache>, // hex pubkey -> cached global profile
+    group_profiles: HashMap<String, HashMap<String, ProfileCache>>, // chat_id -> (pubkey -> profile)
     profile_db: Option<rusqlite::Connection>,
     chat_media_db: Option<rusqlite::Connection>,
 
@@ -652,6 +668,7 @@ impl AppCore {
             pending_sends: HashMap::new(),
             local_outbox: HashMap::new(),
             profiles,
+            group_profiles: HashMap::new(),
             profile_db,
             typing_state: HashMap::new(),
             last_typing_sent: HashMap::new(),
@@ -1096,6 +1113,211 @@ impl AppCore {
                 }
             }
         });
+    }
+
+    fn upsert_group_profile(
+        &mut self,
+        chat_id: &str,
+        pubkey: String,
+        new: ProfileCache,
+        encrypted_pic_info: Option<(String, String, String)>,
+    ) {
+        // Check existing entry and decide what to do before mutating.
+        let chat_profiles = self.group_profiles.entry(chat_id.to_string()).or_default();
+        let mut need_pic_download: Option<String> = None;
+        let mut need_pic_delete = false;
+
+        if let Some(existing) = chat_profiles.get(&pubkey) {
+            if existing.event_created_at > new.event_created_at {
+                return;
+            }
+            if existing.picture_url != new.picture_url {
+                if let Some(ref url) = new.picture_url {
+                    need_pic_download = Some(url.clone());
+                } else {
+                    need_pic_delete = true;
+                }
+            }
+            if *existing == new {
+                return;
+            }
+        } else if let Some(ref url) = new.picture_url {
+            need_pic_download = Some(url.clone());
+        }
+
+        chat_profiles.insert(pubkey.clone(), new);
+
+        // Persist to DB.
+        if let Some(conn) = self.profile_db.as_ref() {
+            if let Some(cache) = self
+                .group_profiles
+                .get(chat_id)
+                .and_then(|m| m.get(&pubkey))
+            {
+                profile_db::save_group_profile(conn, &pubkey, chat_id, cache);
+            }
+        }
+
+        // Trigger pic download/delete after all borrows are released.
+        // Skip download if the file is already cached locally (e.g. we just uploaded it).
+        if let Some(url) = need_pic_download {
+            let already_cached =
+                profile_pics::group_cached_path(&self.data_dir, chat_id, &pubkey).exists();
+            if !already_cached {
+                self.spawn_group_pfp_download(chat_id.to_string(), pubkey, url, encrypted_pic_info);
+            }
+        } else if need_pic_delete {
+            let _ = std::fs::remove_file(profile_pics::group_cached_path(
+                &self.data_dir,
+                chat_id,
+                &pubkey,
+            ));
+        }
+    }
+
+    fn spawn_group_pfp_download(
+        &self,
+        chat_id: String,
+        pubkey: String,
+        url: String,
+        encrypted: Option<(String, String, String)>, // (nonce_hex, original_hash_hex, scheme_version)
+    ) {
+        let client = self.http_client.clone();
+        let data_dir = self.data_dir.clone();
+        let semaphore = self.pfp_semaphore.clone();
+        let tx = self.core_sender.clone();
+        profile_pics::ensure_group_dir(&data_dir, &chat_id);
+
+        if let Some((nonce_hex, original_hash_hex, scheme_version)) = encrypted {
+            // Encrypted: download raw bytes, send back for sync decryption via MDK.
+            self.runtime.spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let resp = client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await;
+                let encrypted_data = match resp.and_then(|r| r.error_for_status()) {
+                    Ok(r) => match r.bytes().await {
+                        Ok(b) => b.to_vec(),
+                        Err(e) => {
+                            tracing::debug!(%pubkey, %chat_id, %url, %e, "encrypted group pfp download failed");
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(%pubkey, %chat_id, %url, %e, "encrypted group pfp download failed");
+                        return;
+                    }
+                };
+                let _ = tx.send(CoreMsg::Internal(Box::new(
+                    InternalEvent::GroupProfilePicDownloaded {
+                        chat_id,
+                        pubkey,
+                        encrypted_data,
+                        nonce_hex,
+                        original_hash_hex,
+                        scheme_version,
+                        url,
+                    },
+                )));
+            });
+        } else {
+            // Unencrypted: plain download (backwards compat).
+            self.runtime.spawn(async move {
+                match profile_pics::download_group_image(
+                    &client, &data_dir, &chat_id, &pubkey, &url, &semaphore,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let _ = tx.send(CoreMsg::Internal(Box::new(
+                            InternalEvent::GroupProfilePicCached { chat_id, pubkey },
+                        )));
+                    }
+                    Err(e) => {
+                        tracing::debug!(%pubkey, %chat_id, %url, %e, "group profile pic download failed");
+                    }
+                }
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decrypt_and_cache_group_pfp(
+        &mut self,
+        chat_id: &str,
+        pubkey: &str,
+        encrypted_data: &[u8],
+        nonce_hex: &str,
+        original_hash_hex: &str,
+        scheme_version: &str,
+        url: &str,
+    ) {
+        let Some(sess) = self.session.as_ref() else {
+            return;
+        };
+        let Some(group) = sess.groups.get(chat_id) else {
+            return;
+        };
+
+        // Build a MediaReference for decryption.
+        let nonce: [u8; 12] = match hex::decode(nonce_hex) {
+            Ok(b) if b.len() == 12 => {
+                let mut arr = [0u8; 12];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => {
+                tracing::debug!(%pubkey, %chat_id, "invalid nonce for encrypted group pfp");
+                return;
+            }
+        };
+        let original_hash: [u8; 32] = match hex::decode(original_hash_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => {
+                tracing::debug!(%pubkey, %chat_id, "invalid hash for encrypted group pfp");
+                return;
+            }
+        };
+
+        let reference = MediaReference {
+            url: url.to_string(),
+            original_hash,
+            nonce,
+            mime_type: "image/jpeg".to_string(),
+            filename: "profile.jpg".to_string(),
+            scheme_version: scheme_version.to_string(),
+            dimensions: None,
+        };
+
+        let manager = sess.mdk.media_manager(group.mls_group_id.clone());
+        let decrypted = match manager.decrypt_from_download(encrypted_data, &reference) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::debug!(%pubkey, %chat_id, %e, "group pfp decrypt failed");
+                return;
+            }
+        };
+
+        // Save decrypted image to cache.
+        profile_pics::ensure_group_dir(&self.data_dir, chat_id);
+        if let Err(e) =
+            profile_pics::save_group_image_bytes(&self.data_dir, chat_id, pubkey, &decrypted)
+        {
+            tracing::debug!(%pubkey, %chat_id, %e, "failed to save decrypted group pfp");
+            return;
+        }
+
+        self.refresh_chat_list_from_storage();
+        self.refresh_current_chat_if_open(chat_id);
     }
 
     fn cache_missing_profile_pics(&self) {
@@ -2717,6 +2939,45 @@ impl AppCore {
             InternalEvent::ProfilePicCached { pubkey, url } => {
                 self.handle_profile_pic_cached(pubkey, url)
             }
+            InternalEvent::GroupProfilePicCached { chat_id, pubkey } => {
+                tracing::debug!(%pubkey, %chat_id, "group profile pic cached");
+                self.refresh_chat_list_from_storage();
+                self.refresh_current_chat_if_open(&chat_id);
+            }
+            InternalEvent::GroupProfilePicDownloaded {
+                chat_id,
+                pubkey,
+                encrypted_data,
+                nonce_hex,
+                original_hash_hex,
+                scheme_version,
+                url,
+            } => {
+                self.decrypt_and_cache_group_pfp(
+                    &chat_id,
+                    &pubkey,
+                    &encrypted_data,
+                    &nonce_hex,
+                    &original_hash_hex,
+                    &scheme_version,
+                    &url,
+                );
+            }
+            InternalEvent::GroupProfileImageUploaded {
+                chat_id,
+                metadata_json,
+                image_bytes,
+                upload,
+                uploaded_url,
+            } => {
+                self.handle_group_profile_image_uploaded(
+                    chat_id,
+                    metadata_json,
+                    image_bytes,
+                    upload,
+                    uploaded_url,
+                );
+            }
             InternalEvent::ContactListModifyFailed { pubkey, revert_to } => {
                 self.handle_contact_list_modify_failed(pubkey, revert_to)
             }
@@ -3339,7 +3600,7 @@ impl AppCore {
 
     fn handle_group_evolution_published(
         &mut self,
-        _chat_id: String,
+        chat_id: String,
         mls_group_id: GroupId,
         welcome_rumors: Option<Vec<UnsignedEvent>>,
         added_pubkeys: Vec<PublicKey>,
@@ -3361,6 +3622,8 @@ impl AppCore {
             }
         }
 
+        let has_added = !added_pubkeys.is_empty();
+
         // Send welcomes to newly added members.
         if let Some(rumors) = welcome_rumors {
             if !rumors.is_empty() && self.network_enabled() {
@@ -3376,6 +3639,11 @@ impl AppCore {
                     self.publish_welcomes_to_peer(pk, rumors.clone(), relays.clone());
                 }
             }
+        }
+
+        // Rebroadcast per-group profiles to newly added members.
+        if has_added {
+            self.rebroadcast_group_profiles(&chat_id, &mls_group_id);
         }
 
         self.refresh_all_from_storage();
@@ -3470,13 +3738,26 @@ impl AppCore {
         );
 
         // Update peer_profile if it's still showing this pubkey.
+        // If a group profile exists, use it entirely; otherwise use global.
         if let Some(ref mut pp) = self.state.peer_profile {
             if pp.pubkey == pubkey {
-                let cached = self.profiles.get(&pubkey);
-                pp.name = cached.and_then(|p| p.name.clone());
-                pp.about = cached.and_then(|p| p.about.clone());
-                pp.picture_url =
-                    cached.and_then(|p| p.display_picture_url(&self.data_dir, &pubkey));
+                let chat_id = self.state.current_chat.as_ref().map(|c| c.chat_id.as_str());
+                let group_cached = chat_id
+                    .and_then(|cid| self.group_profiles.get(cid))
+                    .and_then(|m| m.get(&pubkey));
+
+                if let Some(gp) = group_cached {
+                    pp.name = gp.name.clone();
+                    pp.about = gp.about.clone();
+                    pp.picture_url = chat_id
+                        .and_then(|cid| gp.display_group_picture_url(&self.data_dir, cid, &pubkey));
+                } else {
+                    let global = self.profiles.get(&pubkey);
+                    pp.name = global.and_then(|p| p.name.clone());
+                    pp.about = global.and_then(|p| p.about.clone());
+                    pp.picture_url =
+                        global.and_then(|p| p.display_picture_url(&self.data_dir, &pubkey));
+                }
                 self.emit_state();
             }
         }
@@ -3603,7 +3884,14 @@ impl AppCore {
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 (Some(mls_group_id), None)
             }
-            MessageProcessingResult::Commit { mls_group_id } => (Some(mls_group_id), None),
+            MessageProcessingResult::Commit { ref mls_group_id } => {
+                // Re-publish our own group profile on membership changes so
+                // new members receive it.
+                if let Some(chat_id) = self.resolve_chat_id(mls_group_id) {
+                    self.maybe_rebroadcast_my_group_profile(&chat_id, mls_group_id);
+                }
+                (Some(mls_group_id.clone()), None)
+            }
             MessageProcessingResult::Unprocessable { mls_group_id } => (Some(mls_group_id), None),
             MessageProcessingResult::PreviouslyFailed => (None, None),
         };
@@ -3674,6 +3962,51 @@ impl AppCore {
                         .or_insert(51);
                 }
 
+                self.refresh_chat_list_from_storage();
+                self.refresh_current_chat_if_open(chat_id);
+            }
+            AppMessageKind::GroupProfile => {
+                // Determine profile owner: if the rumor has a `p` tag, this is
+                // a rebroadcast and the `p` value is the real owner; otherwise
+                // msg.pubkey (MLS-authenticated sender) is the owner.
+                let owner_hex = msg
+                    .tags
+                    .iter()
+                    .find(|t| t.kind() == nostr_sdk::TagKind::p())
+                    .and_then(|t| t.content().map(|s| s.to_string()))
+                    .unwrap_or_else(|| msg.pubkey.to_hex());
+                let cache = ProfileCache::from_metadata_json(
+                    Some(msg.content.clone()),
+                    msg.created_at.as_secs() as i64,
+                    now_seconds(),
+                );
+
+                // Extract encrypted picture metadata from imeta tag transiently
+                // (not stored in ProfileCache — only needed for the download).
+                let encrypted_pic_info = self
+                    .session
+                    .as_ref()
+                    .and_then(|sess| sess.groups.get(chat_id))
+                    .and_then(|group| {
+                        let manager = self
+                            .session
+                            .as_ref()?
+                            .mdk
+                            .media_manager(group.mls_group_id.clone());
+                        msg.tags
+                            .iter()
+                            .filter(|t| chat_media::is_imeta_tag(t))
+                            .find_map(|t| manager.parse_imeta_tag(t).ok())
+                    })
+                    .map(|reference| {
+                        (
+                            hex::encode(reference.nonce),
+                            hex::encode(reference.original_hash),
+                            reference.scheme_version,
+                        )
+                    });
+
+                self.upsert_group_profile(chat_id, owner_hex, cache, encrypted_pic_info);
                 self.refresh_chat_list_from_storage();
                 self.refresh_current_chat_if_open(chat_id);
             }
@@ -3974,6 +4307,16 @@ impl AppCore {
                 }
                 self.emit_state();
             }
+            AppAction::WipeProfileCache => {
+                if let Some(conn) = self.profile_db.as_ref() {
+                    profile_db::clear_all(conn);
+                }
+                self.profiles.clear();
+                self.group_profiles.clear();
+                profile_pics::clear_cache(&self.data_dir);
+                self.refresh_all_from_storage();
+                self.toast("Profile cache wiped");
+            }
             AppAction::VoiceRecordingStart => {
                 self.state.voice_recording = Some(VoiceRecordingState {
                     phase: VoiceRecordingPhase::Recording,
@@ -4097,15 +4440,33 @@ impl AppCore {
                     .ok()
                     .and_then(|pk| pk.to_bech32().ok())
                     .unwrap_or_else(|| pubkey.clone());
-                let cached = self.profiles.get(&pubkey);
+
+                // Use group profile if one exists (all-or-nothing), otherwise global.
+                let chat_id = self.state.current_chat.as_ref().map(|c| c.chat_id.as_str());
+                let group_cached = chat_id
+                    .and_then(|cid| self.group_profiles.get(cid))
+                    .and_then(|m| m.get(&pubkey));
+
+                let (name, about, picture_url) = if let Some(gp) = group_cached {
+                    let pic = chat_id
+                        .and_then(|cid| gp.display_group_picture_url(&self.data_dir, cid, &pubkey));
+                    (gp.name.clone(), gp.about.clone(), pic)
+                } else {
+                    let global = self.profiles.get(&pubkey);
+                    (
+                        global.and_then(|p| p.name.clone()),
+                        global.and_then(|p| p.about.clone()),
+                        global.and_then(|p| p.display_picture_url(&self.data_dir, &pubkey)),
+                    )
+                };
+
                 let is_followed = self.state.follow_list.iter().any(|f| f.pubkey == pubkey);
                 self.state.peer_profile = Some(crate::state::PeerProfileState {
                     pubkey: pubkey.clone(),
                     npub,
-                    name: cached.and_then(|p| p.name.clone()),
-                    about: cached.and_then(|p| p.about.clone()),
-                    picture_url: cached
-                        .and_then(|p| p.display_picture_url(&self.data_dir, &pubkey)),
+                    name,
+                    about,
+                    picture_url,
                     is_followed,
                 });
                 self.emit_state();
@@ -4737,6 +5098,13 @@ impl AppCore {
                     vec![],
                 );
 
+                // Clean up per-group profiles.
+                self.group_profiles.remove(&chat_id);
+                if let Some(conn) = self.profile_db.as_ref() {
+                    profile_db::delete_group_profiles(conn, &chat_id);
+                }
+                profile_pics::delete_group_cache(&self.data_dir, &chat_id);
+
                 // Navigate back to chat list.
                 prune_chat_routes(&mut self.state.router.screen_stack, &chat_id);
                 self.state.current_chat = None;
@@ -4772,6 +5140,20 @@ impl AppCore {
                     None,
                     vec![],
                 );
+            }
+            AppAction::SaveGroupProfile {
+                chat_id,
+                name,
+                about,
+            } => {
+                self.save_group_profile(chat_id, name, about);
+            }
+            AppAction::UploadGroupProfileImage {
+                chat_id,
+                image_base64,
+                mime_type,
+            } => {
+                self.upload_group_profile_image(chat_id, image_base64, mime_type);
             }
         }
     }
@@ -4937,7 +5319,7 @@ fn prune_chat_routes(stack: &mut Vec<Screen>, chat_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_pics, prune_chat_routes, AppCore, ProfileCache};
+    use super::{profile_db, profile_pics, prune_chat_routes, AppCore, ProfileCache};
     use crate::bunker_signer::{NostrConnectBunkerSignerConnector, SharedBunkerSignerConnector};
     use crate::external_signer::SharedExternalSignerBridge;
     use crate::Screen;
@@ -5108,6 +5490,158 @@ mod tests {
         assert!(
             cache_path.exists(),
             "cached file should be kept when URL unchanged"
+        );
+    }
+
+    #[test]
+    fn upsert_group_profile_inserts_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().into_owned();
+        let mut core = make_core(data_dir);
+
+        let cache = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"Alice in Group"}"#.to_string()),
+            1,
+            1,
+        );
+        core.upsert_group_profile("chat1", "alice_pk".to_string(), cache, None);
+
+        let gp = core.group_profiles.get("chat1").unwrap();
+        assert_eq!(
+            gp.get("alice_pk").unwrap().name.as_deref(),
+            Some("Alice in Group")
+        );
+    }
+
+    #[test]
+    fn upsert_group_profile_skips_older() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().into_owned();
+        let mut core = make_core(data_dir);
+
+        let newer = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"New Name"}"#.to_string()),
+            10,
+            10,
+        );
+        core.upsert_group_profile("chat1", "pk1".to_string(), newer, None);
+
+        // Attempt to upsert an older profile — should be ignored.
+        let older = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"Old Name"}"#.to_string()),
+            5,
+            5,
+        );
+        core.upsert_group_profile("chat1", "pk1".to_string(), older, None);
+
+        let gp = core.group_profiles.get("chat1").unwrap();
+        assert_eq!(
+            gp.get("pk1").unwrap().name.as_deref(),
+            Some("New Name"),
+            "older profile should not replace newer one"
+        );
+    }
+
+    #[test]
+    fn upsert_group_profile_does_not_affect_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().into_owned();
+        let mut core = make_core(data_dir);
+
+        // Insert a global profile.
+        let global = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"Global Alice"}"#.to_string()),
+            1,
+            1,
+        );
+        core.profiles.insert("alice".to_string(), global);
+
+        // Insert a group profile for the same pubkey.
+        let group = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"Group Alice"}"#.to_string()),
+            2,
+            2,
+        );
+        core.upsert_group_profile("chat1", "alice".to_string(), group, None);
+
+        // Global profile should be unchanged.
+        assert_eq!(
+            core.profiles.get("alice").unwrap().name.as_deref(),
+            Some("Global Alice")
+        );
+        // Group profile should be separate.
+        assert_eq!(
+            core.group_profiles
+                .get("chat1")
+                .unwrap()
+                .get("alice")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Group Alice")
+        );
+    }
+
+    #[test]
+    fn upsert_group_profile_persists_to_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().into_owned();
+        let mut core = make_core(data_dir);
+
+        let cache = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"Persisted"}"#.to_string()),
+            1,
+            1,
+        );
+        core.upsert_group_profile("chat1", "pk1".to_string(), cache, None);
+
+        // Verify it was persisted to the DB.
+        let conn = core.profile_db.as_ref().unwrap();
+        let loaded = profile_db::load_group_profiles(conn, "chat1");
+        assert_eq!(
+            loaded.get("pk1").unwrap().name.as_deref(),
+            Some("Persisted")
+        );
+    }
+
+    #[test]
+    fn upsert_group_profile_separate_chats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_string_lossy().into_owned();
+        let mut core = make_core(data_dir);
+
+        let cache1 = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"In Chat1"}"#.to_string()),
+            1,
+            1,
+        );
+        let cache2 = ProfileCache::from_metadata_json(
+            Some(r#"{"display_name":"In Chat2"}"#.to_string()),
+            1,
+            1,
+        );
+        core.upsert_group_profile("chat1", "pk1".to_string(), cache1, None);
+        core.upsert_group_profile("chat2", "pk1".to_string(), cache2, None);
+
+        assert_eq!(
+            core.group_profiles
+                .get("chat1")
+                .unwrap()
+                .get("pk1")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("In Chat1")
+        );
+        assert_eq!(
+            core.group_profiles
+                .get("chat2")
+                .unwrap()
+                .get("pk1")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("In Chat2")
         );
     }
 
@@ -5401,6 +5935,7 @@ mod tests {
                 first_unread_message_id: None,
                 can_load_older: false,
                 typing_members: vec![],
+                my_group_profile: None,
             });
             let other = Keys::generate();
             let msg = make_test_message(
@@ -5940,6 +6475,242 @@ mod tests {
             assert!(!core.state.busy.creating_chat);
             // No error toast — success path.
             assert!(core.state.toast.is_none());
+        }
+    }
+
+    mod group_profile_tests {
+        use super::*;
+        use crate::mdk_support::open_mdk;
+        use mdk_core::prelude::{message_types, GroupId, NostrGroupConfigData};
+        use nostr_sdk::prelude::*;
+
+        fn make_core_with_group() -> (AppCore, String, Keys, GroupId) {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let data_dir = tempdir.path().to_string_lossy().into_owned();
+            std::mem::forget(tempdir);
+
+            let creator = Keys::generate();
+            let pubkey = creator.public_key();
+            let mdk = open_mdk(&data_dir, &pubkey, "").expect("open_mdk");
+
+            let config = NostrGroupConfigData::new(
+                "Test".to_string(),
+                String::new(),
+                None,
+                None,
+                None,
+                vec![RelayUrl::parse("wss://test.relay").unwrap()],
+                vec![pubkey],
+            );
+            let result = mdk
+                .create_group(&pubkey, vec![], config)
+                .expect("create_group");
+            let group_id = result.group.mls_group_id.clone();
+            let chat_id = hex::encode(result.group.nostr_group_id);
+            mdk.merge_pending_commit(&group_id)
+                .expect("merge_pending_commit");
+
+            let mut core = make_core(data_dir);
+            let client = Client::builder().signer(creator.clone()).build();
+            core.session = Some(super::super::Session {
+                pubkey,
+                local_keys: Some(creator.clone()),
+                mdk,
+                client,
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                giftwrap_sub: None,
+                group_sub: None,
+                groups: std::collections::HashMap::new(),
+            });
+
+            (core, chat_id, creator, group_id)
+        }
+
+        fn make_test_message(
+            pubkey: &PublicKey,
+            kind: Kind,
+            content: &str,
+            mls_group_id: &GroupId,
+            tags: Tags,
+        ) -> message_types::Message {
+            message_types::Message {
+                id: EventId::all_zeros(),
+                pubkey: *pubkey,
+                kind,
+                mls_group_id: mls_group_id.clone(),
+                created_at: Timestamp::now(),
+                processed_at: Timestamp::now(),
+                content: content.to_string(),
+                tags: tags.clone(),
+                event: UnsignedEvent::new(
+                    *pubkey,
+                    Timestamp::now(),
+                    kind,
+                    tags,
+                    content.to_string(),
+                ),
+                wrapper_event_id: EventId::all_zeros(),
+                epoch: None,
+                state: message_types::MessageState::Processed,
+            }
+        }
+
+        #[test]
+        fn classify_kind0_as_group_profile() {
+            let keys = Keys::generate();
+            let gid = GroupId::from_slice(&[1, 2, 3]);
+            let msg = make_test_message(
+                &keys.public_key(),
+                Kind::Metadata,
+                r#"{"display_name":"Test"}"#,
+                &gid,
+                Tags::new(),
+            );
+            assert_eq!(
+                super::super::classify_app_message(&msg),
+                Some(super::super::AppMessageKind::GroupProfile)
+            );
+        }
+
+        #[test]
+        fn group_profile_not_chat_visible() {
+            assert!(!super::super::AppMessageKind::GroupProfile.is_chat_visible());
+            assert!(!super::super::AppMessageKind::GroupProfile.increments_unread());
+            assert!(!super::super::AppMessageKind::GroupProfile.increments_loaded());
+        }
+
+        #[test]
+        fn handle_group_profile_self_set() {
+            let (mut core, chat_id, keys, group_id) = make_core_with_group();
+            core.refresh_all_from_storage();
+
+            let metadata_json = r#"{"display_name":"Alice in Group","about":"group bio"}"#;
+            let msg = make_test_message(
+                &keys.public_key(),
+                Kind::Metadata,
+                metadata_json,
+                &group_id,
+                Tags::new(),
+            );
+
+            core.handle_app_message(&chat_id, msg);
+
+            let pk_hex = keys.public_key().to_hex();
+            let gp = core.group_profiles.get(&chat_id).unwrap();
+            let cached = gp.get(&pk_hex).unwrap();
+            assert_eq!(cached.name.as_deref(), Some("Alice in Group"));
+            assert_eq!(cached.about.as_deref(), Some("group bio"));
+        }
+
+        #[test]
+        fn handle_group_profile_rebroadcast_with_p_tag() {
+            let (mut core, chat_id, keys, group_id) = make_core_with_group();
+            core.refresh_all_from_storage();
+
+            let admin = keys.public_key();
+            let real_owner = Keys::generate().public_key();
+            let real_owner_hex = real_owner.to_hex();
+
+            let metadata_json = r#"{"display_name":"Bob's Group Name"}"#;
+            let msg = make_test_message(
+                &admin,
+                Kind::Metadata,
+                metadata_json,
+                &group_id,
+                Tags::from_list(vec![Tag::public_key(real_owner)]),
+            );
+
+            core.handle_app_message(&chat_id, msg);
+
+            let gp = core.group_profiles.get(&chat_id).unwrap();
+            assert!(
+                gp.get(&real_owner_hex).is_some(),
+                "profile should be attributed to p-tag pubkey"
+            );
+            assert_eq!(
+                gp.get(&real_owner_hex).unwrap().name.as_deref(),
+                Some("Bob's Group Name")
+            );
+            assert!(gp.get(&admin.to_hex()).is_none());
+        }
+
+        #[test]
+        fn group_profile_does_not_increment_unread() {
+            let (mut core, chat_id, keys, group_id) = make_core_with_group();
+            core.refresh_all_from_storage();
+
+            let msg = make_test_message(
+                &keys.public_key(),
+                Kind::Metadata,
+                r#"{"display_name":"Test"}"#,
+                &group_id,
+                Tags::new(),
+            );
+
+            let before = *core.unread_counts.get(&chat_id).unwrap_or(&0);
+            core.handle_app_message(&chat_id, msg);
+            let after = *core.unread_counts.get(&chat_id).unwrap_or(&0);
+            assert_eq!(
+                before, after,
+                "group profile should not increment unread count"
+            );
+        }
+
+        #[test]
+        fn group_profiles_lazy_loaded_on_refresh() {
+            let (mut core, chat_id, _keys, _gid) = make_core_with_group();
+            core.refresh_all_from_storage();
+
+            // Seed a group profile directly in the DB.
+            let cache = ProfileCache::from_metadata_json(
+                Some(r#"{"display_name":"DB Only"}"#.to_string()),
+                1,
+                0,
+            );
+            if let Some(conn) = core.profile_db.as_ref() {
+                profile_db::save_group_profile(conn, "lazy_pk", &chat_id, &cache);
+            }
+
+            // Ensure it's NOT in memory yet.
+            assert!(
+                core.group_profiles
+                    .get(&chat_id)
+                    .and_then(|m| m.get("lazy_pk"))
+                    .is_none(),
+                "profile should not be in memory before refresh"
+            );
+
+            // Clear the in-memory map so the lazy-load path is triggered.
+            core.group_profiles.clear();
+
+            // refresh_chat_list_from_storage should lazy-load from DB.
+            core.refresh_chat_list_from_storage();
+
+            let gp = core
+                .group_profiles
+                .get(&chat_id)
+                .and_then(|m| m.get("lazy_pk"));
+            assert!(gp.is_some(), "group profile should be lazy-loaded from DB");
+            assert_eq!(gp.unwrap().name.as_deref(), Some("DB Only"));
+        }
+
+        #[test]
+        fn stop_session_clears_group_profiles() {
+            let (mut core, chat_id, _keys, _gid) = make_core_with_group();
+
+            let cache = ProfileCache::from_metadata_json(
+                Some(r#"{"display_name":"Test"}"#.to_string()),
+                1,
+                1,
+            );
+            core.upsert_group_profile(&chat_id, "pk1".to_string(), cache, None);
+            assert!(!core.group_profiles.is_empty());
+
+            core.stop_session();
+            assert!(
+                core.group_profiles.is_empty(),
+                "group profiles should be cleared on session stop"
+            );
         }
     }
 }

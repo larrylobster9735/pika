@@ -137,7 +137,7 @@ fn path_if_exists(path: &Path) -> Option<String> {
     }
 }
 
-fn is_imeta_tag(tag: &Tag) -> bool {
+pub(super) fn is_imeta_tag(tag: &Tag) -> bool {
     matches!(tag.kind(), TagKind::Custom(kind) if kind.as_ref() == "imeta")
 }
 
@@ -346,74 +346,29 @@ impl AppCore {
 
         let tx = self.core_sender.clone();
         self.runtime.spawn(async move {
-            if blossom_servers.is_empty() {
-                let _ = tx.send(CoreMsg::Internal(Box::new(
-                    InternalEvent::ChatMediaUploadCompleted {
-                        request_id,
-                        uploaded_url: None,
-                        descriptor_sha256_hex: None,
-                        error: Some("No valid Blossom servers configured".to_string()),
-                    },
-                )));
-                return;
-            }
-
-            let mut last_error: Option<String> = None;
-            for server in &blossom_servers {
-                let base_url = match Url::parse(server) {
-                    Ok(url) => url,
-                    Err(e) => {
-                        last_error = Some(format!("{server}: {e}"));
-                        continue;
-                    }
-                };
-
-                let blossom = BlossomClient::new(base_url);
-                let descriptor = match blossom
-                    .upload_blob(
-                        encrypted_data.clone(),
-                        Some(upload_mime.clone()),
-                        None,
-                        Some(&signer_keys),
-                    )
-                    .await
-                {
-                    Ok(descriptor) => descriptor,
-                    Err(e) => {
-                        last_error = Some(format!("{server}: {e}"));
-                        continue;
-                    }
-                };
-
-                let descriptor_hash_hex = descriptor.sha256.to_string();
-                if !descriptor_hash_hex.eq_ignore_ascii_case(&expected_hash_hex) {
-                    last_error = Some(format!(
-                        "{server}: uploaded hash mismatch (expected {expected_hash_hex}, got {descriptor_hash_hex})"
-                    ));
-                    continue;
-                }
-
-                let _ = tx.send(CoreMsg::Internal(Box::new(
-                    InternalEvent::ChatMediaUploadCompleted {
-                        request_id,
-                        uploaded_url: Some(descriptor.url.to_string()),
-                        descriptor_sha256_hex: Some(descriptor_hash_hex),
-                        error: None,
-                    },
-                )));
-                return;
-            }
-
-            let _ = tx.send(CoreMsg::Internal(Box::new(
-                InternalEvent::ChatMediaUploadCompleted {
+            let result = upload_to_blossom(
+                &blossom_servers,
+                encrypted_data,
+                &upload_mime,
+                &expected_hash_hex,
+                &signer_keys,
+            )
+            .await;
+            let event = match result {
+                Ok((url, hash)) => InternalEvent::ChatMediaUploadCompleted {
+                    request_id,
+                    uploaded_url: Some(url),
+                    descriptor_sha256_hex: Some(hash),
+                    error: None,
+                },
+                Err(e) => InternalEvent::ChatMediaUploadCompleted {
                     request_id,
                     uploaded_url: None,
                     descriptor_sha256_hex: None,
-                    error: Some(
-                        last_error.unwrap_or_else(|| "Blossom upload failed".to_string()),
-                    ),
+                    error: Some(e),
                 },
-            )));
+            };
+            let _ = tx.send(CoreMsg::Internal(Box::new(event)));
         });
     }
 
@@ -877,6 +832,60 @@ impl AppCore {
 
         self.refresh_current_chat_if_open(&pending.chat_id);
     }
+}
+
+/// Upload data to the first available Blossom server, verifying the hash.
+/// Returns `(uploaded_url, descriptor_hash_hex)` on success.
+pub(super) async fn upload_to_blossom(
+    servers: &[String],
+    data: Vec<u8>,
+    mime_type: &str,
+    expected_hash_hex: &str,
+    signer: &nostr_sdk::Keys,
+) -> Result<(String, String), String> {
+    if servers.is_empty() {
+        return Err("No valid Blossom servers configured".to_string());
+    }
+
+    let mut last_error: Option<String> = None;
+    for server in servers {
+        let base_url = match Url::parse(server) {
+            Ok(url) => url,
+            Err(e) => {
+                last_error = Some(format!("{server}: {e}"));
+                continue;
+            }
+        };
+
+        let blossom = BlossomClient::new(base_url);
+        let descriptor = match blossom
+            .upload_blob(
+                data.clone(),
+                Some(mime_type.to_string()),
+                None,
+                Some(signer),
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                last_error = Some(format!("{server}: {e}"));
+                continue;
+            }
+        };
+
+        let descriptor_hash_hex = descriptor.sha256.to_string();
+        if !descriptor_hash_hex.eq_ignore_ascii_case(expected_hash_hex) {
+            last_error = Some(format!(
+                "{server}: uploaded hash mismatch (expected {expected_hash_hex}, got {descriptor_hash_hex})"
+            ));
+            continue;
+        }
+
+        return Ok((descriptor.url.to_string(), descriptor_hash_hex));
+    }
+
+    Err(last_error.unwrap_or_else(|| "Blossom upload failed".to_string()))
 }
 
 #[cfg(test)]

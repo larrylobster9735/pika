@@ -5934,7 +5934,7 @@ dependencies = [
  "pika-media",
  "pika-relay-profiles",
  "pika-tls",
- "pikahub",
+ "pikahut",
  "rand 0.8.5",
  "regex",
  "reqwest",
@@ -6011,14 +6011,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "pikahub"
+name = "pikahut"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bech32",
  "chrono",
  "clap",
  "nix",
  "pika-marmot-runtime",
+ "pika-relay-profiles",
+ "pika_core",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

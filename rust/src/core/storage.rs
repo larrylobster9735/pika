@@ -10,47 +10,74 @@ use std::sync::OnceLock;
 impl AppCore {
     /// Build a sender pubkey → display name lookup from member info + profile cache,
     /// including the current user's name for mention resolution.
+    /// Uses group profile if one exists (all-or-nothing), otherwise global.
     fn build_sender_names(
         &self,
+        chat_id: &str,
         members: &[super::GroupMember],
         my_pubkey_hex: &str,
     ) -> HashMap<String, String> {
+        let group_map = self.group_profiles.get(chat_id);
         let mut names: HashMap<String, String> = members
             .iter()
             .filter_map(|m| {
                 let hex = m.pubkey.to_hex();
-                let display = m
-                    .name
-                    .clone()
-                    .or_else(|| self.profiles.get(&hex).and_then(|p| p.name.clone()));
+                let display = if let Some(gp) = group_map.and_then(|gm| gm.get(&hex)) {
+                    gp.name.clone()
+                } else {
+                    m.name
+                        .clone()
+                        .or_else(|| self.profiles.get(&hex).and_then(|p| p.name.clone()))
+                };
                 display.map(|n| (hex, n))
             })
             .collect();
-        let my_name = &self.state.my_profile.name;
-        if !my_name.is_empty() {
-            names.insert(my_pubkey_hex.to_string(), my_name.clone());
+        // Own name: use group profile if exists, otherwise global.
+        let my_name = if let Some(gp) = group_map.and_then(|gm| gm.get(my_pubkey_hex)) {
+            gp.name.clone()
+        } else {
+            let n = &self.state.my_profile.name;
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.clone())
+            }
+        };
+        if let Some(name) = my_name {
+            names.insert(my_pubkey_hex.to_string(), name);
         }
         names
     }
 
     /// Build a member profile lookup: pubkey_hex → (name, npub, picture_url),
     /// including the current user.
+    /// Uses group profile if one exists (all-or-nothing), otherwise global.
     fn build_member_profiles(
         &self,
+        chat_id: &str,
         sess: &super::Session,
         members: &[super::GroupMember],
         my_pubkey_hex: &str,
     ) -> HashMap<String, (Option<String>, String, Option<String>)> {
+        let group_map = self.group_profiles.get(chat_id);
         let mut profiles: HashMap<String, (Option<String>, String, Option<String>)> = members
             .iter()
             .map(|m| {
                 let hex = m.pubkey.to_hex();
                 let npub = m.pubkey.to_bech32().unwrap_or_else(|_| hex.clone());
-                let name = m
-                    .name
-                    .clone()
-                    .or_else(|| self.profiles.get(&hex).and_then(|p| p.name.clone()));
-                let picture_url = m.picture_url.clone();
+                let (name, picture_url) = if let Some(gp) = group_map.and_then(|gm| gm.get(&hex)) {
+                    (
+                        gp.name.clone(),
+                        gp.display_group_picture_url(&self.data_dir, chat_id, &hex),
+                    )
+                } else {
+                    (
+                        m.name
+                            .clone()
+                            .or_else(|| self.profiles.get(&hex).and_then(|p| p.name.clone())),
+                        m.picture_url.clone(),
+                    )
+                };
                 (hex, (name, npub, picture_url))
             })
             .collect();
@@ -59,14 +86,20 @@ impl AppCore {
                 .pubkey
                 .to_bech32()
                 .unwrap_or_else(|_| my_pubkey_hex.to_string());
-            let my_pic = self.state.my_profile.picture_url.clone();
-            let my_name = &self.state.my_profile.name;
-            let name = if my_name.is_empty() {
-                None
+            let (my_name, my_pic) = if let Some(gp) = group_map.and_then(|gm| gm.get(my_pubkey_hex))
+            {
+                (
+                    gp.name.clone(),
+                    gp.display_group_picture_url(&self.data_dir, chat_id, my_pubkey_hex),
+                )
             } else {
-                Some(my_name.clone())
+                let n = &self.state.my_profile.name;
+                (
+                    if n.is_empty() { None } else { Some(n.clone()) },
+                    self.state.my_profile.picture_url.clone(),
+                )
             };
-            profiles.insert(my_pubkey_hex.to_string(), (name, my_npub, my_pic));
+            profiles.insert(my_pubkey_hex.to_string(), (my_name, my_npub, my_pic));
         }
         profiles
     }
@@ -127,21 +160,42 @@ impl AppCore {
             let is_group =
                 other_members.len() > 1 || (explicit_name.is_some() && !other_members.is_empty());
 
-            // Build member info with cached profiles.
+            // Lazy-load group profiles from DB if not yet in memory.
+            if !self.group_profiles.contains_key(&chat_id) {
+                if let Some(conn) = self.profile_db.as_ref() {
+                    let gp = super::profile_db::load_group_profiles(conn, &chat_id);
+                    if !gp.is_empty() {
+                        self.group_profiles.insert(chat_id.clone(), gp);
+                    }
+                }
+            }
+
+            // Build member info with cached profiles (group all-or-nothing, else global).
             let now = crate::state::now_seconds();
+            let group_map = self.group_profiles.get(&chat_id);
             let mut member_infos: Vec<super::GroupMember> = Vec::new();
             for pk in &other_members {
                 let hex = pk.to_hex();
-                let cached = self.profiles.get(&hex);
-                let name = cached.and_then(|p| p.name.clone());
-                let picture_url = cached.and_then(|p| p.display_picture_url(&self.data_dir, &hex));
+                let (name, picture_url) = if let Some(gp) = group_map.and_then(|gm| gm.get(&hex)) {
+                    (
+                        gp.name.clone(),
+                        gp.display_group_picture_url(&self.data_dir, &chat_id, &hex),
+                    )
+                } else {
+                    let cached = self.profiles.get(&hex);
+                    (
+                        cached.and_then(|p| p.name.clone()),
+                        cached.and_then(|p| p.display_picture_url(&self.data_dir, &hex)),
+                    )
+                };
                 member_infos.push(super::GroupMember {
                     pubkey: *pk,
                     name,
                     picture_url,
                 });
 
-                let needs_fetch = match cached {
+                let global_cached = self.profiles.get(&hex);
+                let needs_fetch = match global_cached {
                     None => true,
                     Some(p) => (now - p.last_checked_at) > 3600,
                 };
@@ -366,8 +420,9 @@ impl AppCore {
 
         let my_pubkey_hex = sess.pubkey.to_hex();
 
-        let sender_names = self.build_sender_names(&entry.members, &my_pubkey_hex);
-        let member_profiles = self.build_member_profiles(sess, &entry.members, &my_pubkey_hex);
+        let sender_names = self.build_sender_names(chat_id, &entry.members, &my_pubkey_hex);
+        let member_profiles =
+            self.build_member_profiles(chat_id, sess, &entry.members, &my_pubkey_hex);
 
         let desired = *self.loaded_count.get(chat_id).unwrap_or(&50usize);
         let target = desired.max(50);
@@ -521,6 +576,26 @@ impl AppCore {
 
         let typing = self.get_active_typers(chat_id);
 
+        // Lazy-load group profiles from DB if not yet in memory.
+        if !self.group_profiles.contains_key(chat_id) {
+            if let Some(conn) = self.profile_db.as_ref() {
+                let gp = super::profile_db::load_group_profiles(conn, chat_id);
+                if !gp.is_empty() {
+                    self.group_profiles.insert(chat_id.to_string(), gp);
+                }
+            }
+        }
+
+        let my_group_profile = self
+            .group_profiles
+            .get(chat_id)
+            .and_then(|m| m.get(&my_pubkey_hex))
+            .map(|p| crate::state::MyProfileState {
+                name: p.name.clone().unwrap_or_default(),
+                about: p.about.clone().unwrap_or_default(),
+                picture_url: p.display_group_picture_url(&self.data_dir, chat_id, &my_pubkey_hex),
+            });
+
         self.state.current_chat = Some(ChatViewState {
             chat_id: chat_id.to_string(),
             is_group: entry.is_group,
@@ -531,6 +606,7 @@ impl AppCore {
             first_unread_message_id,
             can_load_older,
             typing_members: typing,
+            my_group_profile,
         });
         self.emit_current_chat();
     }
@@ -545,8 +621,9 @@ impl AppCore {
 
         let my_pubkey_hex = sess.pubkey.to_hex();
 
-        let sender_names = self.build_sender_names(&entry.members, &my_pubkey_hex);
-        let member_profiles = self.build_member_profiles(sess, &entry.members, &my_pubkey_hex);
+        let sender_names = self.build_sender_names(chat_id, &entry.members, &my_pubkey_hex);
+        let member_profiles =
+            self.build_member_profiles(chat_id, sess, &entry.members, &my_pubkey_hex);
 
         let base_offset = *self.loaded_count.get(chat_id).unwrap_or(&0);
         let mut visible_page = Vec::new();

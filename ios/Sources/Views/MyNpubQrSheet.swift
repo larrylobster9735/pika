@@ -268,13 +268,16 @@ struct MyNpubQrSheet: View {
     private var developerSection: some View {
         if developerModeEnabled {
             Section {
+                Button("Wipe Profile Cache") {
+                    onAction(.wipeProfileCache)
+                }
                 Button("Wipe All Local Data", role: .destructive) {
                     showWipeLocalDataConfirm = true
                 }
             } header: {
                 Text("Developer Mode")
             } footer: {
-                Text("Deletes all local Pika data on this device and logs out immediately.")
+                Text("Wipe Profile Cache clears cached profiles and pictures. Wipe All Local Data deletes everything and logs out.")
             }
         }
     }

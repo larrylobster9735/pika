@@ -121,6 +121,7 @@ impl AppCore {
         self.subs_recompute_token = self.subs_recompute_token.wrapping_add(1);
         self.subs_recompute_in_flight = false;
         self.subs_recompute_dirty = false;
+        self.group_profiles.clear();
 
         if let Some(sess) = self.session.take() {
             sess.alive.store(false, Ordering::SeqCst);

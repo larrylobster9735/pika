@@ -324,6 +324,24 @@ If --output is omitted, the original filename from the sender is used.")]
         picture: Option<PathBuf>,
     },
 
+    /// Set a per-group profile (name/about published as kind-0 inside the MLS group)
+    #[command(after_help = "Examples:
+  pikachat update-group-profile --group <HEX> --name \"Alice in Wonderland\"
+  pikachat update-group-profile --group <HEX> --name \"Alice\" --about \"group bio\"")]
+    UpdateGroupProfile {
+        /// Nostr group ID (hex)
+        #[arg(long)]
+        group: String,
+
+        /// Display name for this group
+        #[arg(long)]
+        name: Option<String>,
+
+        /// About text for this group
+        #[arg(long)]
+        about: Option<String>,
+    },
+
     /// Listen for incoming messages (runs until interrupted or --timeout)
     #[command(after_help = "Examples:
   pikachat listen                    # listen for 60 seconds
@@ -796,6 +814,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Profile => cmd_profile(&cli).await,
         Command::UpdateProfile { name, picture } => {
             cmd_update_profile(&cli, name.as_deref(), picture.as_deref()).await
+        }
+        Command::UpdateGroupProfile { group, name, about } => {
+            cmd_update_group_profile(&cli, group, name.as_deref(), about.as_deref()).await
         }
         Command::Listen { timeout, lookback } => cmd_listen(&cli, *timeout, *lookback).await,
         Command::Daemon {
@@ -2519,6 +2540,56 @@ async fn cmd_update_profile(
         "name": metadata.name,
         "about": metadata.about,
         "picture_url": metadata.picture,
+    }));
+    Ok(())
+}
+
+async fn cmd_update_group_profile(
+    cli: &Cli,
+    group_hex: &str,
+    name: Option<&str>,
+    about: Option<&str>,
+) -> anyhow::Result<()> {
+    if name.is_none() && about.is_none() {
+        anyhow::bail!("at least one of --name or --about is required");
+    }
+
+    let (keys, mdk) = open(cli)?;
+    let group = find_group(&mdk, group_hex)?;
+    let relays = relay_util::parse_relay_urls(&resolve_relays(cli))?;
+    let client = client(cli, &keys).await?;
+
+    // Build metadata JSON.
+    let mut metadata = Metadata::new();
+    if let Some(n) = name {
+        let trimmed = n.trim();
+        if !trimmed.is_empty() {
+            metadata.name = Some(trimmed.to_string());
+            metadata.display_name = Some(trimmed.to_string());
+        }
+    }
+    if let Some(a) = about {
+        let trimmed = a.trim();
+        if !trimmed.is_empty() {
+            metadata.about = Some(trimmed.to_string());
+        }
+    }
+
+    let metadata_json = serde_json::to_string(&metadata)?;
+
+    // Build kind-0 rumor and encrypt via MLS.
+    let rumor = EventBuilder::new(Kind::Metadata, &metadata_json).build(keys.public_key());
+    let msg_event = mdk
+        .create_message(&group.mls_group_id, rumor)
+        .context("create group profile message")?;
+    relay_util::publish_and_confirm(&client, &relays, &msg_event, "update_group_profile").await?;
+    client.shutdown().await;
+
+    let ngid = hex::encode(group.nostr_group_id);
+    print(json!({
+        "nostr_group_id": ngid,
+        "name": metadata.name,
+        "about": metadata.about,
     }));
     Ok(())
 }

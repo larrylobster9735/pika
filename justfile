@@ -45,7 +45,7 @@ info:
     @echo
     @echo "Agent demos"
     @echo "  Local backend (postgres + relay + server):"
-    @echo "    just pikahub"
+    @echo "    just pikahut-up"
     @echo "  Fly demo (against local backend):"
     @echo "    just agent-fly-local"
     @echo "  Fly demo (against deployed backend):"
@@ -225,6 +225,11 @@ pre-commit: fmt clippy
     just --fmt --check --unstable
     npx --yes @justinmoon/agent-tools check-docs
     npx --yes @justinmoon/agent-tools check-justfile
+    just clippy --lib --tests
+    cargo clippy -p pikachat --tests -- -D warnings
+    cargo clippy -p pikachat-sidecar --tests -- -D warnings
+    cargo clippy -p pika-server --tests -- -D warnings
+    cargo clippy -p pikahut -- -D warnings
 
 # CI-safe pre-merge for the Pika app lane.
 pre-merge-pika: fmt clippy
@@ -241,21 +246,25 @@ pre-merge-pika: fmt clippy
 pre-merge-notifications:
     #!/usr/bin/env bash
     set -euo pipefail
-    SD="$(mktemp -d /tmp/pikahub-notifications.XXXXXX)"
-    cleanup() { cargo run -q -p pikahub -- down --state-dir "$SD" 2>/dev/null || true; rm -rf "$SD"; }
+    SD="$(mktemp -d /tmp/pikahut-notifications.XXXXXX)"
+    cleanup() { cargo run -q -p pikahut -- down --state-dir "$SD" 2>/dev/null || true; rm -rf "$SD"; }
     trap cleanup EXIT
-    cargo run -q -p pikahub -- up --profile postgres --background --state-dir "$SD" >/dev/null
-    eval "$(cargo run -q -p pikahub -- env --state-dir "$SD")"
+    cargo run -q -p pikahut -- up --profile postgres --background --state-dir "$SD" >/dev/null
+    eval "$(cargo run -q -p pikahut -- env --state-dir "$SD")"
     cargo clippy -p pika-server -- -D warnings
     cargo test -p pika-server -- --test-threads=1
     echo "pre-merge-notifications complete"
 
-# CI-safe pre-merge for the pikachat lane (CLI + daemon sidecar).
+# CI-safe pre-merge for the pikachat lane (deterministic only).
 pre-merge-pikachat:
     cargo clippy -p pikachat -- -D warnings
     cargo clippy -p pikachat-sidecar -- -D warnings
     cargo test -p pikachat
     cargo test -p pikachat-sidecar
+    cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic post_rebase_invalid_event_rejection_boundary -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic post_rebase_logout_session_convergence_boundary -- --ignored --nocapture
+    just openclaw-pikachat-deterministic
     @echo "pre-merge-pikachat complete"
 
 # Deterministic provider control-plane contracts (mocked Fly + mocked MicroVM spawner).
@@ -272,18 +281,18 @@ pre-merge-rmp:
     just rmp-init-smoke-ci
     @echo "pre-merge-rmp complete"
 
-# CI-safe pre-merge for the pikahub tooling lane.
+# CI-safe pre-merge for the pikahut tooling lane.
 pre-merge-fixture:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo clippy -p pikahub -- -D warnings
-    cargo test -p pikahub
-    SD="$(mktemp -d /tmp/pikahub-smoke.XXXXXX)"
-    cleanup() { cargo run -q -p pikahub -- down --state-dir "$SD" 2>/dev/null || true; rm -rf "$SD"; }
+    cargo clippy -p pikahut -- -D warnings
+    cargo test -p pikahut
+    SD="$(mktemp -d /tmp/pikahut-smoke.XXXXXX)"
+    cleanup() { cargo run -q -p pikahut -- down --state-dir "$SD" 2>/dev/null || true; rm -rf "$SD"; }
     trap cleanup EXIT
-    cargo run -q -p pikahub -- up --profile relay --background --state-dir "$SD" --relay-port 0 >/dev/null
-    cargo run -q -p pikahub -- wait --state-dir "$SD" --timeout 30
-    cargo run -q -p pikahub -- status --state-dir "$SD" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('relay_url'), f'relay_url missing: {d}'"
+    cargo run -q -p pikahut -- up --profile relay --background --state-dir "$SD" --relay-port 0 >/dev/null
+    cargo run -q -p pikahut -- wait --state-dir "$SD" --timeout 30
+    cargo run -q -p pikahut -- status --state-dir "$SD" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('relay_url'), f'relay_url missing: {d}'"
     echo "pre-merge-fixture complete"
 
 # Single CI entrypoint for the whole repo.
@@ -302,22 +311,28 @@ nightly:
     just nightly-pikachat
     @echo "nightly complete"
 
-# Nightly E2E (Rust): run all `#[ignore]` tests (local call tests + deployed bot call).
+# Nightly E2E (Rust): public selectors + focused call-path regression boundaries.
 nightly-pika-e2e:
     set -euo pipefail; \
-    if [ -z "${PIKA_TEST_NSEC:-}" ]; then \
-      echo "note: PIKA_TEST_NSEC not set; call_deployed_bot will skip"; \
+    if [ -z "${PIKA_UI_E2E_NSEC:-}" ] && [ -z "${PIKA_TEST_NSEC:-}" ]; then \
+      echo "note: neither PIKA_UI_E2E_NSEC nor PIKA_TEST_NSEC is set in the shell; deployed-bot selector may still run if .env defaults provide credentials"; \
     fi; \
-    cargo build -p pikachat; \
-    cargo test -p pika_core --tests -- --ignored --nocapture
+    cargo test -p pikahut --test integration_public -- --ignored --nocapture; \
+    cargo test -p pikahut --test integration_deterministic call_over_local_moq_relay_boundary -- --ignored --nocapture; \
+    cargo test -p pikahut --test integration_deterministic call_with_pikachat_daemon_boundary -- --ignored --nocapture
 
-# Nightly lane: pikachat E2E suite (openclaw scenarios use pikahub for local relay).
+# Nightly lane: full OpenClaw integration E2E (gateway + real sidecar wiring).
 nightly-pikachat:
-    just openclaw-pikachat-scenarios
+    just openclaw-pikachat-e2e
 
 # Nightly lane: iOS interop smoke (nostrconnect:// route + Pika bridge emission).
 nightly-primal-ios-interop:
-    ./tools/primal-ios-interop-nightly
+    cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture
+
+# Manual-only selector contracts (never required in CI lanes).
+integration-manual:
+    cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored --nocapture
+    cargo test -p pikahut --test integration_manual manual_primal_lab_runbook_contract -- --ignored --nocapture
 
 # Local Primal interop lab: dedicated simulator + local relay + event tap logs.
 primal-ios-lab:
@@ -339,13 +354,22 @@ primal-ios-lab-seed-reset:
 primal-ios-lab-dump-debug:
     ./tools/primal-ios-interop-lab dump-debug
 
-# openclaw pikachat scenario suite (local Nostr relay + pikachat scenarios).
-openclaw-pikachat-scenarios:
-    ./pikachat-openclaw/scripts/phase1.sh
-    ./pikachat-openclaw/scripts/phase2.sh
-    ./pikachat-openclaw/scripts/phase3.sh
-    ./pikachat-openclaw/scripts/phase3_audio.sh
+# openclaw pikachat deterministic contract suite (local relay + scenarios + focused tests).
+openclaw-pikachat-deterministic:
+    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_rust_bot -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic openclaw_scenario_audio_echo -- --ignored --nocapture
     PIKACHAT_TTS_FIXTURE=1 cargo test -p pikachat-sidecar daemon::tests::tts_pcm_publish_reaches_subscriber -- --nocapture
+    npx --yes tsx --test pikachat-openclaw/openclaw/extensions/pikachat-openclaw/src/channel-behavior.test.ts
+
+# Full OpenClaw integration lane (nightly/manual).
+openclaw-pikachat-e2e:
+    cargo test -p pikahut --test integration_openclaw openclaw_gateway_e2e -- --ignored --nocapture
+
+# Backwards-compatible alias for older docs/scripts.
+openclaw-pikachat-scenarios:
+    just openclaw-pikachat-deterministic
 
 # Full QA: fmt, clippy, test, android build, iOS sim build.
 qa: fmt clippy test android-assemble ios-build-sim
@@ -358,12 +382,12 @@ e2e-local-relay:
 
 # E2E against public relays + deployed bot (nondeterministic).
 e2e-public-relays:
-    ./tools/ui-e2e-public --platform all
+    cargo test -p pikahut --test integration_public ui_e2e_public_all -- --ignored --nocapture
 
 # E2E call test against the deployed bot (requires PIKA_TEST_NSEC).
 e2e-deployed-bot:
     source .env 2>/dev/null || true; \
-    cargo test -p pika_core --test e2e_calls call_deployed_bot -- --ignored --nocapture
+    cargo test -p pikahut --test integration_public deployed_bot_call_flow -- --ignored --nocapture
 
 # Build Rust core + NSE for the host platform.
 rust-build-host:
@@ -478,15 +502,15 @@ android-ui-test: gen-kotlin android-rust android-local-properties
 
 # Android E2E: local Nostr relay + local Rust bot. Requires emulator.
 android-ui-e2e-local:
-    ./tools/ui-e2e-local --platform android
+    cargo test -p pikahut --test integration_deterministic ui_e2e_local_android -- --ignored --nocapture
 
 # Desktop E2E: local Nostr relay + local Rust bot.
 desktop-e2e-local:
-    ./tools/ui-e2e-local --platform desktop
+    cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture
 
 # Android E2E: public relays + deployed bot (nondeterministic). Requires emulator.
 android-ui-e2e:
-    ./tools/ui-e2e-public --platform android
+    cargo test -p pikahut --test integration_public ui_e2e_public_android -- --ignored --nocapture
 
 # Create + push version tag (pika/vX.Y.Z) after validating VERSION and clean tree.
 release VERSION:
@@ -652,11 +676,11 @@ ios-ui-test: ios-xcframework ios-xcodeproj
 
 # iOS E2E: local Nostr relay + local Rust bot.
 ios-ui-e2e-local:
-    ./tools/ui-e2e-local --platform ios
+    cargo test -p pikahut --test integration_deterministic ui_e2e_local_ios -- --ignored --nocapture
 
 # iOS E2E: public relays + deployed bot (nondeterministic). Requires PIKA_UI_E2E=1.
 ios-ui-e2e:
-    ./tools/ui-e2e-public --platform ios
+    cargo test -p pikahut --test integration_public ui_e2e_public_ios -- --ignored --nocapture
 
 # Optional: device automation (npx). Not required for building.
 device:
@@ -710,11 +734,11 @@ doctor-ios:
 
 # Interop baseline: local Rust bot. Requires ~/code/marmot-interop-lab-rust.
 interop-rust-baseline:
-    ./tools/interop-rust-baseline
+    cargo test -p pikahut --test integration_deterministic interop_rust_baseline -- --ignored --nocapture
 
 # Interactive interop test (manual send/receive with local bot).
 interop-rust-manual:
-    ./tools/interop-rust-baseline --manual
+    cargo test -p pikahut --test integration_manual manual_interop_rust_runbook_contract -- --ignored --nocapture
 
 # ── pika-relay (local Nostr relay + Blossom server) ─────────────────────────
 
@@ -740,19 +764,19 @@ relay-build:
 # ── Local backend (postgres + relay + pika-server) ──────────────────────────
 # Start local backend (postgres, pika-relay, pika-server with agent control).
 
-# State persists in .pikahub/. Press Ctrl-C to stop all services.
-pikahub:
-    cargo run -p pikahub -- up --profile backend
+# State persists in .pikahut/. Press Ctrl-C to stop all services.
+pikahut-up:
+    cargo run -p pikahut -- up --profile backend
 
-# TUI: pikahub + component logs + interactive shell via mprocs.
+# TUI: pikahut-up + component logs + interactive shell via mprocs.
 pikahut:
     mprocs
 
-# Run agent-fly against local backend (requires `just pikahub` in another terminal).
+# Run agent-fly against local backend (requires `just pikahut-up` in another terminal).
 agent-fly-local *ARGS="":
     #!/usr/bin/env bash
     set -euo pipefail
-    eval "$(cargo run -q -p pikahub -- env)"
+    eval "$(cargo run -q -p pikahut -- env)"
     if [ ! -f .env ]; then
       echo "error: missing .env in repo root"
       echo "hint: add FLY_API_TOKEN and ANTHROPIC_API_KEY to .env"
@@ -784,13 +808,13 @@ cli-identity STATE_DIR=".pikachat" RELAY="ws://127.0.0.1:7777":
 
 # Starts its own pika-relay automatically.
 cli-smoke:
-    ./tools/cli-smoke
+    cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
 
 # Quick smoke test including encrypted media upload/download over Blossom.
 
 # Starts its own relay automatically. Requires internet for the default Blossom server.
 cli-smoke-media:
-    ./tools/cli-smoke --with-media
+    cargo test -p pikahut --test integration_deterministic cli_smoke_media_local -- --ignored --nocapture
 
 # Run `pikachat agent new --provider fly` with interactive chat (loads .env).
 # Pass --json for non-interactive, --keep to skip teardown.

@@ -26,6 +26,7 @@ pub enum Message {
     LeaveGroup,
     Close,
     OpenPeerProfile(String),
+    EditGroupProfile,
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ pub enum Event {
     LeaveGroup,
     Close,
     OpenPeerProfile { pubkey: String },
+    EditGroupProfile,
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ impl State {
             Message::LeaveGroup => Some(Event::LeaveGroup),
             Message::Close => Some(Event::Close),
             Message::OpenPeerProfile(pubkey) => Some(Event::OpenPeerProfile { pubkey }),
+            Message::EditGroupProfile => Some(Event::EditGroupProfile),
         }
     }
 
@@ -81,7 +84,7 @@ impl State {
     pub fn view<'a>(
         &'a self,
         chat: &'a ChatViewState,
-        my_pubkey: &str,
+        _my_pubkey: &str,
         avatar_cache: &mut super::avatar::AvatarCache,
     ) -> Element<'a, Message, Theme> {
         let mut content = column![].spacing(4).width(Fill);
@@ -130,7 +133,7 @@ impl State {
         // ── Members section ──────────────────────────────────────────
         content = content.push(
             container(
-                text(format!("{} members", chat.members.len()))
+                text(format!("{} members", chat.members.len() + 1))
                     .size(14)
                     .font(icons::BOLD)
                     .color(theme::text_primary()),
@@ -148,18 +151,44 @@ impl State {
             ));
         }
 
-        // Member list
+        // "You" row — clickable to edit group profile.
+        let you_row = {
+            let you_icon = text(icons::USER)
+                .font(icons::LUCIDE_FONT)
+                .size(18)
+                .color(theme::accent_blue());
+            let my_label = text("You").size(14).color(theme::text_primary());
+            let mut you_content = row![you_icon, my_label]
+                .spacing(12)
+                .align_y(Alignment::Center);
+            you_content = you_content.push(Space::new().width(Fill));
+            if chat.is_admin {
+                you_content = you_content.push(text("Admin").size(12).color(theme::text_faded()));
+            }
+            button(you_content)
+                .on_press(Message::EditGroupProfile)
+                .width(Fill)
+                .padding([10, 24])
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => theme::hover_bg(),
+                        _ => iced::Color::TRANSPARENT,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        text_color: theme::text_primary(),
+                        ..Default::default()
+                    }
+                })
+        };
+
+        // Member list (You + other members).
         let is_admin = chat.is_admin;
         let member_list = chat
             .members
             .iter()
-            .fold(column![].spacing(0), |col, member| {
-                col.push(member_row(
-                    member,
-                    is_me(member, my_pubkey),
-                    is_admin,
-                    avatar_cache,
-                ))
+            .fold(column![you_row].spacing(0), |col, member| {
+                col.push(member_row(member, is_admin, avatar_cache))
             });
 
         content = content.push(scrollable(member_list).height(Fill).width(Fill));
@@ -182,10 +211,6 @@ impl State {
 }
 
 // ── Private helpers ─────────────────────────────────────────────────────────
-
-fn is_me(member: &pika_core::MemberInfo, my_pubkey: &str) -> bool {
-    member.pubkey == my_pubkey
-}
 
 /// Signal-style full-width action row: [icon] [label] — hover shows bg.
 fn danger_action_row<'a>(
@@ -261,7 +286,6 @@ fn action_row_with_input<'a>(
 /// A single member row — Signal style: full-width, hover bg, avatar + name.
 fn member_row<'a>(
     member: &'a pika_core::MemberInfo,
-    is_me: bool,
     is_admin: bool,
     avatar_cache: &mut super::avatar::AvatarCache,
 ) -> Element<'a, Message, Theme> {
@@ -279,15 +303,12 @@ fn member_row<'a>(
         avatar_cache,
     );
 
-    let label = if is_me {
-        "You".to_string()
-    } else {
-        display_name
-    };
-
-    let mut row_content = row![avatar, text(label).size(14).color(theme::text_primary())]
-        .spacing(12)
-        .align_y(Alignment::Center);
+    let mut row_content = row![
+        avatar,
+        text(display_name).size(14).color(theme::text_primary())
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
 
     row_content = row_content.push(Space::new().width(Fill));
 
@@ -295,7 +316,7 @@ fn member_row<'a>(
         row_content = row_content.push(text("Admin").size(12).color(theme::text_faded()));
     }
 
-    if !is_me && is_admin {
+    if is_admin {
         let pubkey = member.pubkey.clone();
         row_content = row_content.push(
             button(
@@ -323,11 +344,7 @@ fn member_row<'a>(
 
     let pubkey_for_profile = member.pubkey.clone();
     button(row_content)
-        .on_press_maybe(if is_me {
-            None
-        } else {
-            Some(Message::OpenPeerProfile(pubkey_for_profile))
-        })
+        .on_press(Message::OpenPeerProfile(pubkey_for_profile))
         .width(Fill)
         .padding([10, 24])
         .style(|_: &Theme, status: button::Status| {
