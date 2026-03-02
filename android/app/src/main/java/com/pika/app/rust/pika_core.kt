@@ -2400,6 +2400,8 @@ data class ChatViewState (
     var `canLoadOlder`: kotlin.Boolean
     , 
     var `typingMembers`: List<TypingMember>
+    , 
+    var `myGroupProfile`: MyProfileState?
     
 ){
     
@@ -2425,6 +2427,7 @@ public object FfiConverterTypeChatViewState: FfiConverterRustBuffer<ChatViewStat
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypeTypingMember.read(buf),
+            FfiConverterOptionalTypeMyProfileState.read(buf),
         )
     }
 
@@ -2437,7 +2440,8 @@ public object FfiConverterTypeChatViewState: FfiConverterRustBuffer<ChatViewStat
             FfiConverterSequenceTypeChatMessage.allocationSize(value.`messages`) +
             FfiConverterOptionalString.allocationSize(value.`firstUnreadMessageId`) +
             FfiConverterBoolean.allocationSize(value.`canLoadOlder`) +
-            FfiConverterSequenceTypeTypingMember.allocationSize(value.`typingMembers`)
+            FfiConverterSequenceTypeTypingMember.allocationSize(value.`typingMembers`) +
+            FfiConverterOptionalTypeMyProfileState.allocationSize(value.`myGroupProfile`)
     )
 
     override fun write(value: ChatViewState, buf: ByteBuffer) {
@@ -2450,6 +2454,7 @@ public object FfiConverterTypeChatViewState: FfiConverterRustBuffer<ChatViewStat
             FfiConverterOptionalString.write(value.`firstUnreadMessageId`, buf)
             FfiConverterBoolean.write(value.`canLoadOlder`, buf)
             FfiConverterSequenceTypeTypingMember.write(value.`typingMembers`, buf)
+            FfiConverterOptionalTypeMyProfileState.write(value.`myGroupProfile`, buf)
     }
 }
 
@@ -3411,6 +3416,28 @@ sealed class AppAction {
         companion object
     }
     
+    data class SaveGroupProfile(
+        val `chatId`: kotlin.String, 
+        val `name`: kotlin.String, 
+        val `about`: kotlin.String) : AppAction()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class UploadGroupProfileImage(
+        val `chatId`: kotlin.String, 
+        val `imageBase64`: kotlin.String, 
+        val `mimeType`: kotlin.String) : AppAction()
+        
+    {
+        
+
+        companion object
+    }
+    
     data class HypernoteAction(
         val `chatId`: kotlin.String, 
         val `messageId`: kotlin.String, 
@@ -3467,6 +3494,9 @@ sealed class AppAction {
     
     
     object EnableDeveloperMode : AppAction()
+    
+    
+    object WipeProfileCache : AppAction()
     
     
     object VoiceRecordingStart : AppAction()
@@ -3686,59 +3716,70 @@ public object FfiConverterTypeAppAction : FfiConverterRustBuffer<AppAction>{
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            36 -> AppAction.HypernoteAction(
+            36 -> AppAction.SaveGroupProfile(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            37 -> AppAction.UploadGroupProfileImage(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            38 -> AppAction.HypernoteAction(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterMapStringString.read(buf),
                 )
-            37 -> AppAction.SendHypernotePoll(
+            39 -> AppAction.SendHypernotePoll(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterSequenceString.read(buf),
                 )
-            38 -> AppAction.ArchiveChat(
+            40 -> AppAction.ArchiveChat(
                 FfiConverterString.read(buf),
                 )
-            39 -> AppAction.ReactToMessage(
+            41 -> AppAction.ReactToMessage(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            40 -> AppAction.TypingStarted(
+            42 -> AppAction.TypingStarted(
                 FfiConverterString.read(buf),
                 )
-            41 -> AppAction.ClearToast
-            42 -> AppAction.EnableDeveloperMode
-            43 -> AppAction.VoiceRecordingStart
-            44 -> AppAction.VoiceRecordingPause
-            45 -> AppAction.VoiceRecordingResume
-            46 -> AppAction.VoiceRecordingStop
-            47 -> AppAction.VoiceRecordingCancel
-            48 -> AppAction.VoiceRecordingAudioLevel(
+            43 -> AppAction.ClearToast
+            44 -> AppAction.EnableDeveloperMode
+            45 -> AppAction.WipeProfileCache
+            46 -> AppAction.VoiceRecordingStart
+            47 -> AppAction.VoiceRecordingPause
+            48 -> AppAction.VoiceRecordingResume
+            49 -> AppAction.VoiceRecordingStop
+            50 -> AppAction.VoiceRecordingCancel
+            51 -> AppAction.VoiceRecordingAudioLevel(
                 FfiConverterFloat.read(buf),
                 )
-            49 -> AppAction.VoiceRecordingTranscript(
+            52 -> AppAction.VoiceRecordingTranscript(
                 FfiConverterString.read(buf),
                 )
-            50 -> AppAction.Foregrounded
-            51 -> AppAction.NostrConnectCallback(
+            53 -> AppAction.Foregrounded
+            54 -> AppAction.NostrConnectCallback(
                 FfiConverterString.read(buf),
                 )
-            52 -> AppAction.ReloadConfig
-            53 -> AppAction.OpenPeerProfile(
+            55 -> AppAction.ReloadConfig
+            56 -> AppAction.OpenPeerProfile(
                 FfiConverterString.read(buf),
                 )
-            54 -> AppAction.ClosePeerProfile
-            55 -> AppAction.SetPushToken(
+            57 -> AppAction.ClosePeerProfile
+            58 -> AppAction.SetPushToken(
                 FfiConverterString.read(buf),
                 )
-            56 -> AppAction.ReregisterPush
-            57 -> AppAction.RefreshFollowList
-            58 -> AppAction.FollowUser(
+            59 -> AppAction.ReregisterPush
+            60 -> AppAction.RefreshFollowList
+            61 -> AppAction.FollowUser(
                 FfiConverterString.read(buf),
                 )
-            59 -> AppAction.UnfollowUser(
+            62 -> AppAction.UnfollowUser(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -4003,6 +4044,24 @@ public object FfiConverterTypeAppAction : FfiConverterRustBuffer<AppAction>{
                 + FfiConverterString.allocationSize(value.`name`)
             )
         }
+        is AppAction.SaveGroupProfile -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`chatId`)
+                + FfiConverterString.allocationSize(value.`name`)
+                + FfiConverterString.allocationSize(value.`about`)
+            )
+        }
+        is AppAction.UploadGroupProfileImage -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`chatId`)
+                + FfiConverterString.allocationSize(value.`imageBase64`)
+                + FfiConverterString.allocationSize(value.`mimeType`)
+            )
+        }
         is AppAction.HypernoteAction -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -4052,6 +4111,12 @@ public object FfiConverterTypeAppAction : FfiConverterRustBuffer<AppAction>{
             )
         }
         is AppAction.EnableDeveloperMode -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is AppAction.WipeProfileCache -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -4357,8 +4422,22 @@ public object FfiConverterTypeAppAction : FfiConverterRustBuffer<AppAction>{
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }
-            is AppAction.HypernoteAction -> {
+            is AppAction.SaveGroupProfile -> {
                 buf.putInt(36)
+                FfiConverterString.write(value.`chatId`, buf)
+                FfiConverterString.write(value.`name`, buf)
+                FfiConverterString.write(value.`about`, buf)
+                Unit
+            }
+            is AppAction.UploadGroupProfileImage -> {
+                buf.putInt(37)
+                FfiConverterString.write(value.`chatId`, buf)
+                FfiConverterString.write(value.`imageBase64`, buf)
+                FfiConverterString.write(value.`mimeType`, buf)
+                Unit
+            }
+            is AppAction.HypernoteAction -> {
+                buf.putInt(38)
                 FfiConverterString.write(value.`chatId`, buf)
                 FfiConverterString.write(value.`messageId`, buf)
                 FfiConverterString.write(value.`actionName`, buf)
@@ -4366,109 +4445,113 @@ public object FfiConverterTypeAppAction : FfiConverterRustBuffer<AppAction>{
                 Unit
             }
             is AppAction.SendHypernotePoll -> {
-                buf.putInt(37)
+                buf.putInt(39)
                 FfiConverterString.write(value.`chatId`, buf)
                 FfiConverterString.write(value.`question`, buf)
                 FfiConverterSequenceString.write(value.`options`, buf)
                 Unit
             }
             is AppAction.ArchiveChat -> {
-                buf.putInt(38)
+                buf.putInt(40)
                 FfiConverterString.write(value.`chatId`, buf)
                 Unit
             }
             is AppAction.ReactToMessage -> {
-                buf.putInt(39)
+                buf.putInt(41)
                 FfiConverterString.write(value.`chatId`, buf)
                 FfiConverterString.write(value.`messageId`, buf)
                 FfiConverterString.write(value.`emoji`, buf)
                 Unit
             }
             is AppAction.TypingStarted -> {
-                buf.putInt(40)
+                buf.putInt(42)
                 FfiConverterString.write(value.`chatId`, buf)
                 Unit
             }
             is AppAction.ClearToast -> {
-                buf.putInt(41)
-                Unit
-            }
-            is AppAction.EnableDeveloperMode -> {
-                buf.putInt(42)
-                Unit
-            }
-            is AppAction.VoiceRecordingStart -> {
                 buf.putInt(43)
                 Unit
             }
-            is AppAction.VoiceRecordingPause -> {
+            is AppAction.EnableDeveloperMode -> {
                 buf.putInt(44)
                 Unit
             }
-            is AppAction.VoiceRecordingResume -> {
+            is AppAction.WipeProfileCache -> {
                 buf.putInt(45)
                 Unit
             }
-            is AppAction.VoiceRecordingStop -> {
+            is AppAction.VoiceRecordingStart -> {
                 buf.putInt(46)
                 Unit
             }
-            is AppAction.VoiceRecordingCancel -> {
+            is AppAction.VoiceRecordingPause -> {
                 buf.putInt(47)
                 Unit
             }
-            is AppAction.VoiceRecordingAudioLevel -> {
+            is AppAction.VoiceRecordingResume -> {
                 buf.putInt(48)
+                Unit
+            }
+            is AppAction.VoiceRecordingStop -> {
+                buf.putInt(49)
+                Unit
+            }
+            is AppAction.VoiceRecordingCancel -> {
+                buf.putInt(50)
+                Unit
+            }
+            is AppAction.VoiceRecordingAudioLevel -> {
+                buf.putInt(51)
                 FfiConverterFloat.write(value.`level`, buf)
                 Unit
             }
             is AppAction.VoiceRecordingTranscript -> {
-                buf.putInt(49)
+                buf.putInt(52)
                 FfiConverterString.write(value.`text`, buf)
                 Unit
             }
             is AppAction.Foregrounded -> {
-                buf.putInt(50)
+                buf.putInt(53)
                 Unit
             }
             is AppAction.NostrConnectCallback -> {
-                buf.putInt(51)
+                buf.putInt(54)
                 FfiConverterString.write(value.`url`, buf)
                 Unit
             }
             is AppAction.ReloadConfig -> {
-                buf.putInt(52)
+                buf.putInt(55)
                 Unit
             }
             is AppAction.OpenPeerProfile -> {
-                buf.putInt(53)
+                buf.putInt(56)
                 FfiConverterString.write(value.`pubkey`, buf)
                 Unit
             }
             is AppAction.ClosePeerProfile -> {
-                buf.putInt(54)
+                buf.putInt(57)
                 Unit
             }
             is AppAction.SetPushToken -> {
-                buf.putInt(55)
+                buf.putInt(58)
                 FfiConverterString.write(value.`token`, buf)
                 Unit
             }
             is AppAction.ReregisterPush -> {
-                buf.putInt(56)
+                buf.putInt(59)
                 Unit
             }
             is AppAction.RefreshFollowList -> {
-                buf.putInt(57)
+                buf.putInt(60)
                 Unit
             }
             is AppAction.FollowUser -> {
-                buf.putInt(58)
+                buf.putInt(61)
                 FfiConverterString.write(value.`pubkey`, buf)
                 Unit
             }
             is AppAction.UnfollowUser -> {
-                buf.putInt(59)
+                buf.putInt(62)
                 FfiConverterString.write(value.`pubkey`, buf)
                 Unit
             }
@@ -5875,6 +5958,38 @@ public object FfiConverterOptionalTypeHypernoteData: FfiConverterRustBuffer<Hype
         } else {
             buf.put(1)
             FfiConverterTypeHypernoteData.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeMyProfileState: FfiConverterRustBuffer<MyProfileState?> {
+    override fun read(buf: ByteBuffer): MyProfileState? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMyProfileState.read(buf)
+    }
+
+    override fun allocationSize(value: MyProfileState?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMyProfileState.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MyProfileState?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMyProfileState.write(value, buf)
         }
     }
 }

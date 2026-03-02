@@ -330,7 +330,7 @@ fun MyProfileSheet(
             if (developerModeEnabled) {
                 item {
                     ProfileSectionCard(title = "Developer Mode") {
-                        OutlinedButton(
+                        Button(
                             onClick = { manager.dispatch(AppAction.WipeProfileCache) },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
