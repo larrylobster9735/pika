@@ -230,3 +230,39 @@ fn integration_wrapper_scripts_dispatch_to_selectors() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn shared_capable_scenarios_use_tenant_namespace_helpers() -> Result<()> {
+    let root = workspace_root();
+
+    let openclaw =
+        fs::read_to_string(root.join("crates/pikahut/src/testing/scenarios/openclaw.rs"))?;
+    assert!(
+        openclaw.contains("TenantNamespace::new("),
+        "openclaw scenario must derive tenant namespaces from helper API"
+    );
+    assert!(
+        openclaw.contains(".relay_namespace(") && openclaw.contains(".moq_namespace("),
+        "openclaw scenario must use TenantNamespace relay/moq helpers"
+    );
+    assert!(
+        !openclaw.contains("tenant/"),
+        "openclaw scenario must not hardcode tenant namespace literals"
+    );
+
+    let interop = fs::read_to_string(root.join("crates/pikahut/src/testing/scenarios/interop.rs"))?;
+    assert!(
+        interop.contains("TenantNamespace::new("),
+        "interop scenario must derive tenant namespaces from helper API"
+    );
+    assert!(
+        interop.contains(".relay_namespace(") && interop.contains(".moq_namespace("),
+        "interop scenario must use TenantNamespace relay/moq helpers"
+    );
+    assert!(
+        !interop.contains("tenant/"),
+        "interop scenario must not hardcode tenant namespace literals"
+    );
+
+    Ok(())
+}

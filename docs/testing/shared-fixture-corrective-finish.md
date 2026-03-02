@@ -47,6 +47,9 @@ The following corrective actions are intentionally scoped as immediate removals/
 
 Canonical helper surface:
 - `crates/pikahut/src/testing/tenant.rs` exposes `TenantNamespace::{relay_namespace,moq_namespace}`.
+- Shared-capable scenario consumers currently wired:
+- `crates/pikahut/src/testing/scenarios/openclaw.rs`
+- `crates/pikahut/src/testing/scenarios/interop.rs`
 
 Enforcement boundary for this cycle:
 - Shared-capable internals must route relay/MoQ tenant naming through `TenantNamespace` helpers.

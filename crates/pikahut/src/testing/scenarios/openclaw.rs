@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 use crate::config::{self, ProfileName};
 use crate::testing::{
-    ArtifactPolicy, CommandRunner, CommandSpec, FixtureSpec, TestContext, start_fixture,
+    ArtifactPolicy, CommandRunner, CommandSpec, FixtureSpec, TenantNamespace, TestContext,
+    start_fixture,
 };
 
 use super::artifacts::{self, CommandOutcomeRecord};
@@ -26,6 +27,11 @@ fn build_context(state_dir: Option<std::path::PathBuf>) -> Result<TestContext> {
 pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOutput> {
     let root = config::find_workspace_root()?;
     let mut context = build_context(args.state_dir)?;
+    let tenant_namespace =
+        TenantNamespace::new(format!("{}-{}", context.run_name(), context.run_id()))
+            .context("derive tenant namespace for openclaw-e2e")?;
+    let tenant_relay_namespace = tenant_namespace.relay_namespace("openclaw-gateway");
+    let tenant_moq_namespace = tenant_namespace.moq_namespace("openclaw-gateway");
 
     let fixture = if args.relay_url.is_none() {
         Some(start_fixture(&context, &FixtureSpec::builder(ProfileName::Relay).build()).await?)
@@ -265,6 +271,8 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
         .with_artifact(scenario_output.stdout_path.clone())
         .with_artifact(scenario_output.stderr_path.clone())
         .with_metadata("relay_url", relay_url)
+        .with_metadata("tenant_relay_namespace", tenant_relay_namespace)
+        .with_metadata("tenant_moq_namespace", tenant_moq_namespace)
         .with_metadata("openclaw_dir", openclaw_dir.to_string_lossy().to_string())
         .with_metadata("gateway_port", gw_port.to_string());
     let summary = artifacts::write_standard_summary(

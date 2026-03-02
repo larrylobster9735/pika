@@ -7,7 +7,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::config::{self, ProfileName};
 use crate::health;
 use crate::testing::{
-    ArtifactPolicy, CommandRunner, CommandSpec, FixtureSpec, TestContext, start_fixture,
+    ArtifactPolicy, CommandRunner, CommandSpec, FixtureSpec, TenantNamespace, TestContext,
+    start_fixture,
 };
 
 use super::artifacts::{self, CommandOutcomeRecord};
@@ -60,6 +61,11 @@ pub async fn run_interop_rust_baseline(
     });
 
     let mut context = build_context(explicit_state, args.keep)?;
+    let tenant_namespace =
+        TenantNamespace::new(format!("{}-{}", context.run_name(), context.run_id()))
+            .context("derive tenant namespace for interop-rust-baseline")?;
+    let tenant_relay_namespace = tenant_namespace.relay_namespace("interop-rust-bot");
+    let tenant_moq_namespace = tenant_namespace.moq_namespace("interop-rust-bot");
     let fixture =
         start_fixture(&context, &FixtureSpec::builder(ProfileName::Relay).build()).await?;
     let relay_url = fixture
@@ -156,6 +162,8 @@ pub async fn run_interop_rust_baseline(
         .with_artifact(bot_log)
         .with_artifact(bot_err)
         .with_metadata("relay_url", relay_url)
+        .with_metadata("tenant_relay_namespace", tenant_relay_namespace)
+        .with_metadata("tenant_moq_namespace", tenant_moq_namespace)
         .with_metadata("bot_npub", bot_npub)
         .with_metadata("manual", args.manual.to_string());
     let summary = artifacts::write_standard_summary(
