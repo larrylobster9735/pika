@@ -327,16 +327,15 @@ struct ChatView: View {
             activeReactionMessageId: activeReactionMessageId,
             scrollToBottomTrigger: scrollToBottomTrigger
         )
-        .onChange(of: chat.messages.last?.id) { oldMessageId, newMessageId in
-            guard newMessageId != oldMessageId else { return }
+        .onChangeCompat(of: chat.messages.last?.id) { newMessageId in
             guard shouldStickToBottom else { return }
             scrollToBottomTrigger += 1
         }
-        .onChange(of: chat.chatId) { _, _ in
+        .onChangeCompat(of: chat.chatId) {
             shouldStickToBottom = true
             scrollToBottomTrigger += 1
         }
-        .onChange(of: isInputFocused) { _, focused in
+        .onChangeCompat(of: isInputFocused) { focused in
             guard focused else { return }
             guard shouldStickToBottom else { return }
             scrollToBottomTrigger += 1
@@ -640,7 +639,7 @@ struct ChatView: View {
                     onSend: { sendMessage() },
                     onStartVoiceRecording: { startVoiceRecording() }
                 )
-                .onChange(of: messageText) { _, newValue in
+                .onChangeCompat(of: messageText) { newValue in
                     if chat.isGroup {
                         if let atIdx = newValue.lastIndex(of: "@") {
                             let prefix = newValue[..<atIdx]
@@ -667,7 +666,7 @@ struct ChatView: View {
                         onTypingStarted?()
                     }
                 }
-                .onChange(of: selectedPhotoItem) { _, item in
+                .onChangeCompat(of: selectedPhotoItem) { item in
                     guard let item else { return }
                     Task {
                         defer { selectedPhotoItem = nil }

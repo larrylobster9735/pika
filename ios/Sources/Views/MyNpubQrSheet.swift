@@ -312,10 +312,10 @@ struct MyNpubQrSheet: View {
                 onRefreshProfile()
                 syncDraftsIfNeeded(force: false)
             }
-            .onChange(of: selectedPhoto) { _, item in
+            .onChangeCompat(of: selectedPhoto) { item in
                 handlePhotoSelection(item)
             }
-            .onChange(of: profile) { _, _ in
+            .onChangeCompat(of: profile) {
                 syncDraftsIfNeeded(force: !hasProfileChanges)
             }
             .onDisappear {

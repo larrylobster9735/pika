@@ -1,11 +1,12 @@
 import AVFoundation
 import CoreVideo
+import Perception
 import SwiftUI
 
 /// Coordinates the full video call pipeline: camera capture → encode → Rust core,
 /// and Rust core → decode → display. Manages lifecycle based on call state.
 @MainActor
-@Observable
+@Perceptible
 final class VideoCallPipeline {
     private(set) var remotePixelBuffer: CVPixelBuffer?
     private var captureManager: VideoCaptureManager?

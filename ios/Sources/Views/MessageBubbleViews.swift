@@ -418,7 +418,7 @@ private struct MessageBubble: View {
                 let frame = proxy.frame(in: .global)
                 Color.clear
                     .onAppear { bubbleFrameRef.frame = frame }
-                    .onChange(of: frame) { _, newFrame in
+                    .onChangeCompat(of: frame) { newFrame in
                         bubbleFrameRef.frame = newFrame
                     }
             }
@@ -496,7 +496,7 @@ private struct MessageBubble: View {
             }
         }
         .background(hasText || hasFileAttachment ? (message.isMine ? Color.blue : Color.gray.opacity(0.2)) : Color.clear)
-        .clipShape(UnevenRoundedRectangle(cornerRadii: bubbleRadii, style: .continuous))
+        .clipShape(UnevenRoundedRectangleCompat(cornerRadii: bubbleRadii, style: .continuous))
     }
 
     private func markdownBubble(text: String) -> some View {
@@ -513,7 +513,7 @@ private struct MessageBubble: View {
         .padding(.top, 8)
         .padding(.bottom, 6)
         .background(message.isMine ? Color.blue : Color.gray.opacity(0.2))
-        .clipShape(UnevenRoundedRectangle(cornerRadii: bubbleRadii, style: .continuous))
+        .clipShape(UnevenRoundedRectangleCompat(cornerRadii: bubbleRadii, style: .continuous))
     }
 
     private var timestampText: String {
@@ -526,7 +526,7 @@ private struct MessageBubble: View {
         return [.markdown(text: message.displayContent)]
     }
 
-    private var bubbleRadii: RectangleCornerRadii {
+    private var bubbleRadii: CornerRadii {
         if message.isMine {
             return .init(
                 topLeading: roundedCornerRadius,

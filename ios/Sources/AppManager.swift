@@ -1,5 +1,5 @@
 import Foundation
-import Observation
+import Perception
 
 protocol AppCore: AnyObject, Sendable {
     func dispatch(action: AppAction)
@@ -103,7 +103,7 @@ final class KeychainAuthStore: AuthStore {
 }
 
 @MainActor
-@Observable
+@Perceptible
 final class AppManager: AppReconciler {
     private static let migrationSentinelName = ".migrated_to_app_group"
     private(set) var core: AppCore

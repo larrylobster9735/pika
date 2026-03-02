@@ -270,6 +270,7 @@ if [ "$MODE" = "device" ]; then
     -destination "id=$UDID" \
     -derivedDataPath ios/build-device \
     -allowProvisioningUpdates \
+    -skipMacroValidation \
     "${signing_settings[@]}" \
     build
 
