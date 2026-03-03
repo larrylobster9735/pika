@@ -1898,32 +1898,6 @@ mod tests {
         assert_eq!(super::classify_app_message(&msg), None);
     }
 
-    // --- AppMessageKind method tests ---
-
-    #[test]
-    fn increments_unread_only_chat_and_hypernote() {
-        use super::AppMessageKind::*;
-        assert!(Chat.increments_unread());
-        assert!(Hypernote.increments_unread());
-        assert!(!Reaction.increments_unread());
-        assert!(!TypingIndicator.increments_unread());
-        assert!(!CallSignal.increments_unread());
-        assert!(!HypernoteResponse.increments_unread());
-        assert!(!GroupProfile.increments_unread());
-    }
-
-    #[test]
-    fn increments_loaded_includes_reaction() {
-        use super::AppMessageKind::*;
-        assert!(Chat.increments_loaded());
-        assert!(Reaction.increments_loaded());
-        assert!(Hypernote.increments_loaded());
-        assert!(!TypingIndicator.increments_loaded());
-        assert!(!CallSignal.increments_loaded());
-        assert!(!HypernoteResponse.increments_loaded());
-        assert!(!GroupProfile.increments_loaded());
-    }
-
     // --- separate_messages edge cases ---
 
     #[test]

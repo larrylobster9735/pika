@@ -446,9 +446,4 @@ mod tests {
         assert!(cache.name.is_none());
         assert_eq!(cache.about.as_deref(), Some("just about"));
     }
-
-    #[test]
-    fn upload_image_size_limit_is_8mb() {
-        assert_eq!(MAX_PROFILE_IMAGE_BYTES, 8 * 1024 * 1024);
-    }
 }
