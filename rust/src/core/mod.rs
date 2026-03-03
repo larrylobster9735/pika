@@ -6714,6 +6714,103 @@ mod tests {
         }
     }
 
+    mod message_handler_validation {
+        use super::*;
+        use crate::actions::AppAction;
+
+        /// Create a core with a minimal session (logged in, no groups registered).
+        fn make_logged_in_core() -> (AppCore, tempfile::TempDir) {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_string_lossy().into_owned();
+            let mut core = make_core(data_dir.clone());
+            let keys = nostr_sdk::Keys::generate();
+            let mdk = crate::mdk_support::open_mdk(&data_dir, &keys.public_key(), "").unwrap();
+            let client = nostr_sdk::Client::builder().signer(keys.clone()).build();
+            core.session = Some(super::super::Session {
+                pubkey: keys.public_key(),
+                local_keys: Some(keys),
+                mdk,
+                client,
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                giftwrap_sub: None,
+                group_sub: None,
+                groups: std::collections::HashMap::new(),
+            });
+            (core, tmp)
+        }
+
+        #[test]
+        fn send_message_rejects_when_not_logged_in() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+            core.handle_action(AppAction::SendMessage {
+                chat_id: "chat1".into(),
+                content: "hello".into(),
+                kind: None,
+                reply_to_message_id: None,
+            });
+
+            assert_eq!(core.state.toast.as_deref(), Some("Please log in first"));
+        }
+
+        #[test]
+        fn send_message_ignores_empty_content() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            core.handle_action(AppAction::SendMessage {
+                chat_id: "chat1".into(),
+                content: "".into(),
+                kind: None,
+                reply_to_message_id: None,
+            });
+
+            // No toast — just silently returns.
+            assert!(core.state.toast.is_none());
+            assert!(core.local_outbox.is_empty());
+        }
+
+        #[test]
+        fn send_message_ignores_whitespace_only() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            core.handle_action(AppAction::SendMessage {
+                chat_id: "chat1".into(),
+                content: "   \n\t  ".into(),
+                kind: None,
+                reply_to_message_id: None,
+            });
+
+            assert!(core.state.toast.is_none());
+            assert!(core.local_outbox.is_empty());
+        }
+
+        #[test]
+        fn retry_message_rejects_when_not_logged_in() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+            core.handle_action(AppAction::RetryMessage {
+                chat_id: "chat1".into(),
+                message_id: "m1".into(),
+            });
+
+            assert_eq!(core.state.toast.as_deref(), Some("Please log in first"));
+        }
+
+        #[test]
+        fn retry_message_toasts_when_no_pending_send() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            core.handle_action(AppAction::RetryMessage {
+                chat_id: "chat1".into(),
+                message_id: "nonexistent".into(),
+            });
+
+            assert_eq!(core.state.toast.as_deref(), Some("Nothing to retry"));
+        }
+    }
+
     mod group_management_validation {
         use super::*;
         use crate::actions::AppAction;
