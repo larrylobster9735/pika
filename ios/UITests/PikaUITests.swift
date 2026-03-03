@@ -573,10 +573,10 @@ final class PikaUITests: XCTestCase {
 
         // Chat list.
         let chatsNavBar = app.navigationBars["Chats"]
-        XCTAssertTrue(chatsNavBar.waitForExistence(timeout: 30))
+        XCTAssertTrue(chatsNavBar.waitForExistence(timeout: 10))
 
         // Start chat with deployed bot.
-        openNewChatFromChatList(app, timeout: 15)
+        openNewChatFromChatList(app, timeout: 10)
 
         let peer = app.descendants(matching: .any).matching(identifier: "newchat_peer_npub").firstMatch
         XCTAssertTrue(peer.waitForExistence(timeout: 10))
@@ -590,7 +590,7 @@ final class PikaUITests: XCTestCase {
         // Chat creation runs asynchronously (key package fetch + group setup).
         // The user stays on NewChat with a loading spinner; on success the app navigates
         // directly to the chat screen. Check for error toasts while waiting.
-        let composerDeadline = Date().addingTimeInterval(60)
+        let composerDeadline = Date().addingTimeInterval(10)
         var chatCreationFailed = false
         let msgField = app.textViews.matching(identifier: "chat_message_input").firstMatch
         let msgFieldFallback = app.textFields.matching(identifier: "chat_message_input").firstMatch
@@ -619,7 +619,7 @@ final class PikaUITests: XCTestCase {
         let expect = "pong:\(nonce)"
 
         let composer = msgField.exists ? msgField : msgFieldFallback
-        XCTAssertTrue(composer.waitForExistence(timeout: 30))
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText(probe)
 
@@ -628,7 +628,7 @@ final class PikaUITests: XCTestCase {
         send.tap()
 
         // Expect deterministic ack from the bot.
-        XCTAssertTrue(app.staticTexts[expect].waitForExistence(timeout: 180))
+        XCTAssertTrue(app.staticTexts[expect].waitForExistence(timeout: 10))
     }
 
     func testE2E_hypernoteDetailsAndCodeBlock() throws {
@@ -667,10 +667,10 @@ final class PikaUITests: XCTestCase {
 
         // Chat list.
         let chatsNavBar = app.navigationBars["Chats"]
-        XCTAssertTrue(chatsNavBar.waitForExistence(timeout: 30))
+        XCTAssertTrue(chatsNavBar.waitForExistence(timeout: 10))
 
         // Start chat with bot.
-        openNewChatFromChatList(app, timeout: 15)
+        openNewChatFromChatList(app, timeout: 10)
 
         let peer = app.descendants(matching: .any).matching(identifier: "newchat_peer_npub").firstMatch
         XCTAssertTrue(peer.waitForExistence(timeout: 10))
@@ -682,7 +682,7 @@ final class PikaUITests: XCTestCase {
         start.tap()
 
         // Wait for chat creation.
-        let composerDeadline = Date().addingTimeInterval(60)
+        let composerDeadline = Date().addingTimeInterval(10)
         var chatCreationFailed = false
         let msgField = app.textViews.matching(identifier: "chat_message_input").firstMatch
         let msgFieldFallback = app.textFields.matching(identifier: "chat_message_input").firstMatch
@@ -703,7 +703,7 @@ final class PikaUITests: XCTestCase {
         if chatCreationFailed { return }
 
         let composer = msgField.exists ? msgField : msgFieldFallback
-        XCTAssertTrue(composer.waitForExistence(timeout: 30))
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
 
         // ── Details probe ──
         composer.tap()
@@ -714,7 +714,7 @@ final class PikaUITests: XCTestCase {
 
         // Wait for the details component to appear.
         let details = app.descendants(matching: .any).matching(identifier: "hypernote_details").firstMatch
-        XCTAssertTrue(details.waitForExistence(timeout: 180), "Details component did not appear")
+        XCTAssertTrue(details.waitForExistence(timeout: 10), "Details component did not appear")
 
         let summary = app.descendants(matching: .any).matching(identifier: "hypernote_details_summary").firstMatch
         XCTAssertTrue(summary.exists, "Summary should be visible")
@@ -741,7 +741,7 @@ final class PikaUITests: XCTestCase {
         send.tap()
 
         let codeblock = app.descendants(matching: .any).matching(identifier: "hypernote_codeblock").firstMatch
-        XCTAssertTrue(codeblock.waitForExistence(timeout: 180), "Code block did not appear")
+        XCTAssertTrue(codeblock.waitForExistence(timeout: 10), "Code block did not appear")
 
         let lang = app.descendants(matching: .any).matching(identifier: "hypernote_codeblock_lang").firstMatch
         XCTAssertTrue(lang.exists, "Language label should be visible")

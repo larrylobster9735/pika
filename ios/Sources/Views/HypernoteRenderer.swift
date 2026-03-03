@@ -491,6 +491,7 @@ struct HypernoteRenderer: View {
                         summaryContent
                     }
                     .contentShape(Rectangle())
+                    .accessibilityIdentifier(TestIds.hypernoteDetailsSummary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier(TestIds.hypernoteDetailsSummary)
@@ -502,6 +503,7 @@ struct HypernoteRenderer: View {
                         .accessibilityIdentifier(TestIds.hypernoteDetailsBody)
                 }
             }
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier(TestIds.hypernoteDetails)
         }
     }
@@ -512,13 +514,19 @@ struct HypernoteRenderer: View {
         let code: String
         let lang: String?
         @State private var showCopied = false
+        private var languageLabel: String {
+            let trimmed = (lang ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "plain" : trimmed
+        }
 
         var body: some View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text(lang ?? "")
+                    Text(languageLabel)
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(languageLabel)
                         .accessibilityIdentifier(TestIds.hypernoteCodeblockLang)
                     Spacer()
                     Button {
@@ -546,6 +554,7 @@ struct HypernoteRenderer: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .background(Color.gray.opacity(0.15))
+                .accessibilityElement(children: .contain)
 
                 Text(code)
                     .font(.system(.caption, design: .monospaced))
