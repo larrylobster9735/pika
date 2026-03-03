@@ -3,9 +3,9 @@ package com.pika.app
 import android.Manifest
 import android.util.Log
 import androidx.compose.ui.test.ComposeTimeoutException
-import androidx.compose.ui.test.assertDoesNotExist
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.test.rule.GrantPermissionRule
@@ -255,7 +255,7 @@ class PikaE2eUiTest {
         }
         compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS).assertIsDisplayed()
         compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS_SUMMARY).assertIsDisplayed()
-        compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS_BODY).assertDoesNotExist()
+        assertTagDoesNotExist(TestTags.HYPERNOTE_DETAILS_BODY)
 
         // Tap to expand.
         compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS_SUMMARY).performClick()
@@ -265,7 +265,7 @@ class PikaE2eUiTest {
         // Tap to collapse.
         compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS_SUMMARY).performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag(TestTags.HYPERNOTE_DETAILS_BODY).assertDoesNotExist()
+        assertTagDoesNotExist(TestTags.HYPERNOTE_DETAILS_BODY)
 
         // ── Code block probe ──
         runOnMain {
@@ -314,6 +314,13 @@ class PikaE2eUiTest {
         if (currentHas) return true
         val summary = st.chatList.firstOrNull { it.chatId == chatId } ?: return false
         return summary.lastMessage?.trim() == expected || summary.lastMessagePreview.trim() == expected
+    }
+
+    private fun assertTagDoesNotExist(tag: String) {
+        val matches = compose.onAllNodesWithTag(tag, useUnmergedTree = true).fetchSemanticsNodes()
+        if (matches.isNotEmpty()) {
+            throw AssertionError("Expected no node with tag $tag, found ${matches.size}")
+        }
     }
 
     private fun waitUntilState(
