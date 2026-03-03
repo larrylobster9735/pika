@@ -26,3 +26,8 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 bech32 = "0.11"
 rand = "0.8"
+nostr-blossom = "0.44.0"
+nostr-sdk = "0.44.1"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"

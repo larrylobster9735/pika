@@ -6018,17 +6018,22 @@ dependencies = [
  "bech32",
  "chrono",
  "clap",
+ "hex",
  "nix",
+ "nostr-blossom",
+ "nostr-sdk",
  "pika-marmot-runtime",
  "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

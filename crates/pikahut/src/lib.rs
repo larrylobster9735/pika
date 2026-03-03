@@ -1,3 +1,4 @@
+pub mod blossom_upload;
 pub mod component;
 pub mod config;
 pub mod fixture;

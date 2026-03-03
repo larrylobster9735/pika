@@ -72,3 +72,25 @@ ffprobe screen_recordings/<file>.mp4
 ```
 
 If `ffprobe` prints stream and duration metadata, the container is valid.
+
+## Upload Recordings To Blossom
+
+Upload all recordings and get back URLs (for PR descriptions, etc.):
+
+```bash
+cargo run -p pikahut -- blossom-upload screen_recordings/*.mp4
+```
+
+Or upload a single file:
+
+```bash
+cargo run -p pikahut -- blossom-upload screen_recordings/ios-ui-e2e-local-1234567890.mp4
+```
+
+URLs are printed to stdout, one per line. An ephemeral nostr key is generated automatically — no configuration needed.
+
+To override the default blossom servers:
+
+```bash
+cargo run -p pikahut -- blossom-upload --server https://my-blossom.example.com screen_recordings/*.mp4
+```

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use pikahut::{config, fixture, test_harness};
+use pikahut::{blossom_upload, config, fixture, test_harness};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -99,6 +99,8 @@ enum Command {
         #[command(subcommand)]
         command: test_harness::TestCommand,
     },
+    /// Upload files to blossom servers and print URLs
+    BlossomUpload(blossom_upload::BlossomUploadArgs),
 }
 
 #[tokio::main]
@@ -185,5 +187,6 @@ async fn main() -> Result<()> {
             fixture::nuke(&dir).await
         }
         Command::Test { command } => test_harness::run(command).await,
+        Command::BlossomUpload(args) => blossom_upload::run(args).await,
     }
 }
