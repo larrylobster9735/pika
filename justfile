@@ -262,6 +262,7 @@ pre-merge-pikachat:
     cargo test -p pikachat
     cargo test -p pikachat-sidecar
     cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture
     cargo test -p pikahut --test integration_deterministic post_rebase_invalid_event_rejection_boundary -- --ignored --nocapture
     cargo test -p pikahut --test integration_deterministic post_rebase_logout_session_convergence_boundary -- --ignored --nocapture
     just openclaw-pikachat-deterministic
@@ -315,6 +316,7 @@ nightly:
 nightly-pika-e2e:
     cargo test -p pikahut --test integration_deterministic call_over_local_moq_relay_boundary -- --ignored --nocapture
     cargo test -p pikahut --test integration_deterministic call_with_pikachat_daemon_boundary -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic cli_smoke_media_local -- --ignored --nocapture
 
 # Nightly lane: full OpenClaw integration E2E (gateway + real sidecar wiring).
 nightly-pikachat:

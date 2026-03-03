@@ -510,9 +510,6 @@ jobs:
 
       - run: |
           nix develop .#default -c ./tools/android-avd-ensure
-          # Keep nightly Android lane deterministic. Public-relay bot ping/pong remains flaky on CI emulators.
-          # Run intent tests (NostrConnect + chat deep link) and the deterministic PikaUiTest suite.
-          PIKA_ANDROID_E2E_TEST_CLASS="com.pika.app.NostrConnectIntentTest,com.pika.app.PikaUiTest" \
           PIKA_ANDROID_FORCE_GUI=0 \
           PIKA_ANDROID_EMULATOR_ARGS="-no-window" \
           nix develop .#default -c just android-ui-e2e-local
@@ -526,11 +523,12 @@ jobs:
       - run: nix develop .#default -c just ios-ui-test
 
   nightly-primal-ios-interop:
-    if: (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'nightly')) && vars.PIKA_NIGHTLY_PRIMAL_INTEROP == '1'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'nightly')
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: nixbuild/nix-quick-install-action@v30
+      - run: nix develop .#default -c just ios-ui-test
       - run: nix develop .#default -c just nightly-primal-ios-interop
 
   nightly:
@@ -563,6 +561,10 @@ jobs:
           if [[ "${{ needs.nightly-pika-ui-ios.result }}" != "success" ]]; then
             echo "nightly-pika-ui-ios failed"
             failed="${failed}- **nightly-pika-ui-ios**: ${{ needs.nightly-pika-ui-ios.result }}\n"
+          fi
+          if [[ "${{ needs.nightly-primal-ios-interop.result }}" != "success" ]]; then
+            echo "nightly-primal-ios-interop failed"
+            failed="${failed}- **nightly-primal-ios-interop**: ${{ needs.nightly-primal-ios-interop.result }}\n"
           fi
           if [[ -n "$failed" ]]; then
             {

@@ -17,7 +17,7 @@ This document defines the selector contract for integration coverage in CI and n
 
 | Lane / recipe | Canonical selectors |
 | --- | --- |
-| `pre-merge-pikachat` | `integration_deterministic::cli_smoke_local`, `integration_deterministic::post_rebase_invalid_event_rejection_boundary`, `integration_deterministic::post_rebase_logout_session_convergence_boundary`, and all `openclaw-pikachat-deterministic` selectors |
+| `pre-merge-pikachat` | `integration_deterministic::cli_smoke_local`, `integration_deterministic::ui_e2e_local_desktop`, `integration_deterministic::post_rebase_invalid_event_rejection_boundary`, `integration_deterministic::post_rebase_logout_session_convergence_boundary`, and all `openclaw-pikachat-deterministic` selectors |
 | `openclaw-pikachat-deterministic` | `integration_deterministic::openclaw_scenario_invite_and_chat`, `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot`, `integration_deterministic::openclaw_scenario_invite_and_chat_daemon`, `integration_deterministic::openclaw_scenario_audio_echo` |
 | Path-scoped heavy OpenClaw lane (`check-pikachat-openclaw-e2e`) | `integration_openclaw::openclaw_gateway_e2e` |
 | `android-ui-e2e-local` | `integration_deterministic::ui_e2e_local_android` |
@@ -29,10 +29,11 @@ This document defines the selector contract for integration coverage in CI and n
 
 | Lane / recipe | Canonical selectors |
 | --- | --- |
-| `nightly-pika-e2e` | `integration_deterministic::call_over_local_moq_relay_boundary`, `integration_deterministic::call_with_pikachat_daemon_boundary` |
+| `nightly-pika-e2e` | `integration_deterministic::call_over_local_moq_relay_boundary`, `integration_deterministic::call_with_pikachat_daemon_boundary`, `integration_deterministic::cli_smoke_media_local` |
 | `nightly-pikachat` | `integration_openclaw::openclaw_gateway_e2e` |
-| `nightly-pika-ui-android` | `integration_deterministic::ui_e2e_local_android` |
-| `nightly-primal-ios-interop` | `integration_primal::primal_nostrconnect_smoke` |
+| `nightly-pika-ui-android` | full Android instrumentation suite via `integration_deterministic::ui_e2e_local_android` |
+| `nightly-pika-ui-ios` | iOS Swift unit tests via `just ios-ui-test` |
+| `nightly-primal-ios-interop` | iOS Swift unit tests via `just ios-ui-test`, `integration_primal::primal_nostrconnect_smoke` |
 
 ## Manual-Only Lane
 
