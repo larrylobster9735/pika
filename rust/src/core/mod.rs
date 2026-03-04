@@ -2758,12 +2758,16 @@ impl AppCore {
             self.state.router.screen_stack.pop();
         }
 
+        // Prevent stacking multiple chat screens
+        self.state
+            .router
+            .screen_stack
+            .retain(|s| !matches!(s, Screen::Chat { .. }));
+
         let screen = Screen::Chat {
             chat_id: chat_id.to_string(),
         };
-        if self.state.router.screen_stack.last() != Some(&screen) {
-            self.push_screen(screen);
-        }
+        self.push_screen(screen);
     }
 
     fn handle_auth_transition(&mut self, logged_in: bool) {
