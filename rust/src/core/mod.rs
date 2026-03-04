@@ -489,6 +489,50 @@ impl PendingSends {
     }
 }
 
+/// In-memory map of failed send reasons backed by SQLite for persistence across restarts.
+#[derive(Debug)]
+struct FailedSends {
+    map: HashMap<String, String>, // message_id -> reason
+}
+
+impl FailedSends {
+    fn load(conn: Option<&rusqlite::Connection>) -> Self {
+        let map = conn.map(profile_db::load_failed_sends).unwrap_or_default();
+        Self { map }
+    }
+
+    fn insert(
+        &mut self,
+        message_id: &str,
+        chat_id: &str,
+        reason: &str,
+        db: Option<&rusqlite::Connection>,
+    ) {
+        self.map.insert(message_id.to_string(), reason.to_string());
+        if let Some(conn) = db {
+            profile_db::save_failed_send(conn, message_id, chat_id, reason);
+        }
+    }
+
+    fn get(&self, message_id: &str) -> Option<&String> {
+        self.map.get(message_id)
+    }
+
+    fn remove(&mut self, message_id: &str, db: Option<&rusqlite::Connection>) {
+        self.map.remove(message_id);
+        if let Some(conn) = db {
+            profile_db::remove_failed_send(conn, message_id);
+        }
+    }
+
+    fn clear(&mut self, db: Option<&rusqlite::Connection>) {
+        self.map.clear();
+        if let Some(conn) = db {
+            profile_db::clear_failed_sends(conn);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LocalOutgoing {
     content: String,
@@ -626,7 +670,7 @@ pub struct AppCore {
     unread_counts: HashMap<String, u32>,
     delivery_overrides: HashMap<String, HashMap<String, MessageDeliveryState>>, // chat_id -> message_id -> delivery
     pending_sends: PendingSends,
-    failed_sends: HashMap<String, String>, // message_id -> reason (persisted in profile_db)
+    failed_sends: FailedSends,
     // When MDK storage is eventually consistent, keep a local optimistic outbox so UI can render
     // immediately and reliably (e.g., offline note-to-self).
     local_outbox: HashMap<String, HashMap<String, LocalOutgoing>>, // chat_id -> message_id -> message
@@ -721,10 +765,7 @@ impl AppCore {
             .as_ref()
             .map(profile_db::load_profiles)
             .unwrap_or_default();
-        let failed_sends = profile_db
-            .as_ref()
-            .map(profile_db::load_failed_sends)
-            .unwrap_or_default();
+        let failed_sends = FailedSends::load(profile_db.as_ref());
         let pending_sends = PendingSends::load(profile_db.as_ref());
         let developer_mode = profile_db
             .as_ref()
@@ -2747,10 +2788,7 @@ impl AppCore {
             self.unread_counts.clear();
             self.delivery_overrides.clear();
             self.pending_sends.clear(self.profile_db.as_ref());
-            self.failed_sends.clear();
-            if let Some(conn) = self.profile_db.as_ref() {
-                profile_db::clear_failed_sends(conn);
-            }
+            self.failed_sends.clear(self.profile_db.as_ref());
             self.pending_media_sends.clear();
             self.pending_media_downloads.clear();
             self.local_outbox.clear();
@@ -3316,12 +3354,8 @@ impl AppCore {
             per_chat.insert(rumor_id.clone(), MessageDeliveryState::Sent);
             self.pending_sends
                 .remove(&chat_id, &rumor_id, self.profile_db.as_ref());
-            // Clear persisted failure state on success.
-            if self.failed_sends.remove(&rumor_id).is_some() {
-                if let Some(conn) = self.profile_db.as_ref() {
-                    profile_db::remove_failed_send(conn, &rumor_id);
-                }
-            }
+            self.failed_sends
+                .remove(&rumor_id, self.profile_db.as_ref());
         } else {
             let reason = error.unwrap_or_else(|| "publish failed".into());
             per_chat.insert(
@@ -3330,11 +3364,8 @@ impl AppCore {
                     reason: reason.clone(),
                 },
             );
-            // Persist failure so it survives app restart.
-            self.failed_sends.insert(rumor_id.clone(), reason.clone());
-            if let Some(conn) = self.profile_db.as_ref() {
-                profile_db::save_failed_send(conn, &rumor_id, &chat_id, &reason);
-            }
+            self.failed_sends
+                .insert(&rumor_id, &chat_id, &reason, self.profile_db.as_ref());
         }
         self.refresh_chat_list_from_storage();
         self.refresh_current_chat_if_open(&chat_id);
