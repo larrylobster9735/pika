@@ -569,29 +569,20 @@ impl AppCore {
                 InternalEvent::PublishMessageResult {
                     chat_id,
                     rumor_id: rumor_id_hex,
-                    ok: true,
-                    error: None,
+                    ok: false,
+                    error: Some("offline".into()),
                 },
             )));
             return;
         }
 
-        let _ = self.core_sender.send(CoreMsg::Internal(Box::new(
-            InternalEvent::PublishMessageResult {
-                chat_id: chat_id.clone(),
-                rumor_id: rumor_id_hex.clone(),
-                ok: true,
-                error: None,
-            },
-        )));
-
+        let tx = self.core_sender.clone();
         let diag = diag_nostr_publish_enabled();
         let wrapper_id = wrapper.id.to_hex();
         let wrapper_kind = wrapper.kind.as_u16();
         let relay_list: Vec<String> = relays.iter().map(|r| r.to_string()).collect();
         self.runtime.spawn(async move {
-            let out = client.send_event_to(relays, &wrapper).await;
-            match out {
+            let (ok, error) = match client.send_event_to(relays, &wrapper).await {
                 Ok(output) => {
                     if diag {
                         tracing::info!(
@@ -604,6 +595,13 @@ impl AppCore {
                             success = ?output.success,
                             failed = ?output.failed,
                         );
+                    }
+                    if output.success.is_empty() {
+                        let errors: Vec<&str> =
+                            output.failed.values().map(|s| s.as_str()).collect();
+                        (false, Some(errors.join("; ")))
+                    } else {
+                        (true, None)
                     }
                 }
                 Err(e) => {
@@ -620,8 +618,17 @@ impl AppCore {
                     } else {
                         tracing::warn!(%e, "message broadcast failed");
                     }
+                    (false, Some(e.to_string()))
                 }
-            }
+            };
+            let _ = tx.send(CoreMsg::Internal(Box::new(
+                InternalEvent::PublishMessageResult {
+                    chat_id,
+                    rumor_id: rumor_id_hex,
+                    ok,
+                    error,
+                },
+            )));
         });
     }
 

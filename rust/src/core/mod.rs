@@ -4802,24 +4802,35 @@ impl AppCore {
                         InternalEvent::PublishMessageResult {
                             chat_id,
                             rumor_id: message_id,
-                            ok: true,
-                            error: None,
+                            ok: false,
+                            error: Some("offline".into()),
                         },
                     )));
                     return;
                 }
-                let _ = self.core_sender.send(CoreMsg::Internal(Box::new(
-                    InternalEvent::PublishMessageResult {
-                        chat_id,
-                        rumor_id: ps.rumor_id_hex,
-                        ok: true,
-                        error: None,
-                    },
-                )));
+                let tx = self.core_sender.clone();
+                let rumor_id = ps.rumor_id_hex.clone();
                 self.runtime.spawn(async move {
-                    if let Err(e) = client.send_event_to(relays, &ps.wrapper_event).await {
-                        tracing::warn!(%e, "message retry broadcast failed");
-                    }
+                    let (ok, error) = match client.send_event_to(relays, &ps.wrapper_event).await {
+                        Ok(output) if !output.success.is_empty() => (true, None),
+                        Ok(output) => {
+                            let errors: Vec<&str> =
+                                output.failed.values().map(|s| s.as_str()).collect();
+                            (false, Some(errors.join("; ")))
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "message retry broadcast failed");
+                            (false, Some(e.to_string()))
+                        }
+                    };
+                    let _ = tx.send(CoreMsg::Internal(Box::new(
+                        InternalEvent::PublishMessageResult {
+                            chat_id,
+                            rumor_id,
+                            ok,
+                            error,
+                        },
+                    )));
                 });
             }
             AppAction::StartCall { chat_id } => {
