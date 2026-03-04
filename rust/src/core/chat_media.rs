@@ -374,7 +374,7 @@ impl AppCore {
                 Some((resized_bytes, w, h)) => {
                     (resized_bytes, "image/jpeg".to_string(), true, Some((w, h)))
                 }
-                None => (decoded.clone(), mime_type.clone(), false, None),
+                None => (decoded, mime_type.clone(), false, None),
             };
 
         // Compute hash of the data we'll give to MDK.
@@ -518,18 +518,23 @@ impl AppCore {
                     &original_hash_hex,
                     &local_filename,
                 );
-                if final_local_path != local_path {
+                let effective_path = if final_local_path != local_path {
                     if let Err(e) = write_media_file(&final_local_path, &media_data) {
                         tracing::warn!(%e, "failed to copy local preview to final hash path");
+                        // Fall back to original path — file still exists there.
+                        &local_path
                     } else {
                         let _ = std::fs::remove_file(&local_path);
+                        &final_local_path
                     }
-                }
+                } else {
+                    &final_local_path
+                };
                 if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
                     if let Some(entry) = outbox.get_mut(&temp_rumor_id) {
                         if let Some(att) = entry.media.first_mut() {
                             att.original_hash_hex = original_hash_hex.clone();
-                            att.local_path = path_if_exists(&final_local_path);
+                            att.local_path = path_if_exists(effective_path);
                         }
                     }
                 }
