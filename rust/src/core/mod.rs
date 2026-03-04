@@ -2758,11 +2758,11 @@ impl AppCore {
             self.state.router.screen_stack.pop();
         }
 
-        // Prevent stacking multiple chat screens
+        // Prevent stacking multiple chat screens (and their child GroupInfo screens).
         self.state
             .router
             .screen_stack
-            .retain(|s| !matches!(s, Screen::Chat { .. }));
+            .retain(|s| !matches!(s, Screen::Chat { .. } | Screen::GroupInfo { .. }));
 
         let screen = Screen::Chat {
             chat_id: chat_id.to_string(),
@@ -7287,5 +7287,88 @@ mod tests {
 
             assert!(!core.pending_group_ops.contains("chat1"));
         }
+    }
+
+    #[test]
+    fn open_chat_screen_replaces_existing_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+        core.state.router.screen_stack = vec![Screen::Chat {
+            chat_id: "chat-a".into(),
+        }];
+
+        core.open_chat_screen("chat-b");
+
+        assert_eq!(
+            core.state.router.screen_stack,
+            vec![Screen::Chat {
+                chat_id: "chat-b".into()
+            }],
+            "should replace existing Chat screen, not stack"
+        );
+    }
+
+    #[test]
+    fn open_chat_screen_clears_group_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+        core.state.router.screen_stack = vec![
+            Screen::Chat {
+                chat_id: "chat-a".into(),
+            },
+            Screen::GroupInfo {
+                chat_id: "chat-a".into(),
+            },
+        ];
+
+        core.open_chat_screen("chat-b");
+
+        assert_eq!(
+            core.state.router.screen_stack,
+            vec![Screen::Chat {
+                chat_id: "chat-b".into()
+            }],
+            "should remove orphaned GroupInfo screens"
+        );
+    }
+
+    #[test]
+    fn open_chat_screen_same_chat_no_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+        core.state.router.screen_stack = vec![Screen::Chat {
+            chat_id: "chat-a".into(),
+        }];
+
+        core.open_chat_screen("chat-a");
+
+        assert_eq!(
+            core.state.router.screen_stack,
+            vec![Screen::Chat {
+                chat_id: "chat-a".into()
+            }],
+            "should have exactly one Chat screen"
+        );
+    }
+
+    #[test]
+    fn complete_session_init_noop_when_logged_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+        // Not logged in — should be a no-op (no panic).
+        core.handle_internal(crate::updates::InternalEvent::CompleteSessionInit);
+    }
+
+    #[test]
+    fn refresh_after_foreground_noop_when_logged_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = make_core(tmp.path().to_string_lossy().into_owned());
+
+        // Not logged in — should be a no-op (no panic).
+        core.handle_internal(crate::updates::InternalEvent::RefreshAfterForeground);
     }
 }
