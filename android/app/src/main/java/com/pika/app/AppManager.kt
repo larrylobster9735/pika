@@ -444,6 +444,22 @@ class AppManager private constructor(context: Context) : AppReconciler {
                         ),
                     )
                 }
+                is ShareDispatchKind.MediaBatch -> {
+                    val batchItems = kind.items.map { entry ->
+                        MediaBatchItem(
+                            dataBase64 = entry.dataBase64,
+                            mimeType = entry.mimeType,
+                            filename = entry.filename,
+                        )
+                    }
+                    rust.dispatch(
+                        AppAction.SendChatMediaBatch(
+                            chatId = job.chatId,
+                            items = batchItems,
+                            caption = kind.caption,
+                        ),
+                    )
+                }
             }
 
             runCatching {

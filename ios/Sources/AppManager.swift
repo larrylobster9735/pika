@@ -542,6 +542,33 @@ final class AppManager: AppReconciler {
                         errorMessage: nil
                     )
                 )
+
+            case .mediaBatch(let caption, let items):
+                let batchItems = items.map { entry in
+                    MediaBatchItem(
+                        dataBase64: entry.dataBase64,
+                        mimeType: entry.mimeType,
+                        filename: entry.filename
+                    )
+                }
+                dispatch(
+                    .sendChatMediaBatch(
+                        chatId: item.chatId,
+                        items: batchItems,
+                        caption: caption
+                    )
+                )
+                if openFirstChat, firstOpenedChatId == nil {
+                    firstOpenedChatId = item.chatId
+                }
+                ShareQueueManager.acknowledge(
+                    ShareDispatchAck(
+                        itemId: item.itemId,
+                        status: .acceptedByCore,
+                        errorCode: nil,
+                        errorMessage: nil
+                    )
+                )
             }
         }
 

@@ -297,7 +297,7 @@ struct MediaAttachmentView: View {
                     .resizable()
                     .scaledToFill()
             } placeholder: {
-                imagePlaceholder
+                blurhashOrPlaceholder
             }
             .frame(width: imageSize.width, height: imageSize.height)
             .clipped()
@@ -312,7 +312,7 @@ struct MediaAttachmentView: View {
         } else if isAutoDownloadKind {
             // Auto-downloading: show placeholder with spinner
             ZStack {
-                imagePlaceholder
+                blurhashOrPlaceholder
                 ProgressView().tint(.white)
             }
             .frame(width: imageSize.width, height: imageSize.height)
@@ -368,6 +368,15 @@ struct MediaAttachmentView: View {
         }
         .buttonStyle(.plain)
         .frame(width: imageSize.width, height: imageSize.height)
+    }
+
+    @ViewBuilder
+    private var blurhashOrPlaceholder: some View {
+        if let hash = attachment.blurhash {
+            BlurhashView(hash: hash, size: imageSize)
+        } else {
+            imagePlaceholder
+        }
     }
 
     private var imagePlaceholder: some View {
@@ -589,62 +598,79 @@ private struct MessageBubble: View {
     private func mediaGrid(attachments: [ChatMediaAttachment]) -> some View {
         let spacing: CGFloat = 2
         let maxVisibleCount = 4
+        let cellHeight: CGFloat = 200
 
-        switch attachments.count {
-        case 1:
-            // Single item: full width
-            mediaGridCell(attachment: attachments[0])
+        GeometryReader { geo in
+            let availableWidth = geo.size.width
+            let halfWidth = (availableWidth - spacing) / 2
 
-        case 2:
-            // Two items side by side
-            HStack(spacing: spacing) {
-                mediaGridCell(attachment: attachments[0])
-                mediaGridCell(attachment: attachments[1])
-            }
+            switch attachments.count {
+            case 1:
+                mediaGridCell(attachment: attachments[0], maxWidth: availableWidth)
 
-        case 3:
-            // Top row: 2 items, bottom row: 1 item full width
-            VStack(spacing: spacing) {
+            case 2:
                 HStack(spacing: spacing) {
-                    mediaGridCell(attachment: attachments[0])
-                    mediaGridCell(attachment: attachments[1])
+                    mediaGridCell(attachment: attachments[0], maxWidth: halfWidth)
+                    mediaGridCell(attachment: attachments[1], maxWidth: halfWidth)
                 }
-                mediaGridCell(attachment: attachments[2])
-            }
 
-        default:
-            // 4+ items: 2×2 grid, last cell shows "+N" overlay if >4
-            VStack(spacing: spacing) {
+            case 3:
+                // 1 tall left + 2 stacked right (like iMessage)
                 HStack(spacing: spacing) {
-                    mediaGridCell(attachment: attachments[0])
-                    mediaGridCell(attachment: attachments[1])
+                    mediaGridCell(attachment: attachments[0], maxWidth: halfWidth, maxHeight: cellHeight * 2 + spacing)
+                    VStack(spacing: spacing) {
+                        mediaGridCell(attachment: attachments[1], maxWidth: halfWidth)
+                        mediaGridCell(attachment: attachments[2], maxWidth: halfWidth)
+                    }
                 }
-                HStack(spacing: spacing) {
-                    mediaGridCell(attachment: attachments[2])
-                    let remaining = attachments.count - maxVisibleCount
-                    if remaining > 0 {
-                        mediaGridCell(attachment: attachments[3])
-                            .overlay {
-                                Color.black.opacity(0.5)
-                                Text("+\(remaining)")
-                                    .font(.title2.bold())
-                                    .foregroundStyle(.white)
-                            }
-                    } else {
-                        mediaGridCell(attachment: attachments[3])
+
+            default:
+                VStack(spacing: spacing) {
+                    HStack(spacing: spacing) {
+                        mediaGridCell(attachment: attachments[0], maxWidth: halfWidth)
+                        mediaGridCell(attachment: attachments[1], maxWidth: halfWidth)
+                    }
+                    HStack(spacing: spacing) {
+                        mediaGridCell(attachment: attachments[2], maxWidth: halfWidth)
+                        let remaining = attachments.count - maxVisibleCount
+                        if remaining > 0 {
+                            mediaGridCell(attachment: attachments[3], maxWidth: halfWidth)
+                                .overlay {
+                                    Color.black.opacity(0.5)
+                                    Text("+\(remaining)")
+                                        .font(.title2.bold())
+                                        .foregroundStyle(.white)
+                                }
+                        } else {
+                            mediaGridCell(attachment: attachments[3], maxWidth: halfWidth)
+                        }
                     }
                 }
             }
         }
+        .frame(height: mediaGridHeight(count: attachments.count, cellHeight: cellHeight, spacing: spacing))
+    }
+
+    private func mediaGridHeight(count: Int, cellHeight: CGFloat, spacing: CGFloat) -> CGFloat {
+        switch count {
+        case 1:
+            return cellHeight
+        case 2:
+            return cellHeight
+        case 3:
+            return cellHeight * 2 + spacing
+        default:
+            return cellHeight * 2 + spacing
+        }
     }
 
     @ViewBuilder
-    private func mediaGridCell(attachment: ChatMediaAttachment) -> some View {
+    private func mediaGridCell(attachment: ChatMediaAttachment, maxWidth: CGFloat, maxHeight: CGFloat = 200) -> some View {
         MediaAttachmentView(
             attachment: attachment,
             isMine: message.isMine,
-            maxMediaWidth: .infinity,
-            maxMediaHeight: 200,
+            maxMediaWidth: maxWidth,
+            maxMediaHeight: maxHeight,
             onDownload: {
                 onDownloadMedia?(message.id, attachment.originalHashHex)
             },

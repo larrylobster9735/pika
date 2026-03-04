@@ -394,6 +394,7 @@ pub struct ChatMediaAttachment {
     pub scheme_version: String,
     pub local_path: Option<String>,
     pub upload_progress: Option<f32>,
+    pub blurhash: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Debug)]

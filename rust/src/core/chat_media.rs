@@ -55,6 +55,15 @@ fn maybe_resize_image(data: &[u8], mime_type: &str) -> Option<(Vec<u8>, u32, u32
     }
 }
 
+/// Encode a small blurhash (4×3 components) from image bytes.
+/// Returns `None` for non-image data or decode failures.
+fn compute_blurhash(data: &[u8]) -> Option<String> {
+    let img = ::image::load_from_memory(data).ok()?;
+    let small = img.resize_exact(32, 32, ::image::imageops::FilterType::Nearest);
+    let rgba = small.to_rgba8();
+    blurhash::encode(4, 3, 32, 32, rgba.as_raw()).ok()
+}
+
 /// Send an event to multiple relays concurrently, returning success as soon as
 /// the first relay ACKs. Only waits for all relays if none succeed.
 pub(super) async fn send_event_first_ack(
@@ -281,6 +290,7 @@ impl AppCore {
             scheme_version: reference.scheme_version.clone(),
             local_path,
             upload_progress: None,
+            blurhash: None,
         }
     }
 
@@ -432,6 +442,7 @@ impl AppCore {
             .map(|(w, h)| (Some(w), Some(h)))
             .unwrap_or((None, None));
         let kind = infer_media_kind(&media_mime, &local_filename);
+        let blurhash = compute_blurhash(&media_data);
         let temp_rumor_id = uuid::Uuid::new_v4().to_string();
         let temp_attachment = ChatMediaAttachment {
             original_hash_hex: pre_hash_hex.clone(),
@@ -446,6 +457,7 @@ impl AppCore {
             scheme_version: String::new(),
             local_path: Some(local_path.to_string_lossy().to_string()),
             upload_progress: Some(0.0),
+            blurhash,
         };
 
         self.delivery_overrides
@@ -750,6 +762,7 @@ impl AppCore {
                 .map(|(w, h)| (Some(w), Some(h)))
                 .unwrap_or((None, None));
             let kind = infer_media_kind(&media_mime, &local_filename);
+            let blurhash = compute_blurhash(&media_data);
 
             temp_attachments.push(ChatMediaAttachment {
                 original_hash_hex: pre_hash_hex.clone(),
@@ -764,6 +777,7 @@ impl AppCore {
                 scheme_version: String::new(),
                 local_path: Some(local_path.to_string_lossy().to_string()),
                 upload_progress: Some(0.0),
+                blurhash,
             });
 
             preprocessed.push(PreprocessedItem {

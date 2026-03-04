@@ -21,11 +21,11 @@ struct ChatView: View {
     let onTypingStarted: (@MainActor () -> Void)?
     let onDownloadMedia: (@MainActor (String, String, String) -> Void)?
     let onSendMedia: (@MainActor (String, Data, String, String, String) -> Void)?
-    var onSendMediaBatch: (@MainActor (String, [StagedMediaItem], String) -> Void)? = nil
+    let onSendMediaBatch: (@MainActor (String, [StagedMediaItem], String) -> Void)?
     let onHypernoteAction: (@MainActor (String, String, String, [String: String]) -> Void)?
     let onSendPoll: (@MainActor (String, String, [String]) -> Void)?
     let onLoadOlderMessages: (@MainActor (String, String, UInt32) -> Void)?
-    var onRetryMessage: (@MainActor (String, String) -> Void)? = nil
+    let onRetryMessage: (@MainActor (String, String) -> Void)?
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedMedia: [StagedMediaItem] = []
     @State private var showFileImporter = false
@@ -67,6 +67,7 @@ struct ChatView: View {
         onTypingStarted: (@MainActor () -> Void)? = nil,
         onDownloadMedia: (@MainActor (String, String, String) -> Void)? = nil,
         onSendMedia: (@MainActor (String, Data, String, String, String) -> Void)? = nil,
+        onSendMediaBatch: (@MainActor (String, [StagedMediaItem], String) -> Void)? = nil,
         onHypernoteAction: (@MainActor (String, String, String, [String: String]) -> Void)? = nil,
         onSendPoll: (@MainActor (String, String, [String]) -> Void)? = nil,
         onLoadOlderMessages: (@MainActor (String, String, UInt32) -> Void)? = nil,
@@ -88,6 +89,7 @@ struct ChatView: View {
         self.onTypingStarted = onTypingStarted
         self.onDownloadMedia = onDownloadMedia
         self.onSendMedia = onSendMedia
+        self.onSendMediaBatch = onSendMediaBatch
         self.onHypernoteAction = onHypernoteAction
         self.onSendPoll = onSendPoll
         self.onLoadOlderMessages = onLoadOlderMessages

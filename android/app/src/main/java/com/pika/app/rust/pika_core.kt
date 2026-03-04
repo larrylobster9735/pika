@@ -2137,6 +2137,8 @@ data class ChatMediaAttachment (
     var `localPath`: kotlin.String?
     , 
     var `uploadProgress`: kotlin.Float?
+    , 
+    var `blurhash`: kotlin.String?
     
 ){
     
@@ -2165,6 +2167,7 @@ public object FfiConverterTypeChatMediaAttachment: FfiConverterRustBuffer<ChatMe
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -2180,7 +2183,8 @@ public object FfiConverterTypeChatMediaAttachment: FfiConverterRustBuffer<ChatMe
             FfiConverterString.allocationSize(value.`nonceHex`) +
             FfiConverterString.allocationSize(value.`schemeVersion`) +
             FfiConverterOptionalString.allocationSize(value.`localPath`) +
-            FfiConverterOptionalFloat.allocationSize(value.`uploadProgress`)
+            FfiConverterOptionalFloat.allocationSize(value.`uploadProgress`) +
+            FfiConverterOptionalString.allocationSize(value.`blurhash`)
     )
 
     override fun write(value: ChatMediaAttachment, buf: ByteBuffer) {
@@ -2196,6 +2200,7 @@ public object FfiConverterTypeChatMediaAttachment: FfiConverterRustBuffer<ChatMe
             FfiConverterString.write(value.`schemeVersion`, buf)
             FfiConverterOptionalString.write(value.`localPath`, buf)
             FfiConverterOptionalFloat.write(value.`uploadProgress`, buf)
+            FfiConverterOptionalString.write(value.`blurhash`, buf)
     }
 }
 

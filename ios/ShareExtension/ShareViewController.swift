@@ -125,7 +125,7 @@ private struct ShareExtensionView: View {
                         if viewModel.isSending {
                             ProgressView()
                         } else {
-                            Button("Send", action: onSend)
+                            Button(viewModel.sendButtonTitle, action: onSend)
                                 .disabled(!viewModel.canSend)
                         }
                     }
@@ -184,11 +184,11 @@ private struct ShareExtensionView: View {
                 Section("Recent Chats") {
                     ForEach(viewModel.filteredChats) { chat in
                         Button {
-                            viewModel.selectedChatId = chat.chatId
+                            viewModel.toggleChat(chat.chatId)
                         } label: {
                             ShareChatRow(
                                 chat: chat,
-                                isSelected: viewModel.selectedChatId == chat.chatId
+                                isSelected: viewModel.selectedChatIds.contains(chat.chatId)
                             )
                         }
                         .buttonStyle(.plain)
@@ -319,6 +319,29 @@ private struct SharePayloadPreview: View {
                 } else {
                     Label("Image", systemImage: "photo")
                 }
+            case .images(let items):
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(0..<items.count, id: \.self) { index in
+                            if let image = UIImage(data: items[index].0) {
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 80, height: 80)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.gray.opacity(0.2))
+                                    .frame(width: 80, height: 80)
+                                    .overlay {
+                                        Image(systemName: "photo")
+                                            .foregroundStyle(.secondary)
+                                    }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
             }
         } else {
             Text("No content")
@@ -362,17 +385,36 @@ private struct ShareChatRow: View {
                     .font(.system(size: 14))
                     .foregroundStyle(.blue)
             }
-        } else {
-            let initials = initials(for: chat)
-            ZStack {
-                Circle()
-                    .fill(Color.gray.opacity(0.2))
-                    .frame(width: 36, height: 36)
-                Text(initials)
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.primary)
+        } else if let urlString = chat.members.first?.pictureUrl,
+                  let url = URL(string: urlString) {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 36, height: 36)
+                        .clipShape(Circle())
+                default:
+                    initialsAvatar
+                }
             }
+            .frame(width: 36, height: 36)
+        } else {
+            initialsAvatar
+        }
+    }
+
+    private var initialsAvatar: some View {
+        let initials = initials(for: chat)
+        return ZStack {
+            Circle()
+                .fill(Color.gray.opacity(0.2))
+                .frame(width: 36, height: 36)
+            Text(initials)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
         }
     }
 
@@ -401,7 +443,7 @@ private final class ShareExtensionViewModel: ObservableObject {
     @Published private(set) var payload: ShareIncomingPayload?
     @Published private(set) var isLoadingPayload = false
     @Published private(set) var isSending = false
-    @Published var selectedChatId: String?
+    @Published var selectedChatIds: Set<String> = []
     @Published var searchText = ""
     @Published var composeText = ""
     @Published var errorMessage: String?
@@ -424,18 +466,31 @@ private final class ShareExtensionViewModel: ObservableObject {
     }
 
     var canSend: Bool {
-        isLoggedIn && sendStage == .idle && !isSending && payload != nil && selectedChatId != nil
+        isLoggedIn && sendStage == .idle && !isSending && payload != nil && !selectedChatIds.isEmpty
+    }
+
+    var sendButtonTitle: String {
+        let count = selectedChatIds.count
+        if count > 1 {
+            return "Send to \(count) chats"
+        }
+        return "Send"
     }
 
     var isShowingQueueProgress: Bool {
         sendStage != .idle
     }
 
+    func toggleChat(_ chatId: String) {
+        if selectedChatIds.contains(chatId) {
+            selectedChatIds.remove(chatId)
+        } else {
+            selectedChatIds.insert(chatId)
+        }
+    }
+
     func load(from context: NSExtensionContext?) {
         chats = ShareQueueManager.readChatListCache()
-        if selectedChatId == nil {
-            selectedChatId = chats.first?.chatId
-        }
         sendStage = .idle
         sendProgress = 0
 
@@ -456,7 +511,7 @@ private final class ShareExtensionViewModel: ObservableObject {
     }
 
     func enqueueSelectedShare() async -> Bool {
-        guard let chatId = selectedChatId, let payload else {
+        guard !selectedChatIds.isEmpty, let payload else {
             return false
         }
 
@@ -470,59 +525,90 @@ private final class ShareExtensionViewModel: ObservableObject {
         do {
             let trimmedCompose = composeText.trimmingCharacters(in: .whitespacesAndNewlines)
             let createdAtMs = UInt64(Date().timeIntervalSince1970 * 1000)
-            let requestId = UUID().uuidString
-            let request: ShareEnqueueRequest
 
             sendStage = .queueing
             sendProgress = 0.65
 
-            switch payload {
-            case .text(let text):
-                request = ShareEnqueueRequest(
-                    chatId: chatId,
-                    composeText: trimmedCompose,
-                    payloadKind: .text,
-                    payloadText: text,
-                    mediaRelativePath: nil,
-                    mediaMimeType: nil,
-                    mediaFilename: nil,
-                    clientRequestId: requestId,
-                    createdAtMs: createdAtMs
-                )
+            for chatId in selectedChatIds {
+                let requestId = UUID().uuidString
 
-            case .url(let text):
-                request = ShareEnqueueRequest(
-                    chatId: chatId,
-                    composeText: trimmedCompose,
-                    payloadKind: .url,
-                    payloadText: text,
-                    mediaRelativePath: nil,
-                    mediaMimeType: nil,
-                    mediaFilename: nil,
-                    clientRequestId: requestId,
-                    createdAtMs: createdAtMs
-                )
+                switch payload {
+                case .text(let text):
+                    _ = try ShareQueueManager.enqueue(ShareEnqueueRequest(
+                        chatId: chatId,
+                        composeText: trimmedCompose,
+                        payloadKind: .text,
+                        payloadText: text,
+                        mediaRelativePath: nil,
+                        mediaMimeType: nil,
+                        mediaFilename: nil,
+                        mediaBatch: nil,
+                        clientRequestId: requestId,
+                        createdAtMs: createdAtMs
+                    ))
 
-            case .image(let data, let mimeType, let filename):
-                let mediaPath = try ShareQueueManager.saveMedia(
-                    data,
-                    preferredFilename: filename,
-                    defaultExtension: "jpg"
-                )
-                request = ShareEnqueueRequest(
-                    chatId: chatId,
-                    composeText: trimmedCompose,
-                    payloadKind: .image,
-                    payloadText: nil,
-                    mediaRelativePath: mediaPath,
-                    mediaMimeType: mimeType,
-                    mediaFilename: filename,
-                    clientRequestId: requestId,
-                    createdAtMs: createdAtMs
-                )
+                case .url(let text):
+                    _ = try ShareQueueManager.enqueue(ShareEnqueueRequest(
+                        chatId: chatId,
+                        composeText: trimmedCompose,
+                        payloadKind: .url,
+                        payloadText: text,
+                        mediaRelativePath: nil,
+                        mediaMimeType: nil,
+                        mediaFilename: nil,
+                        mediaBatch: nil,
+                        clientRequestId: requestId,
+                        createdAtMs: createdAtMs
+                    ))
+
+                case .image(let data, let mimeType, let filename):
+                    let mediaPath = try ShareQueueManager.saveMedia(
+                        data,
+                        preferredFilename: filename,
+                        defaultExtension: "jpg"
+                    )
+                    _ = try ShareQueueManager.enqueue(ShareEnqueueRequest(
+                        chatId: chatId,
+                        composeText: trimmedCompose,
+                        payloadKind: .image,
+                        payloadText: nil,
+                        mediaRelativePath: mediaPath,
+                        mediaMimeType: mimeType,
+                        mediaFilename: filename,
+                        mediaBatch: nil,
+                        clientRequestId: requestId,
+                        createdAtMs: createdAtMs
+                    ))
+
+                case .images(let items):
+                    var batchEntries: [ShareMediaBatchEntry] = []
+                    for (data, mimeType, filename) in items {
+                        let mediaPath = try ShareQueueManager.saveMedia(
+                            data,
+                            preferredFilename: filename,
+                            defaultExtension: "jpg"
+                        )
+                        batchEntries.append(ShareMediaBatchEntry(
+                            relativePath: mediaPath,
+                            mimeType: mimeType,
+                            filename: filename
+                        ))
+                    }
+                    _ = try ShareQueueManager.enqueue(ShareEnqueueRequest(
+                        chatId: chatId,
+                        composeText: trimmedCompose,
+                        payloadKind: .imageBatch,
+                        payloadText: nil,
+                        mediaRelativePath: nil,
+                        mediaMimeType: nil,
+                        mediaFilename: nil,
+                        mediaBatch: batchEntries,
+                        clientRequestId: requestId,
+                        createdAtMs: createdAtMs
+                    ))
+                }
             }
 
-            _ = try ShareQueueManager.enqueue(request)
             sendProgress = 1
             sendStage = .queued
             return true
@@ -539,6 +625,7 @@ private enum ShareIncomingPayload {
     case text(String)
     case url(String)
     case image(Data, mimeType: String, filename: String)
+    case images([(Data, mimeType: String, filename: String)])
 
     struct ExtractResult {
         let payload: ShareIncomingPayload?
@@ -554,13 +641,40 @@ private enum ShareIncomingPayload {
             .compactMap { $0 as? NSExtensionItem }
             .flatMap { $0.attachments ?? [] }
 
-        if let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }) {
+        let imageProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }
+        let videoProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.movie.identifier) &&
+            !$0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+        }
+
+        let hasMedia = !imageProviders.isEmpty || !videoProviders.isEmpty
+
+        if hasMedia {
             do {
-                if let imagePayload = try await loadImage(from: provider) {
-                    return ExtractResult(payload: imagePayload, errorMessage: nil)
+                var loaded: [(Data, mimeType: String, filename: String)] = []
+                for provider in imageProviders {
+                    if let imagePayload = try await loadImage(from: provider) {
+                        if case .image(let data, let mimeType, let filename) = imagePayload {
+                            loaded.append((data, mimeType: mimeType, filename: filename))
+                        }
+                    }
+                }
+                for provider in videoProviders {
+                    if let videoEntry = try await loadVideo(from: provider) {
+                        loaded.append(videoEntry)
+                    }
+                }
+                if loaded.count >= 2 {
+                    return ExtractResult(payload: .images(loaded), errorMessage: nil)
+                } else if loaded.count == 1 {
+                    let item = loaded[0]
+                    return ExtractResult(
+                        payload: .image(item.0, mimeType: item.mimeType, filename: item.filename),
+                        errorMessage: nil
+                    )
                 }
             } catch {
-                return ExtractResult(payload: nil, errorMessage: "Could not load the selected image.")
+                return ExtractResult(payload: nil, errorMessage: "Could not load the selected media.")
             }
         }
 
@@ -584,7 +698,7 @@ private enum ShareIncomingPayload {
             }
         }
 
-        return ExtractResult(payload: nil, errorMessage: "Pika supports sharing text, links, and images.")
+        return ExtractResult(payload: nil, errorMessage: "Pika supports sharing text, links, images, and videos.")
     }
 
     private static func loadString(from provider: NSItemProvider, type: UTType) async throws -> String? {
@@ -636,6 +750,51 @@ private enum ShareIncomingPayload {
         }
 
         return nil
+    }
+
+    private static func loadVideo(from provider: NSItemProvider) async throws -> (Data, mimeType: String, filename: String)? {
+        guard provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) else { return nil }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let url else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                // The file is temporary — read it synchronously before the callback returns.
+                guard let data = try? Data(contentsOf: url) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let ext = url.pathExtension.lowercased()
+                let mimeType: String
+                switch ext {
+                case "mov": mimeType = "video/quicktime"
+                case "mp4", "m4v": mimeType = "video/mp4"
+                case "avi": mimeType = "video/x-msvideo"
+                default: mimeType = "video/mp4"
+                }
+                let filename = sanitizedVideoFilename(from: provider.suggestedName, ext: ext)
+                continuation.resume(returning: (data, mimeType: mimeType, filename: filename))
+            }
+        }
+    }
+
+    private static func sanitizedVideoFilename(from proposed: String?, ext: String) -> String {
+        let raw = (proposed ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = URL(fileURLWithPath: raw.isEmpty ? "shared-video" : raw).deletingPathExtension().lastPathComponent
+        let safe = base.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]",
+            with: "-",
+            options: .regularExpression
+        )
+        let finalBase = safe.isEmpty ? "shared-video" : safe
+        let finalExt = ext.isEmpty ? "mp4" : ext
+        return "\(finalBase).\(finalExt)"
     }
 
     // MARK: - Image helpers

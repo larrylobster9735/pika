@@ -27,6 +27,7 @@ pub enum SharePayloadKind {
     Text,
     Url,
     Image,
+    ImageBatch,
 }
 
 #[derive(uniffi::Record, Clone, Debug, Serialize, Deserialize)]
@@ -38,8 +39,16 @@ pub struct ShareEnqueueRequest {
     pub media_relative_path: Option<String>,
     pub media_mime_type: Option<String>,
     pub media_filename: Option<String>,
+    pub media_batch: Option<Vec<ShareMediaBatchEntry>>,
     pub client_request_id: String,
     pub created_at_ms: u64,
+}
+
+#[derive(uniffi::Record, Clone, Debug, Serialize, Deserialize)]
+pub struct ShareMediaBatchEntry {
+    pub relative_path: String,
+    pub mime_type: String,
+    pub filename: String,
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +75,17 @@ pub enum ShareDispatchKind {
         filename: String,
         data_base64: String,
     },
+    MediaBatch {
+        caption: String,
+        items: Vec<ShareMediaBatchDispatchItem>,
+    },
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMediaBatchDispatchItem {
+    pub mime_type: String,
+    pub filename: String,
+    pub data_base64: String,
 }
 
 #[derive(uniffi::Record, Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +155,7 @@ struct StoredQueueItem {
     media_relative_path: Option<String>,
     media_mime_type: Option<String>,
     media_filename: Option<String>,
+    media_batch: Option<Vec<ShareMediaBatchEntry>>,
     client_request_id: String,
     created_at_ms: u64,
     queued_at_ms: u64,
@@ -197,6 +218,18 @@ pub fn share_enqueue(
         }
     }
 
+    if let Some(batch) = &normalized.media_batch {
+        for entry in batch {
+            let abs = resolve_relative_path(&layout.root_dir, &entry.relative_path)?;
+            if !abs.is_file() {
+                return Err(ShareError::InvalidRequest(format!(
+                    "media batch file does not exist: {}",
+                    entry.relative_path
+                )));
+            }
+        }
+    }
+
     let index_path = layout.request_index_path(&normalized.client_request_id);
     if index_path.exists() {
         let existing: StoredRequestIndex = read_json(&index_path)?;
@@ -217,6 +250,7 @@ pub fn share_enqueue(
         media_relative_path: normalized.media_relative_path,
         media_mime_type: normalized.media_mime_type,
         media_filename: normalized.media_filename,
+        media_batch: normalized.media_batch,
         client_request_id: normalized.client_request_id.clone(),
         created_at_ms: normalized.created_at_ms,
         queued_at_ms: normalized.created_at_ms,
@@ -483,6 +517,7 @@ struct NormalizedRequest {
     media_relative_path: Option<String>,
     media_mime_type: Option<String>,
     media_filename: Option<String>,
+    media_batch: Option<Vec<ShareMediaBatchEntry>>,
     client_request_id: String,
     created_at_ms: u64,
 }
@@ -588,6 +623,29 @@ fn validate_enqueue_request(request: &ShareEnqueueRequest) -> Result<(), ShareEr
                 ));
             }
         }
+        SharePayloadKind::ImageBatch => {
+            let batch = request.media_batch.as_ref().ok_or_else(|| {
+                ShareError::InvalidRequest("image batch share requires media_batch".to_string())
+            })?;
+            if batch.is_empty() {
+                return Err(ShareError::InvalidRequest(
+                    "media_batch must not be empty".to_string(),
+                ));
+            }
+            for entry in batch {
+                let path = entry.relative_path.trim();
+                if path.is_empty() {
+                    return Err(ShareError::InvalidRequest(
+                        "media_batch entry has empty relative_path".to_string(),
+                    ));
+                }
+                if !is_safe_relative_path(path) {
+                    return Err(ShareError::InvalidRequest(
+                        "media_batch entry has unsafe relative_path".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -637,6 +695,7 @@ fn normalize_request(request: ShareEnqueueRequest, now: u64) -> NormalizedReques
         media_relative_path,
         media_mime_type,
         media_filename,
+        media_batch: request.media_batch,
         client_request_id: request.client_request_id.trim().to_string(),
         created_at_ms: if request.created_at_ms == 0 {
             now
@@ -687,6 +746,31 @@ fn build_dispatch_job(
                 mime_type,
                 filename,
                 data_base64: BASE64_STANDARD.encode(data),
+            }
+        }
+        SharePayloadKind::ImageBatch => {
+            let batch = item.media_batch.as_ref().ok_or_else(|| {
+                ShareError::InvalidRequest("missing media_batch for ImageBatch".to_string())
+            })?;
+            let mut dispatch_items = Vec::with_capacity(batch.len());
+            for entry in batch {
+                let abs = resolve_relative_path(&layout.root_dir, &entry.relative_path)?;
+                let data = fs::read(&abs).map_err(|err| ShareError::Io(err.to_string()))?;
+                if data.is_empty() {
+                    return Err(ShareError::InvalidRequest(format!(
+                        "media batch file is empty: {}",
+                        entry.relative_path
+                    )));
+                }
+                dispatch_items.push(ShareMediaBatchDispatchItem {
+                    mime_type: entry.mime_type.clone(),
+                    filename: entry.filename.clone(),
+                    data_base64: BASE64_STANDARD.encode(data),
+                });
+            }
+            ShareDispatchKind::MediaBatch {
+                caption: item.compose_text.clone(),
+                items: dispatch_items,
             }
         }
     };
@@ -811,11 +895,16 @@ fn remove_pending_item(layout: &QueueLayout, item: &StoredQueueItem) -> Result<(
 }
 
 fn remove_media_for_item(layout: &QueueLayout, item: &StoredQueueItem) -> Result<(), ShareError> {
-    let Some(media_relative_path) = &item.media_relative_path else {
-        return Ok(());
-    };
-    let media_absolute_path = resolve_relative_path(&layout.root_dir, media_relative_path)?;
-    let _ = fs::remove_file(media_absolute_path);
+    if let Some(media_relative_path) = &item.media_relative_path {
+        let media_absolute_path = resolve_relative_path(&layout.root_dir, media_relative_path)?;
+        let _ = fs::remove_file(media_absolute_path);
+    }
+    if let Some(batch) = &item.media_batch {
+        for entry in batch {
+            let abs = resolve_relative_path(&layout.root_dir, &entry.relative_path)?;
+            let _ = fs::remove_file(abs);
+        }
+    }
     Ok(())
 }
 
@@ -829,6 +918,12 @@ fn remove_orphan_media(layout: &QueueLayout) -> Result<u32, ShareError> {
         if let Some(relative_path) = item.media_relative_path {
             let abs = resolve_relative_path(&layout.root_dir, &relative_path)?;
             referenced.insert(abs);
+        }
+        if let Some(batch) = item.media_batch {
+            for entry in batch {
+                let abs = resolve_relative_path(&layout.root_dir, &entry.relative_path)?;
+                referenced.insert(abs);
+            }
         }
     }
 
@@ -1067,6 +1162,7 @@ mod tests {
             media_relative_path: Some(relative_media.to_string()),
             media_mime_type: Some("image/jpeg".to_string()),
             media_filename: Some("payload.jpg".to_string()),
+            media_batch: None,
             client_request_id: "req-image-1".to_string(),
             created_at_ms: 1_000,
         };
@@ -1104,6 +1200,7 @@ mod tests {
             media_relative_path: None,
             media_mime_type: None,
             media_filename: None,
+            media_batch: None,
             client_request_id: "req-stale-1".to_string(),
             created_at_ms: stale_created,
         };
@@ -1166,6 +1263,7 @@ mod tests {
                 media_relative_path: None,
                 media_mime_type: None,
                 media_filename: None,
+                media_batch: None,
                 client_request_id: request_id.to_string(),
                 created_at_ms: 1_000,
             }
@@ -1178,5 +1276,118 @@ mod tests {
             }
             fs::write(absolute, bytes).expect("write file");
         }
+    }
+
+    #[test]
+    fn image_batch_dispatch_reads_all_media_files() {
+        let harness = Harness::new();
+        harness.write_file("share_queue/media/a.jpg", &[10, 20]);
+        harness.write_file("share_queue/media/b.png", &[30, 40, 50]);
+
+        let batch = vec![
+            ShareMediaBatchEntry {
+                relative_path: "share_queue/media/a.jpg".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                filename: "a.jpg".to_string(),
+            },
+            ShareMediaBatchEntry {
+                relative_path: "share_queue/media/b.png".to_string(),
+                mime_type: "image/png".to_string(),
+                filename: "b.png".to_string(),
+            },
+        ];
+
+        let request = ShareEnqueueRequest {
+            chat_id: "chat-batch".to_string(),
+            compose_text: "batch caption".to_string(),
+            payload_kind: SharePayloadKind::ImageBatch,
+            payload_text: None,
+            media_relative_path: None,
+            media_mime_type: None,
+            media_filename: None,
+            media_batch: Some(batch),
+            client_request_id: "req-batch-1".to_string(),
+            created_at_ms: 1_000,
+        };
+
+        let receipt = share_enqueue(harness.root_dir(), request).expect("enqueue batch");
+        assert_eq!(receipt.status, ShareQueueStatus::Queued);
+
+        let jobs = share_dequeue_batch(harness.root_dir(), 1_001, 10).expect("dequeue batch");
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].kind {
+            ShareDispatchKind::MediaBatch { caption, items } => {
+                assert_eq!(caption, "batch caption");
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].mime_type, "image/jpeg");
+                assert_eq!(items[0].filename, "a.jpg");
+                assert_eq!(items[0].data_base64, BASE64_STANDARD.encode([10, 20]));
+                assert_eq!(items[1].mime_type, "image/png");
+                assert_eq!(items[1].filename, "b.png");
+                assert_eq!(items[1].data_base64, BASE64_STANDARD.encode([30, 40, 50]));
+            }
+            _ => panic!("expected MediaBatch dispatch"),
+        }
+
+        // Ack and verify media cleanup
+        share_ack(
+            harness.root_dir(),
+            ShareDispatchAck {
+                item_id: receipt.item_id.clone(),
+                status: ShareAckStatus::AcceptedByCore,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .expect("ack batch");
+
+        assert!(!harness
+            .temp_dir
+            .path()
+            .join("share_queue/media/a.jpg")
+            .exists());
+        assert!(!harness
+            .temp_dir
+            .path()
+            .join("share_queue/media/b.png")
+            .exists());
+    }
+
+    #[test]
+    fn image_batch_rejects_empty_batch() {
+        let harness = Harness::new();
+        let request = ShareEnqueueRequest {
+            chat_id: "chat-x".to_string(),
+            compose_text: "".to_string(),
+            payload_kind: SharePayloadKind::ImageBatch,
+            payload_text: None,
+            media_relative_path: None,
+            media_mime_type: None,
+            media_filename: None,
+            media_batch: Some(vec![]),
+            client_request_id: "req-empty-batch".to_string(),
+            created_at_ms: 1_000,
+        };
+        let err = share_enqueue(harness.root_dir(), request).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn image_batch_rejects_missing_batch() {
+        let harness = Harness::new();
+        let request = ShareEnqueueRequest {
+            chat_id: "chat-x".to_string(),
+            compose_text: "".to_string(),
+            payload_kind: SharePayloadKind::ImageBatch,
+            payload_text: None,
+            media_relative_path: None,
+            media_mime_type: None,
+            media_filename: None,
+            media_batch: None,
+            client_request_id: "req-no-batch".to_string(),
+            created_at_ms: 1_000,
+        };
+        let err = share_enqueue(harness.root_dir(), request).unwrap_err();
+        assert!(err.to_string().contains("requires media_batch"));
     }
 }

@@ -1134,6 +1134,8 @@ data class ShareEnqueueRequest (
     , 
     var `mediaFilename`: kotlin.String?
     , 
+    var `mediaBatch`: List<ShareMediaBatchEntry>?
+    , 
     var `clientRequestId`: kotlin.String
     , 
     var `createdAtMs`: kotlin.ULong
@@ -1160,6 +1162,7 @@ public object FfiConverterTypeShareEnqueueRequest: FfiConverterRustBuffer<ShareE
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalSequenceTypeShareMediaBatchEntry.read(buf),
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
         )
@@ -1173,6 +1176,7 @@ public object FfiConverterTypeShareEnqueueRequest: FfiConverterRustBuffer<ShareE
             FfiConverterOptionalString.allocationSize(value.`mediaRelativePath`) +
             FfiConverterOptionalString.allocationSize(value.`mediaMimeType`) +
             FfiConverterOptionalString.allocationSize(value.`mediaFilename`) +
+            FfiConverterOptionalSequenceTypeShareMediaBatchEntry.allocationSize(value.`mediaBatch`) +
             FfiConverterString.allocationSize(value.`clientRequestId`) +
             FfiConverterULong.allocationSize(value.`createdAtMs`)
     )
@@ -1185,6 +1189,7 @@ public object FfiConverterTypeShareEnqueueRequest: FfiConverterRustBuffer<ShareE
             FfiConverterOptionalString.write(value.`mediaRelativePath`, buf)
             FfiConverterOptionalString.write(value.`mediaMimeType`, buf)
             FfiConverterOptionalString.write(value.`mediaFilename`, buf)
+            FfiConverterOptionalSequenceTypeShareMediaBatchEntry.write(value.`mediaBatch`, buf)
             FfiConverterString.write(value.`clientRequestId`, buf)
             FfiConverterULong.write(value.`createdAtMs`, buf)
     }
@@ -1245,6 +1250,92 @@ public object FfiConverterTypeShareGcStats: FfiConverterRustBuffer<ShareGcStats>
             FfiConverterUInt.write(value.`removedResults`, buf)
             FfiConverterUInt.write(value.`removedIndexes`, buf)
             FfiConverterUInt.write(value.`removedOrphanMedia`, buf)
+    }
+}
+
+
+
+data class ShareMediaBatchDispatchItem (
+    var `mimeType`: kotlin.String
+    , 
+    var `filename`: kotlin.String
+    , 
+    var `dataBase64`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeShareMediaBatchDispatchItem: FfiConverterRustBuffer<ShareMediaBatchDispatchItem> {
+    override fun read(buf: ByteBuffer): ShareMediaBatchDispatchItem {
+        return ShareMediaBatchDispatchItem(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ShareMediaBatchDispatchItem) = (
+            FfiConverterString.allocationSize(value.`mimeType`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterString.allocationSize(value.`dataBase64`)
+    )
+
+    override fun write(value: ShareMediaBatchDispatchItem, buf: ByteBuffer) {
+            FfiConverterString.write(value.`mimeType`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterString.write(value.`dataBase64`, buf)
+    }
+}
+
+
+
+data class ShareMediaBatchEntry (
+    var `relativePath`: kotlin.String
+    , 
+    var `mimeType`: kotlin.String
+    , 
+    var `filename`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeShareMediaBatchEntry: FfiConverterRustBuffer<ShareMediaBatchEntry> {
+    override fun read(buf: ByteBuffer): ShareMediaBatchEntry {
+        return ShareMediaBatchEntry(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ShareMediaBatchEntry) = (
+            FfiConverterString.allocationSize(value.`relativePath`) +
+            FfiConverterString.allocationSize(value.`mimeType`) +
+            FfiConverterString.allocationSize(value.`filename`)
+    )
+
+    override fun write(value: ShareMediaBatchEntry, buf: ByteBuffer) {
+            FfiConverterString.write(value.`relativePath`, buf)
+            FfiConverterString.write(value.`mimeType`, buf)
+            FfiConverterString.write(value.`filename`, buf)
     }
 }
 
@@ -1419,6 +1510,16 @@ sealed class ShareDispatchKind {
         companion object
     }
     
+    data class MediaBatch(
+        val `caption`: kotlin.String, 
+        val `items`: List<com.pika.app.rust.share.ShareMediaBatchDispatchItem>) : ShareDispatchKind()
+        
+    {
+        
+
+        companion object
+    }
+    
 
     
 
@@ -1444,6 +1545,10 @@ public object FfiConverterTypeShareDispatchKind : FfiConverterRustBuffer<ShareDi
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
+            3 -> ShareDispatchKind.MediaBatch(
+                FfiConverterString.read(buf),
+                FfiConverterSequenceTypeShareMediaBatchDispatchItem.read(buf),
+                )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
     }
@@ -1466,6 +1571,14 @@ public object FfiConverterTypeShareDispatchKind : FfiConverterRustBuffer<ShareDi
                 + FfiConverterString.allocationSize(value.`dataBase64`)
             )
         }
+        is ShareDispatchKind.MediaBatch -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`caption`)
+                + FfiConverterSequenceTypeShareMediaBatchDispatchItem.allocationSize(value.`items`)
+            )
+        }
     }
 
     override fun write(value: ShareDispatchKind, buf: ByteBuffer) {
@@ -1481,6 +1594,12 @@ public object FfiConverterTypeShareDispatchKind : FfiConverterRustBuffer<ShareDi
                 FfiConverterString.write(value.`mimeType`, buf)
                 FfiConverterString.write(value.`filename`, buf)
                 FfiConverterString.write(value.`dataBase64`, buf)
+                Unit
+            }
+            is ShareDispatchKind.MediaBatch -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`caption`, buf)
+                FfiConverterSequenceTypeShareMediaBatchDispatchItem.write(value.`items`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -1621,7 +1740,8 @@ enum class SharePayloadKind {
     
     TEXT,
     URL,
-    IMAGE;
+    IMAGE,
+    IMAGE_BATCH;
 
     
 
@@ -1721,6 +1841,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalSequenceTypeShareMediaBatchEntry: FfiConverterRustBuffer<List<ShareMediaBatchEntry>?> {
+    override fun read(buf: ByteBuffer): List<ShareMediaBatchEntry>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypeShareMediaBatchEntry.read(buf)
+    }
+
+    override fun allocationSize(value: List<ShareMediaBatchEntry>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypeShareMediaBatchEntry.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<ShareMediaBatchEntry>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypeShareMediaBatchEntry.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeShareDispatchJob: FfiConverterRustBuffer<List<ShareDispatchJob>> {
     override fun read(buf: ByteBuffer): List<ShareDispatchJob> {
         val len = buf.getInt()
@@ -1739,6 +1891,62 @@ public object FfiConverterSequenceTypeShareDispatchJob: FfiConverterRustBuffer<L
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeShareDispatchJob.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeShareMediaBatchDispatchItem: FfiConverterRustBuffer<List<ShareMediaBatchDispatchItem>> {
+    override fun read(buf: ByteBuffer): List<ShareMediaBatchDispatchItem> {
+        val len = buf.getInt()
+        return List<ShareMediaBatchDispatchItem>(len) {
+            FfiConverterTypeShareMediaBatchDispatchItem.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ShareMediaBatchDispatchItem>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeShareMediaBatchDispatchItem.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<ShareMediaBatchDispatchItem>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeShareMediaBatchDispatchItem.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeShareMediaBatchEntry: FfiConverterRustBuffer<List<ShareMediaBatchEntry>> {
+    override fun read(buf: ByteBuffer): List<ShareMediaBatchEntry> {
+        val len = buf.getInt()
+        return List<ShareMediaBatchEntry>(len) {
+            FfiConverterTypeShareMediaBatchEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ShareMediaBatchEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeShareMediaBatchEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<ShareMediaBatchEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeShareMediaBatchEntry.write(it, buf)
         }
     }
 }
