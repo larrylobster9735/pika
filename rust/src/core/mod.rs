@@ -3128,6 +3128,29 @@ impl AppCore {
                 tracing::debug!(event_id = %event.id.to_hex(), "group_message_received");
                 self.handle_group_message(event);
             }
+            InternalEvent::CompleteSessionInit => {
+                if !self.is_logged_in() {
+                    return;
+                }
+                self.cache_missing_profile_pics();
+                self.refresh_my_profile(false);
+                self.hydrate_follow_list_from_cache();
+                self.refresh_follow_list();
+                if self.network_enabled() {
+                    self.publish_key_package_relays_best_effort();
+                    self.ensure_key_package_published_best_effort();
+                    self.recompute_subscriptions();
+                }
+                self.register_push_device();
+            }
+            InternalEvent::RefreshAfterForeground => {
+                if !self.is_logged_in() {
+                    return;
+                }
+                self.refresh_all_from_storage();
+                self.refresh_my_profile(false);
+                self.refresh_follow_list();
+            }
         }
     }
 
@@ -4551,9 +4574,12 @@ impl AppCore {
                 // Native should send lifecycle signals as actions. Rust owns all state changes.
                 if self.is_logged_in() {
                     self.reopen_mdk(); // Pick up NSE's ratchet changes
-                    self.refresh_all_from_storage();
-                    self.refresh_my_profile(false);
-                    self.refresh_follow_list();
+
+                    // Defer the heavy refresh so any user actions that queued while
+                    // the actor was busy (e.g. chat taps) are processed first.
+                    let _ = self.core_sender.send(CoreMsg::Internal(Box::new(
+                        InternalEvent::RefreshAfterForeground,
+                    )));
                 } else {
                     tracing::info!(
                         pending_nostr_connect = self.pending_nostr_connect_login.is_some(),
