@@ -433,10 +433,10 @@ fn send_message_creates_pending_then_sent() {
     let msg = chat.messages.last().unwrap();
     let first_message_id = msg.id.clone();
     assert_eq!(msg.content, "hello");
-    assert!(
-        matches!(msg.delivery, pika_core::MessageDeliveryState::Pending)
-            || matches!(msg.delivery, pika_core::MessageDeliveryState::Sent)
-    );
+    assert!(matches!(
+        msg.delivery,
+        pika_core::MessageDeliveryState::Pending | pika_core::MessageDeliveryState::Sent
+    ));
 
     wait_until("message sent", Duration::from_secs(10), || {
         app.state()

@@ -12,6 +12,57 @@ use super::*;
 
 const MAX_CHAT_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 
+/// Send an event to multiple relays concurrently, returning success as soon as
+/// the first relay ACKs. Only waits for all relays if none succeed.
+pub(super) async fn send_event_first_ack(
+    client: &Client,
+    relays: &[RelayUrl],
+    event: &Event,
+) -> (bool, Option<String>) {
+    if relays.is_empty() {
+        return (false, Some("no relays configured".into()));
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(), String>>(relays.len());
+    let event = Arc::new(event.clone());
+
+    for relay in relays {
+        let client = client.clone();
+        let event = event.clone();
+        let relay = relay.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = match client.send_event_to([relay], &event).await {
+                Ok(output) if !output.success.is_empty() => Ok(()),
+                Ok(output) => {
+                    let errors: Vec<&str> = output.failed.values().map(|s| s.as_str()).collect();
+                    Err(if errors.is_empty() {
+                        "no relay accepted event".to_string()
+                    } else {
+                        errors.join("; ")
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(result).await;
+        });
+    }
+    drop(tx); // Close our handle so rx completes when all tasks finish.
+
+    let mut first_error = None;
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(()) => return (true, None),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    (false, first_error)
+}
+
 /// Map file extension to a MIME type that MDK's encrypted-media allowlist
 /// accepts.  Types not on MDK's `SUPPORTED_MIME_TYPES` list must map to
 /// `application/octet-stream` (MDK's escape-hatch type) so that arbitrary
@@ -582,45 +633,22 @@ impl AppCore {
         let wrapper_kind = wrapper.kind.as_u16();
         let relay_list: Vec<String> = relays.iter().map(|r| r.to_string()).collect();
         self.runtime.spawn(async move {
-            let (ok, error) = match client.send_event_to(relays, &wrapper).await {
-                Ok(output) => {
-                    if diag {
-                        tracing::info!(
-                            target: "pika_core::nostr_publish",
-                            context = "group_message",
-                            rumor_id = %rumor_id_hex,
-                            event_id = %wrapper_id,
-                            kind = wrapper_kind,
-                            relays = ?relay_list,
-                            success = ?output.success,
-                            failed = ?output.failed,
-                        );
-                    }
-                    if output.success.is_empty() {
-                        let errors: Vec<&str> =
-                            output.failed.values().map(|s| s.as_str()).collect();
-                        (false, Some(errors.join("; ")))
-                    } else {
-                        (true, None)
-                    }
-                }
-                Err(e) => {
-                    if diag {
-                        tracing::info!(
-                            target: "pika_core::nostr_publish",
-                            context = "group_message",
-                            rumor_id = %rumor_id_hex,
-                            event_id = %wrapper_id,
-                            kind = wrapper_kind,
-                            relays = ?relay_list,
-                            error = %e,
-                        );
-                    } else {
-                        tracing::warn!(%e, "message broadcast failed");
-                    }
-                    (false, Some(e.to_string()))
-                }
-            };
+            let (ok, error) = send_event_first_ack(&client, &relays, &wrapper).await;
+
+            if diag {
+                tracing::info!(
+                    target: "pika_core::nostr_publish",
+                    context = "group_message",
+                    rumor_id = %rumor_id_hex,
+                    event_id = %wrapper_id,
+                    kind = wrapper_kind,
+                    relays = ?relay_list,
+                    ok,
+                );
+            }
+            if !ok && !diag {
+                tracing::warn!(error = ?error, "message broadcast failed");
+            }
             let _ = tx.send(CoreMsg::Internal(Box::new(
                 InternalEvent::PublishMessageResult {
                     chat_id,

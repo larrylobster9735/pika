@@ -4811,19 +4811,13 @@ impl AppCore {
                 }
                 let tx = self.core_sender.clone();
                 let rumor_id = ps.rumor_id_hex.clone();
+                let wrapper = ps.wrapper_event.clone();
                 self.runtime.spawn(async move {
-                    let (ok, error) = match client.send_event_to(relays, &ps.wrapper_event).await {
-                        Ok(output) if !output.success.is_empty() => (true, None),
-                        Ok(output) => {
-                            let errors: Vec<&str> =
-                                output.failed.values().map(|s| s.as_str()).collect();
-                            (false, Some(errors.join("; ")))
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "message retry broadcast failed");
-                            (false, Some(e.to_string()))
-                        }
-                    };
+                    let (ok, error) =
+                        chat_media::send_event_first_ack(&client, &relays, &wrapper).await;
+                    if !ok {
+                        tracing::warn!(error = ?error, "message retry broadcast failed");
+                    }
                     let _ = tx.send(CoreMsg::Internal(Box::new(
                         InternalEvent::PublishMessageResult {
                             chat_id,
