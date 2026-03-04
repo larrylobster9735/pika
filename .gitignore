@@ -33,6 +33,9 @@ ios/Bindings/*.modulemap
 ios/NSEBindings/*.swift
 ios/NSEBindings/*.h
 ios/NSEBindings/*.modulemap
+ios/ShareBindings/*.swift
+ios/ShareBindings/*.h
+ios/ShareBindings/*.modulemap
 ios/.build-number
 
 # Misc

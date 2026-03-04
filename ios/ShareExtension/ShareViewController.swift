@@ -468,39 +468,39 @@ private final class ShareExtensionViewModel: ObservableObject {
         try? await Task.sleep(nanoseconds: 180_000_000)
 
         do {
-            let id = UUID().uuidString
-            let createdAt = Int64(Date().timeIntervalSince1970)
-            let queuedItem: ShareQueueItem
             let trimmedCompose = composeText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let createdAtMs = UInt64(Date().timeIntervalSince1970 * 1000)
+            let requestId = UUID().uuidString
+            let request: ShareEnqueueRequest
 
             sendStage = .queueing
             sendProgress = 0.65
 
             switch payload {
             case .text(let text):
-                let content = mergedText(primary: text, prefix: trimmedCompose)
-                queuedItem = ShareQueueItem(
-                    id: id,
+                request = ShareEnqueueRequest(
                     chatId: chatId,
-                    contentType: .text,
-                    text: content,
-                    mediaFilename: nil,
+                    composeText: trimmedCompose,
+                    payloadKind: .text,
+                    payloadText: text,
+                    mediaRelativePath: nil,
                     mediaMimeType: nil,
-                    mediaPath: nil,
-                    createdAt: createdAt
+                    mediaFilename: nil,
+                    clientRequestId: requestId,
+                    createdAtMs: createdAtMs
                 )
 
             case .url(let text):
-                let content = mergedText(primary: text, prefix: trimmedCompose)
-                queuedItem = ShareQueueItem(
-                    id: id,
+                request = ShareEnqueueRequest(
                     chatId: chatId,
-                    contentType: .url,
-                    text: content,
-                    mediaFilename: nil,
+                    composeText: trimmedCompose,
+                    payloadKind: .url,
+                    payloadText: text,
+                    mediaRelativePath: nil,
                     mediaMimeType: nil,
-                    mediaPath: nil,
-                    createdAt: createdAt
+                    mediaFilename: nil,
+                    clientRequestId: requestId,
+                    createdAtMs: createdAtMs
                 )
 
             case .image(let data, let mimeType, let filename):
@@ -509,19 +509,20 @@ private final class ShareExtensionViewModel: ObservableObject {
                     preferredFilename: filename,
                     defaultExtension: "jpg"
                 )
-                queuedItem = ShareQueueItem(
-                    id: id,
+                request = ShareEnqueueRequest(
                     chatId: chatId,
-                    contentType: .image,
-                    text: trimmedCompose,
-                    mediaFilename: filename,
+                    composeText: trimmedCompose,
+                    payloadKind: .image,
+                    payloadText: nil,
+                    mediaRelativePath: mediaPath,
                     mediaMimeType: mimeType,
-                    mediaPath: mediaPath,
-                    createdAt: createdAt
+                    mediaFilename: filename,
+                    clientRequestId: requestId,
+                    createdAtMs: createdAtMs
                 )
             }
 
-            try ShareQueueManager.enqueue(queuedItem)
+            _ = try ShareQueueManager.enqueue(request)
             sendProgress = 1
             sendStage = .queued
             return true
@@ -531,16 +532,6 @@ private final class ShareExtensionViewModel: ObservableObject {
             sendProgress = 0
             return false
         }
-    }
-
-    private func mergedText(primary: String, prefix: String) -> String {
-        if prefix.isEmpty {
-            return primary
-        }
-        if primary.isEmpty {
-            return prefix
-        }
-        return "\(prefix)\n\(primary)"
     }
 }
 

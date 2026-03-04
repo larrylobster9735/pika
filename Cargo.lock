@@ -5893,6 +5893,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pika-share"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uniffi",
+ "uuid",
+]
+
+[[package]]
 name = "pika-test-utils"
 version = "0.1.0"
 

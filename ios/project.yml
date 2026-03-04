@@ -39,6 +39,10 @@ targets:
         excludes:
           - "*.h"
           - "*.modulemap"
+      - path: ShareBindings
+        excludes:
+          - "*.h"
+          - "*.modulemap"
       - path: ShareExtension/ShareQueueManager.swift
     settings:
       base:
@@ -51,6 +55,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Pika.entitlements
     dependencies:
       - framework: Frameworks/PikaCore.xcframework
+        embed: false
+      - framework: Frameworks/PikaShare.xcframework
         embed: false
       - package: MarkdownUI
       - package: Perception
@@ -102,6 +108,10 @@ targets:
     platform: iOS
     sources:
       - path: ShareExtension
+      - path: ShareBindings
+        excludes:
+          - "*.h"
+          - "*.modulemap"
     settings:
       base:
         PRODUCT_NAME: PikaShareExtension
@@ -109,6 +119,9 @@ targets:
         INFOPLIST_FILE: ShareExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: $(PIKA_APP_BUNDLE_ID).share-extension
+    dependencies:
+      - framework: Frameworks/PikaShare.xcframework
+        embed: false
     postBuildScripts:
       - name: "Stamp build number"
         script: |

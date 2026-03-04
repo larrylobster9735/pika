@@ -493,17 +493,18 @@ final class AppManager: AppReconciler {
 
     private func processPendingShareQueue(openFirstChat: Bool) {
         guard case .loggedIn = state.auth else { return }
-        let pending = ShareQueueManager.dequeueAll()
+        ShareQueueManager.runMaintenance()
+        let pending = ShareQueueManager.dequeueBatch()
         guard !pending.isEmpty else { return }
 
         var firstOpenedChatId: String?
         for item in pending {
-            switch item.contentType {
-            case .text, .url:
+            switch item.kind {
+            case .message(let content):
                 dispatch(
                     .sendMessage(
                         chatId: item.chatId,
-                        content: item.text,
+                        content: content,
                         kind: nil,
                         replyToMessageId: nil
                     )
@@ -511,41 +512,42 @@ final class AppManager: AppReconciler {
                 if openFirstChat, firstOpenedChatId == nil {
                     firstOpenedChatId = item.chatId
                 }
-                ShareQueueManager.deleteQueueItem(item)
+                ShareQueueManager.acknowledge(
+                    ShareDispatchAck(
+                        itemId: item.itemId,
+                        status: .acceptedByCore,
+                        errorCode: nil,
+                        errorMessage: nil
+                    )
+                )
 
-            case .image:
-                guard let mediaURL = ShareQueueManager.mediaURL(for: item),
-                      let data = try? Data(contentsOf: mediaURL),
-                      !data.isEmpty else {
-                    ShareQueueManager.deleteQueueItem(item)
-                    continue
-                }
-
-                let filename = normalizedMediaFilename(item.mediaFilename)
+            case .media(let caption, let mimeType, let filename, let dataBase64):
                 dispatch(
                     .sendChatMedia(
                         chatId: item.chatId,
-                        dataBase64: data.base64EncodedString(),
-                        mimeType: item.mediaMimeType ?? "image/jpeg",
+                        dataBase64: dataBase64,
+                        mimeType: mimeType,
                         filename: filename,
-                        caption: item.text
+                        caption: caption
                     )
                 )
                 if openFirstChat, firstOpenedChatId == nil {
                     firstOpenedChatId = item.chatId
                 }
-                ShareQueueManager.deleteQueueItem(item)
+                ShareQueueManager.acknowledge(
+                    ShareDispatchAck(
+                        itemId: item.itemId,
+                        status: .acceptedByCore,
+                        errorCode: nil,
+                        errorMessage: nil
+                    )
+                )
             }
         }
 
         if openFirstChat, let chatId = firstOpenedChatId {
             dispatch(.openChat(chatId: chatId))
         }
-    }
-
-    private func normalizedMediaFilename(_ filename: String?) -> String {
-        let trimmed = filename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? "shared-image.jpg" : trimmed
     }
 
     private func isExpectedNostrConnectCallback(_ url: URL) -> Bool {

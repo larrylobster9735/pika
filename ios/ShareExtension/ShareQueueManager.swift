@@ -18,23 +18,6 @@ struct ShareableChatSummary: Codable, Equatable, Hashable, Sendable, Identifiabl
     var id: String { chatId }
 }
 
-enum ShareQueueContentType: String, Codable, Sendable {
-    case text
-    case url
-    case image
-}
-
-struct ShareQueueItem: Codable, Equatable, Hashable, Sendable, Identifiable {
-    let id: String
-    let chatId: String
-    let contentType: ShareQueueContentType
-    let text: String
-    let mediaFilename: String?
-    let mediaMimeType: String?
-    let mediaPath: String?
-    let createdAt: Int64
-}
-
 enum ShareQueueManager {
     private static let chatListCacheFilename = "share_chat_list.json"
     private static let queueDirectoryName = "share_queue"
@@ -70,44 +53,38 @@ enum ShareQueueManager {
         return chats
     }
 
-    static func enqueue(_ item: ShareQueueItem) throws {
+    static func enqueue(_ request: ShareEnqueueRequest) throws -> ShareQueueReceipt {
         try ensureDirectories()
-        let data = try encoder.encode(item)
-        try data.write(to: queueItemURL(for: item.id), options: .atomic)
+        return try shareEnqueue(rootDir: appSupportDirectoryURL().path, request: request)
     }
 
-    static func dequeueAll() -> [ShareQueueItem] {
-        let directory = queueDirectoryURL()
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else {
+    static func dequeueBatch(limit: UInt32 = 64) -> [ShareDispatchJob] {
+        do {
+            try ensureDirectories()
+            return try shareDequeueBatch(
+                rootDir: appSupportDirectoryURL().path,
+                nowMsOverride: 0,
+                limit: max(limit, 1)
+            )
+        } catch {
+            NSLog("[ShareQueueManager] failed to dequeue share batch: \(error)")
             return []
         }
+    }
 
-        let items = files
-            .filter { $0.pathExtension.lowercased() == "json" }
-            .compactMap { url -> ShareQueueItem? in
-                guard let data = try? Data(contentsOf: url),
-                      let item = try? decoder.decode(ShareQueueItem.self, from: data) else {
-                    NSLog("[ShareQueueManager] failed to decode queued item: \(url.lastPathComponent)")
-                    return nil
-                }
-                return item
-            }
-
-        return items.sorted {
-            if $0.createdAt == $1.createdAt { return $0.id < $1.id }
-            return $0.createdAt < $1.createdAt
+    static func acknowledge(_ ack: ShareDispatchAck) {
+        do {
+            try shareAck(rootDir: appSupportDirectoryURL().path, ack: ack)
+        } catch {
+            NSLog("[ShareQueueManager] failed to acknowledge share item: \(error)")
         }
     }
 
-    static func deleteQueueItem(_ item: ShareQueueItem) {
-        let fm = FileManager.default
-        try? fm.removeItem(at: queueItemURL(for: item.id))
-        if let mediaPath = item.mediaPath {
-            try? fm.removeItem(at: appSupportDirectoryURL().appendingPathComponent(mediaPath))
+    static func runMaintenance() {
+        do {
+            _ = try shareGc(rootDir: appSupportDirectoryURL().path, nowMsOverride: 0)
+        } catch {
+            NSLog("[ShareQueueManager] failed to run queue maintenance: \(error)")
         }
     }
 
@@ -127,11 +104,6 @@ enum ShareQueueManager {
         return "\(queueDirectoryName)/\(queueMediaDirectoryName)/\(filename)"
     }
 
-    static func mediaURL(for item: ShareQueueItem) -> URL? {
-        guard let mediaPath = item.mediaPath else { return nil }
-        return appSupportDirectoryURL().appendingPathComponent(mediaPath)
-    }
-
     static func setLoggedIn(_ isLoggedIn: Bool) {
         sharedDefaults().set(isLoggedIn, forKey: loginFlagKey)
     }
@@ -149,10 +121,6 @@ enum ShareQueueManager {
 
     private static func chatListCacheURL() -> URL {
         appSupportDirectoryURL().appendingPathComponent(chatListCacheFilename)
-    }
-
-    private static func queueItemURL(for id: String) -> URL {
-        queueDirectoryURL().appendingPathComponent("\(id).json")
     }
 
     private static func queueDirectoryURL() -> URL {
