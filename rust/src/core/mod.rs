@@ -5193,6 +5193,7 @@ impl AppCore {
         self.pending_group_ops.insert(chat_id.to_string());
         let fallback_relays = self.default_relays();
         let Some(sess) = self.session.as_ref() else {
+            self.pending_group_ops.remove(chat_id);
             return;
         };
         let relays: Vec<RelayUrl> = sess
@@ -7003,6 +7004,66 @@ mod tests {
             });
 
             assert_eq!(core.state.toast.as_deref(), Some("Chat not found"));
+        }
+
+        #[test]
+        fn concurrent_group_mutation_rejected_while_pending() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            // Simulate an in-flight group operation.
+            core.pending_group_ops.insert("chat1".to_string());
+
+            let group_id = mdk_core::prelude::GroupId::from_slice(&[1]);
+            let keys = nostr_sdk::Keys::generate();
+            let dummy_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::Custom(444), "test")
+                .sign_with_keys(&keys)
+                .unwrap();
+
+            // A second publish_evolution_event on the same chat should be rejected.
+            core.publish_evolution_event("chat1", group_id, dummy_event, None, vec![]);
+
+            assert_eq!(
+                core.state.toast.as_deref(),
+                Some("A group update is already in progress, please wait")
+            );
+        }
+
+        #[test]
+        fn group_op_lock_released_after_evolution_published() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            core.pending_group_ops.insert("chat1".to_string());
+            assert!(core.pending_group_ops.contains("chat1"));
+
+            // Simulate the background publish completing.
+            core.handle_group_evolution_published(
+                "chat1".to_string(),
+                mdk_core::prelude::GroupId::from_slice(&[1]),
+                None,
+                vec![],
+                true,
+                None,
+            );
+
+            assert!(!core.pending_group_ops.contains("chat1"));
+        }
+
+        #[test]
+        fn group_op_lock_released_on_failure() {
+            let (mut core, _tmp) = make_logged_in_core();
+
+            core.pending_group_ops.insert("chat1".to_string());
+
+            core.handle_group_evolution_published(
+                "chat1".to_string(),
+                mdk_core::prelude::GroupId::from_slice(&[1]),
+                None,
+                vec![],
+                false,
+                Some("relay error".to_string()),
+            );
+
+            assert!(!core.pending_group_ops.contains("chat1"));
         }
     }
 }
