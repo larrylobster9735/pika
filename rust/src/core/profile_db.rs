@@ -23,6 +23,11 @@ const SCHEMA: &str = "
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS failed_sends (
+        message_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        reason TEXT NOT NULL
+    );
 ";
 
 pub fn open_profile_db(data_dir: &str) -> Result<Connection, rusqlite::Error> {
@@ -46,6 +51,7 @@ pub fn open_profile_db(data_dir: &str) -> Result<Connection, rusqlite::Error> {
     }
 
     let conn = Connection::open(&path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -277,7 +283,7 @@ pub fn save_follows(conn: &Connection, pubkeys: &[String]) {
     for pk in pubkeys {
         if let Err(e) = tx.execute("INSERT OR IGNORE INTO follows (pubkey) VALUES (?1)", [pk]) {
             tracing::warn!(%e, pubkey = pk, "failed to save follow to cache db");
-            return;
+            continue;
         }
     }
     if let Err(e) = tx.commit() {
@@ -297,6 +303,56 @@ pub fn add_follow(conn: &Connection, pubkey: &str) {
 pub fn remove_follow(conn: &Connection, pubkey: &str) {
     if let Err(e) = conn.execute("DELETE FROM follows WHERE pubkey = ?1", [pubkey]) {
         tracing::warn!(%e, pubkey, "failed to remove follow from cache db");
+    }
+}
+
+// -- Failed sends --
+
+pub fn load_failed_sends(conn: &Connection) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut stmt = match conn.prepare("SELECT message_id, reason FROM failed_sends") {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%e, "failed to load failed_sends");
+            return map;
+        }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%e, "failed to query failed_sends");
+            return map;
+        }
+    };
+    for row in rows.flatten() {
+        map.insert(row.0, row.1);
+    }
+    map
+}
+
+pub fn save_failed_send(conn: &Connection, message_id: &str, chat_id: &str, reason: &str) {
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO failed_sends (message_id, chat_id, reason) VALUES (?1, ?2, ?3)",
+        rusqlite::params![message_id, chat_id, reason],
+    ) {
+        tracing::warn!(%e, message_id, "failed to save failed_send");
+    }
+}
+
+pub fn remove_failed_send(conn: &Connection, message_id: &str) {
+    if let Err(e) = conn.execute(
+        "DELETE FROM failed_sends WHERE message_id = ?1",
+        [message_id],
+    ) {
+        tracing::warn!(%e, message_id, "failed to remove failed_send");
+    }
+}
+
+pub fn clear_failed_sends(conn: &Connection) {
+    if let Err(e) = conn.execute("DELETE FROM failed_sends", []) {
+        tracing::warn!(%e, "failed to clear failed_sends");
     }
 }
 
@@ -477,5 +533,27 @@ mod tests {
 
         save_developer_mode(&conn, false);
         assert!(!load_developer_mode(&conn));
+    }
+
+    #[test]
+    fn failed_sends_roundtrip() {
+        let conn = test_db();
+        assert!(load_failed_sends(&conn).is_empty());
+
+        save_failed_send(&conn, "msg1", "chat1", "network timeout");
+        save_failed_send(&conn, "msg2", "chat1", "relay rejected");
+
+        let loaded = load_failed_sends(&conn);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("msg1").unwrap(), "network timeout");
+        assert_eq!(loaded.get("msg2").unwrap(), "relay rejected");
+
+        remove_failed_send(&conn, "msg1");
+        let loaded = load_failed_sends(&conn);
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded.contains_key("msg1"));
+
+        clear_failed_sends(&conn);
+        assert!(load_failed_sends(&conn).is_empty());
     }
 }

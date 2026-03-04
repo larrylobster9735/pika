@@ -470,7 +470,15 @@ impl AppCore {
                     .get(chat_id)
                     .and_then(|map| map.get(&cm.id))
                     .cloned()
-                    .unwrap_or(MessageDeliveryState::Sent);
+                    .unwrap_or_else(|| {
+                        if let Some(reason) = self.failed_sends.get(&cm.id) {
+                            MessageDeliveryState::Failed {
+                                reason: reason.clone(),
+                            }
+                        } else {
+                            MessageDeliveryState::Sent
+                        }
+                    });
                 cm.media = self.chat_media_attachments_for_tags(
                     &sess.mdk,
                     &entry.mls_group_id,
@@ -675,7 +683,15 @@ impl AppCore {
                     .get(chat_id)
                     .and_then(|map| map.get(&cm.id))
                     .cloned()
-                    .unwrap_or(MessageDeliveryState::Sent);
+                    .unwrap_or_else(|| {
+                        if let Some(reason) = self.failed_sends.get(&cm.id) {
+                            MessageDeliveryState::Failed {
+                                reason: reason.clone(),
+                            }
+                        } else {
+                            MessageDeliveryState::Sent
+                        }
+                    });
                 cm.media = self.chat_media_attachments_for_tags(
                     &sess.mdk,
                     &entry.mls_group_id,
