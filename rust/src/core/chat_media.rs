@@ -22,12 +22,13 @@ const RESIZE_MAX_DIMENSION: u32 = 1600;
 /// Returns `None` for: non-image types, GIF/WebP (may be animated), images that
 /// already fit within the limit, or decode errors — the caller should pass the
 /// original data through to MDK unchanged.
-fn maybe_resize_image(data: &[u8], mime_type: &str) -> Option<(Vec<u8>, u32, u32)> {
+fn maybe_resize_image(data: &[u8], mime_type: &str) -> Option<(Vec<u8>, u32, u32, &'static str)> {
     let normalized = mime_type.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "image/jpeg" | "image/png" => {}
+    let is_png = match normalized.as_str() {
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => false,
+        "image/png" => true,
         _ => return None,
-    }
+    };
 
     let img = ::image::load_from_memory(data).ok()?;
     let (w, h) = img.dimensions();
@@ -43,10 +44,15 @@ fn maybe_resize_image(data: &[u8], mime_type: &str) -> Option<(Vec<u8>, u32, u32
     let (new_w, new_h) = resized.dimensions();
 
     let mut buf = Cursor::new(Vec::new());
-    let encoder = ::image::codecs::jpeg::JpegEncoder::new(&mut buf);
-    resized.write_with_encoder(encoder).ok()?;
-
-    Some((buf.into_inner(), new_w, new_h))
+    if is_png {
+        let encoder = ::image::codecs::png::PngEncoder::new(&mut buf);
+        resized.write_with_encoder(encoder).ok()?;
+        Some((buf.into_inner(), new_w, new_h, "image/png"))
+    } else {
+        let encoder = ::image::codecs::jpeg::JpegEncoder::new(&mut buf);
+        resized.write_with_encoder(encoder).ok()?;
+        Some((buf.into_inner(), new_w, new_h, "image/jpeg"))
+    }
 }
 
 /// Send an event to multiple relays concurrently, returning success as soon as
@@ -371,8 +377,8 @@ impl AppCore {
         // Try to resize large JPEG/PNG images (bakes in EXIF orientation).
         let (media_data, media_mime, was_resized, resize_dims) =
             match maybe_resize_image(&decoded, &mime_type) {
-                Some((resized_bytes, w, h)) => {
-                    (resized_bytes, "image/jpeg".to_string(), true, Some((w, h)))
+                Some((resized_bytes, w, h, out_mime)) => {
+                    (resized_bytes, out_mime.to_string(), true, Some((w, h)))
                 }
                 None => (decoded, mime_type.clone(), false, None),
             };
@@ -399,9 +405,13 @@ impl AppCore {
 
         // Write the (potentially resized) data to local cache.
         let local_filename = if was_resized {
-            // Use .jpg extension since we re-encoded as JPEG.
             let stem = filename.rsplitn(2, '.').last().unwrap_or(&filename);
-            format!("{stem}.jpg")
+            let ext = if media_mime == "image/png" {
+                "png"
+            } else {
+                "jpg"
+            };
+            format!("{stem}.{ext}")
         } else {
             filename.clone()
         };
@@ -1519,23 +1529,23 @@ mod tests {
     #[test]
     fn resize_large_jpeg() {
         let data = make_jpeg(3200, 2400);
-        let (resized, w, h) =
+        let (resized, w, h, mime) =
             maybe_resize_image(&data, "image/jpeg").expect("should resize 3200x2400");
         assert_eq!(w, 1600);
         assert_eq!(h, 1200);
-        // Verify the output is valid JPEG.
+        assert_eq!(mime, "image/jpeg");
         let img = ::image::load_from_memory(&resized).expect("should be valid image");
         assert_eq!(img.dimensions(), (1600, 1200));
     }
 
     #[test]
-    fn resize_large_png_to_jpeg() {
+    fn resize_large_png_preserves_format() {
         let data = make_png(2000, 1000);
-        let (resized, w, h) =
+        let (resized, w, h, mime) =
             maybe_resize_image(&data, "image/png").expect("should resize 2000x1000 PNG");
         assert_eq!(w, 1600);
         assert_eq!(h, 800);
-        // Output should be valid JPEG.
+        assert_eq!(mime, "image/png");
         let img = ::image::load_from_memory(&resized).expect("should be valid image");
         assert_eq!(img.dimensions(), (1600, 800));
     }
@@ -1552,9 +1562,18 @@ mod tests {
     #[test]
     fn resize_portrait_image() {
         let data = make_jpeg(2400, 3200);
-        let (_, w, h) =
+        let (_, w, h, _) =
             maybe_resize_image(&data, "image/jpeg").expect("should resize 2400x3200 portrait");
         assert_eq!(w, 1200);
         assert_eq!(h, 1600);
+    }
+
+    #[test]
+    fn resize_handles_jpeg_alias() {
+        let data = make_jpeg(3200, 2400);
+        let result = maybe_resize_image(&data, "image/jpg");
+        assert!(result.is_some(), "image/jpg should be accepted");
+        let (_, _, _, mime) = result.unwrap();
+        assert_eq!(mime, "image/jpeg");
     }
 }
