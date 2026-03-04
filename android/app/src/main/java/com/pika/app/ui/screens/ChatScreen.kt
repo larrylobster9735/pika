@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -148,6 +149,7 @@ import com.pika.app.rust.VoiceRecordingPhase
 import com.pika.app.ui.Avatar
 import com.pika.app.ui.TestTags
 import dev.jeziellago.compose.markdowntext.MarkdownText
+import androidx.compose.ui.graphics.asImageBitmap
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -174,6 +176,12 @@ private data class MediaUploadPayload(
     val bytes: ByteArray,
     val mimeType: String,
     val filename: String,
+)
+
+private data class StagedMedia(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val payload: MediaUploadPayload,
+    val thumbnailBitmap: android.graphics.Bitmap? = null,
 )
 
 private fun readMediaUploadPayload(ctx: Context, uri: Uri): MediaUploadPayload? {
@@ -212,6 +220,7 @@ fun ChatScreen(
     var draft by remember { mutableStateOf("") }
     var replyDraft by remember(chat.chatId) { mutableStateOf<ChatMessage?>(null) }
     var showAttachmentSheet by remember(chat.chatId) { mutableStateOf(false) }
+    var stagedMedia by remember(chat.chatId) { mutableStateOf<List<StagedMedia>>(emptyList()) }
     var fullscreenImageAttachment by remember(chat.chatId) { mutableStateOf<ChatMediaAttachment?>(null) }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
@@ -281,6 +290,10 @@ fun ChatScreen(
     }
 
     fun sendDraftMessage() {
+        if (stagedMedia.isNotEmpty()) {
+            sendStagedMedia()
+            return
+        }
         val text = draft.trim()
         if (text.isBlank()) return
         draft = ""
@@ -316,9 +329,72 @@ fun ChatScreen(
         }
     }
 
+    fun stageMediaFromUris(uris: List<Uri>) {
+        coroutineScope.launch {
+            val items = withContext(Dispatchers.IO) {
+                uris.take(32).mapNotNull { uri ->
+                    val payload = readMediaUploadPayload(ctx, uri) ?: return@mapNotNull null
+                    val thumbnail = if (payload.mimeType.startsWith("image/")) {
+                        try {
+                            android.graphics.BitmapFactory.decodeByteArray(payload.bytes, 0, payload.bytes.size)?.let { bmp ->
+                                android.graphics.Bitmap.createScaledBitmap(bmp, 128, 128, true)
+                            }
+                        } catch (_: Exception) { null }
+                    } else null
+                    StagedMedia(payload = payload, thumbnailBitmap = thumbnail)
+                }
+            }
+            stagedMedia = stagedMedia + items
+        }
+    }
+
+    fun sendStagedMedia() {
+        if (stagedMedia.isEmpty()) return
+        coroutineScope.launch {
+            val caption = draft.trim()
+            if (stagedMedia.size == 1) {
+                val p = stagedMedia.first().payload
+                val base64 = Base64.encodeToString(p.bytes, Base64.NO_WRAP)
+                manager.dispatch(
+                    AppAction.SendChatMedia(
+                        chatId = chat.chatId,
+                        dataBase64 = base64,
+                        mimeType = p.mimeType,
+                        filename = p.filename,
+                        caption = caption,
+                    ),
+                )
+            } else {
+                val batchItems = stagedMedia.map { staged ->
+                    com.pika.app.rust.MediaBatchItem(
+                        dataBase64 = Base64.encodeToString(staged.payload.bytes, Base64.NO_WRAP),
+                        mimeType = staged.payload.mimeType,
+                        filename = staged.payload.filename,
+                    )
+                }
+                manager.dispatch(
+                    AppAction.SendChatMediaBatch(
+                        chatId = chat.chatId,
+                        items = batchItems,
+                        caption = caption,
+                    ),
+                )
+            }
+            stagedMedia = emptyList()
+            if (caption.isNotEmpty()) {
+                draft = ""
+            }
+            replyDraft = null
+        }
+    }
+
     val pickPhotoOrVideoLauncher =
-        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            sendMediaFromUri(uri)
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.size == 1) {
+                sendMediaFromUri(uris.first())
+            } else if (uris.isNotEmpty()) {
+                stageMediaFromUris(uris)
+            }
         }
 
     val pickFileLauncher =
@@ -798,6 +874,62 @@ fun ChatScreen(
                         )
                     }
 
+                    // Staging area for selected media
+                    if (stagedMedia.isNotEmpty()) {
+                        Surface(
+                            shape = MaterialTheme.shapes.large,
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            tonalElevation = 1.dp,
+                        ) {
+                            LazyRow(
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(stagedMedia, key = { it.id }) { item ->
+                                    Box(modifier = Modifier.size(64.dp)) {
+                                        if (item.thumbnailBitmap != null) {
+                                            androidx.compose.foundation.Image(
+                                                bitmap = item.thumbnailBitmap.asImageBitmap(),
+                                                contentDescription = item.payload.filename,
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .clip(RoundedCornerShape(8.dp)),
+                                                contentScale = ContentScale.Crop,
+                                            )
+                                        } else {
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.InsertDriveFile,
+                                                    contentDescription = item.payload.filename,
+                                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                        }
+                                        IconButton(
+                                            onClick = { stagedMedia = stagedMedia.filter { it.id != item.id } },
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .size(20.dp),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Remove",
+                                                modifier = Modifier.size(16.dp),
+                                                tint = Color.White,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Surface(
                         shape = MaterialTheme.shapes.large,
                         color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -870,10 +1002,10 @@ fun ChatScreen(
                                 },
                             )
                             Spacer(Modifier.width(8.dp))
-                            if (draft.trim().isNotBlank()) {
+                            if (draft.trim().isNotBlank() || stagedMedia.isNotEmpty()) {
                                 FilledIconButton(
                                     onClick = { sendDraftMessage() },
-                                    enabled = draft.isNotBlank(),
+                                    enabled = draft.isNotBlank() || stagedMedia.isNotEmpty(),
                                     modifier = Modifier.size(40.dp).testTag(TestTags.CHAT_SEND),
                                 ) {
                                     Icon(
@@ -1205,6 +1337,86 @@ private fun ReactionChipsRow(
 }
 
 @Composable
+private fun MediaGrid(
+    attachments: List<ChatMediaAttachment>,
+    messageId: String,
+    isMine: Boolean,
+    onDownloadMedia: (String, String) -> Unit,
+    onOpenImage: (ChatMediaAttachment) -> Unit,
+) {
+    if (attachments.size == 1) {
+        MediaAttachmentContent(
+            attachment = attachments[0],
+            isMine = isMine,
+            onDownload = { onDownloadMedia(messageId, attachments[0].originalHashHex) },
+            onOpenImage = { onOpenImage(attachments[0]) },
+        )
+    } else {
+        val visualMedia = attachments.filter {
+            it.kind == ChatMediaKind.IMAGE || it.kind == ChatMediaKind.VIDEO
+        }
+        val fileMedia = attachments.filter {
+            it.kind != ChatMediaKind.IMAGE && it.kind != ChatMediaKind.VIDEO
+        }
+
+        if (visualMedia.isNotEmpty()) {
+            val maxVisible = 4
+            val rows = visualMedia.take(maxVisible).chunked(2)
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                for ((rowIndex, row) in rows.withIndex()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        for ((colIndex, attachment) in row.withIndex()) {
+                            val isLastCell = rowIndex == rows.lastIndex && colIndex == row.lastIndex
+                            val remaining = visualMedia.size - maxVisible
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(max = 200.dp),
+                            ) {
+                                MediaAttachmentContent(
+                                    attachment = attachment,
+                                    isMine = isMine,
+                                    onDownload = { onDownloadMedia(messageId, attachment.originalHashHex) },
+                                    onOpenImage = { onOpenImage(attachment) },
+                                )
+                                if (isLastCell && remaining > 0) {
+                                    Box(
+                                        modifier = Modifier
+                                            .matchParentSize()
+                                            .background(Color.Black.copy(alpha = 0.5f))
+                                            .clip(RoundedCornerShape(8.dp)),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = "+$remaining",
+                                            color = Color.White,
+                                            style = MaterialTheme.typography.headlineSmall,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (attachment in fileMedia) {
+            MediaAttachmentContent(
+                attachment = attachment,
+                isMine = isMine,
+                onDownload = { onDownloadMedia(messageId, attachment.originalHashHex) },
+                onOpenImage = { onOpenImage(attachment) },
+            )
+            Spacer(Modifier.height(3.dp))
+        }
+    }
+}
+
+@Composable
 private fun MediaAttachmentContent(
     attachment: ChatMediaAttachment,
     isMine: Boolean,
@@ -1527,15 +1739,13 @@ private fun MessageBubble(
             )
         } else {
             if (message.media.isNotEmpty()) {
-                for (attachment in message.media) {
-                    MediaAttachmentContent(
-                        attachment = attachment,
-                        isMine = isMine,
-                        onDownload = { onDownloadMedia(message.id, attachment.originalHashHex) },
-                        onOpenImage = { onOpenImage(attachment) },
-                    )
-                    Spacer(Modifier.height(3.dp))
-                }
+                MediaGrid(
+                    attachments = message.media,
+                    messageId = message.id,
+                    isMine = isMine,
+                    onDownloadMedia = onDownloadMedia,
+                    onOpenImage = onOpenImage,
+                )
             }
 
             for (segment in segments) {

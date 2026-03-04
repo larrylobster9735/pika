@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 
 struct ChatInputBar: View {
     @Binding var messageText: String
-    @Binding var selectedPhotoItem: PhotosPickerItem?
+    @Binding var selectedPhotoItems: [PhotosPickerItem]
+    @Binding var stagedMedia: [StagedMediaItem]
     @Binding var showFileImporter: Bool
     @Binding var showPollComposer: Bool
     let showAttachButton: Bool
@@ -16,90 +17,150 @@ struct ChatInputBar: View {
     @State private var showPhotoPicker = false
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if showAttachButton {
-                Menu {
-                    // TODO: Contact
-                    // TODO: Stickers
-
-                    Button {
-                        showPhotoPicker = true
-                    } label: {
-                        Label("Photos & Videos", systemImage: "photo.on.rectangle")
-                    }
-
-                    Button {
-                        showFileImporter = true
-                    } label: {
-                        Label("File", systemImage: "doc")
-                    }
-
-                    Button {
-                        showPollComposer = true
-                    } label: {
-                        Label("Poll", systemImage: "chart.bar")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 52, height: 52)
-                }
-                .tint(.secondary)
-                .modifier(GlassCircleModifier())
-                .photosPicker(
-                    isPresented: $showPhotoPicker,
-                    selection: $selectedPhotoItem,
-                    matching: .any(of: [.images, .videos])
-                )
-            }
-
-            HStack(spacing: 10) {
-                TextEditor(text: $messageText)
-                    .focused($isInputFocused)
-                    .frame(minHeight: 36, maxHeight: 150)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .scrollContentBackground(.hidden)
-                    .onAppear {
-                        if ProcessInfo.processInfo.isiOSAppOnMac {
-                            isInputFocused = true
+        VStack(spacing: 0) {
+            // Staging area for selected media
+            if !stagedMedia.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(stagedMedia) { item in
+                            StagedMediaThumbnail(item: item) {
+                                withAnimation {
+                                    stagedMedia.removeAll { $0.id == item.id }
+                                }
+                            }
                         }
                     }
-                    .modifier(ReturnKeyPressModifier(onSend: onSend))
-                    .overlay(alignment: .topLeading) {
-                        if messageText.isEmpty {
-                            Text("Message")
-                                .foregroundStyle(.tertiary)
-                                .padding(.leading, 5)
-                                .padding(.top, 8)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .accessibilityIdentifier(TestIds.chatMessageInput)
-
-                let isEmpty = messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                if isEmpty, showMicButton {
-                    Button {
-                        onStartVoiceRecording()
-                    } label: {
-                        Image(systemName: "mic.fill")
-                            .font(.title2)
-                    }
-                    .transition(.scale.combined(with: .opacity))
-                } else {
-                    Button(action: { onSend() }) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                    }
-                    .disabled(isEmpty)
-                    .accessibilityIdentifier(TestIds.chatSend)
-                    .transition(.scale.combined(with: .opacity))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .modifier(GlassInputModifier())
+
+            HStack(alignment: .bottom, spacing: 8) {
+                if showAttachButton {
+                    Menu {
+                        Button {
+                            showPhotoPicker = true
+                        } label: {
+                            Label("Photos & Videos", systemImage: "photo.on.rectangle")
+                        }
+
+                        Button {
+                            showFileImporter = true
+                        } label: {
+                            Label("File", systemImage: "doc")
+                        }
+
+                        Button {
+                            showPollComposer = true
+                        } label: {
+                            Label("Poll", systemImage: "chart.bar")
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 52, height: 52)
+                    }
+                    .tint(.secondary)
+                    .modifier(GlassCircleModifier())
+                    .photosPicker(
+                        isPresented: $showPhotoPicker,
+                        selection: $selectedPhotoItems,
+                        maxSelectionCount: 32,
+                        matching: .any(of: [.images, .videos])
+                    )
+                }
+
+                HStack(spacing: 10) {
+                    TextEditor(text: $messageText)
+                        .focused($isInputFocused)
+                        .frame(minHeight: 36, maxHeight: 150)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .scrollContentBackground(.hidden)
+                        .onAppear {
+                            if ProcessInfo.processInfo.isiOSAppOnMac {
+                                isInputFocused = true
+                            }
+                        }
+                        .modifier(ReturnKeyPressModifier(onSend: onSend))
+                        .overlay(alignment: .topLeading) {
+                            if messageText.isEmpty {
+                                Text("Message")
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.leading, 5)
+                                    .padding(.top, 8)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .accessibilityIdentifier(TestIds.chatMessageInput)
+
+                    let isEmpty = messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && stagedMedia.isEmpty
+                    if isEmpty, showMicButton {
+                        Button {
+                            onStartVoiceRecording()
+                        } label: {
+                            Image(systemName: "mic.fill")
+                                .font(.title2)
+                        }
+                        .transition(.scale.combined(with: .opacity))
+                    } else {
+                        Button(action: { onSend() }) {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.title2)
+                        }
+                        .disabled(isEmpty)
+                        .accessibilityIdentifier(TestIds.chatSend)
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && stagedMedia.isEmpty)
+                .modifier(GlassInputModifier())
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 12)
+    }
+}
+
+// MARK: - Staged Media Types
+
+struct StagedMediaItem: Identifiable {
+    let id: String
+    let data: Data
+    let filename: String
+    let mimeType: String
+    let thumbnail: UIImage?
+}
+
+private struct StagedMediaThumbnail: View {
+    let item: StagedMediaItem
+    let onRemove: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if let thumb = item.thumbnail {
+                Image(uiImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.gray.opacity(0.3))
+                    .frame(width: 64, height: 64)
+                    .overlay {
+                        Image(systemName: "doc")
+                            .foregroundStyle(.secondary)
+                    }
+            }
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.white, .black.opacity(0.6))
+            }
+            .offset(x: 4, y: -4)
+        }
     }
 }
 
@@ -150,7 +211,8 @@ struct GlassCircleModifier: ViewModifier {
 #if DEBUG
 private struct ChatInputBarPreview: View {
     @State var messageText = ""
-    @State var selectedPhotoItem: PhotosPickerItem?
+    @State var selectedPhotoItems: [PhotosPickerItem] = []
+    @State var stagedMedia: [StagedMediaItem] = []
     @State var showFileImporter = false
     @State var showPollComposer = false
     @FocusState var isInputFocused: Bool
@@ -161,7 +223,8 @@ private struct ChatInputBarPreview: View {
     var body: some View {
         ChatInputBar(
             messageText: $messageText,
-            selectedPhotoItem: $selectedPhotoItem,
+            selectedPhotoItems: $selectedPhotoItems,
+            stagedMedia: $stagedMedia,
             showFileImporter: $showFileImporter,
             showPollComposer: $showPollComposer,
             showAttachButton: showAttach,

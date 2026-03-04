@@ -522,31 +522,35 @@ private struct MessageBubble: View {
 
     @ViewBuilder
     private func mediaBubble(segments: [MessageSegment]) -> some View {
+        let visualMedia = message.media.filter { $0.kind == .image || $0.kind == .video }
+        let fileMedia = message.media.filter { $0.kind != .image && $0.kind != .video }
+
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(message.media, id: \.originalHashHex) { attachment in
-                let isVisualAttachment = attachment.kind == .image || attachment.kind == .video
+            // Visual media grid (images + videos)
+            if !visualMedia.isEmpty {
+                mediaGrid(attachments: visualMedia)
+                    .overlay(alignment: .bottomTrailing) {
+                        if !hasText, fileMedia.isEmpty {
+                            Text(timestampText)
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.78))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.black.opacity(0.4), in: Capsule())
+                                .padding(6)
+                        }
+                    }
+            }
+
+            // File attachments (non-visual) in a vertical stack
+            ForEach(fileMedia, id: \.originalHashHex) { attachment in
                 MediaAttachmentView(
                     attachment: attachment,
                     isMine: message.isMine,
                     onDownload: {
                         onDownloadMedia?(message.id, attachment.originalHashHex)
-                    },
-                    onTapImage: {
-                        onTapImage?(attachment)
                     }
                 )
-                .overlay(alignment: .bottomTrailing) {
-                    // Floating timestamp only for images/videos without a text caption
-                    if !hasText, isVisualAttachment {
-                        Text(timestampText)
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.78))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.black.opacity(0.4), in: Capsule())
-                            .padding(6)
-                    }
-                }
             }
 
             // Inline timestamp for file attachments (non-image) without caption text
@@ -579,6 +583,76 @@ private struct MessageBubble: View {
         }
         .background(hasText || hasFileAttachment ? (message.isMine ? Color.blue : Color.gray.opacity(0.2)) : Color.clear)
         .clipShape(UnevenRoundedRectangleCompat(cornerRadii: bubbleRadii, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func mediaGrid(attachments: [ChatMediaAttachment]) -> some View {
+        let spacing: CGFloat = 2
+        let maxVisibleCount = 4
+
+        switch attachments.count {
+        case 1:
+            // Single item: full width
+            mediaGridCell(attachment: attachments[0])
+
+        case 2:
+            // Two items side by side
+            HStack(spacing: spacing) {
+                mediaGridCell(attachment: attachments[0])
+                mediaGridCell(attachment: attachments[1])
+            }
+
+        case 3:
+            // Top row: 2 items, bottom row: 1 item full width
+            VStack(spacing: spacing) {
+                HStack(spacing: spacing) {
+                    mediaGridCell(attachment: attachments[0])
+                    mediaGridCell(attachment: attachments[1])
+                }
+                mediaGridCell(attachment: attachments[2])
+            }
+
+        default:
+            // 4+ items: 2×2 grid, last cell shows "+N" overlay if >4
+            VStack(spacing: spacing) {
+                HStack(spacing: spacing) {
+                    mediaGridCell(attachment: attachments[0])
+                    mediaGridCell(attachment: attachments[1])
+                }
+                HStack(spacing: spacing) {
+                    mediaGridCell(attachment: attachments[2])
+                    let remaining = attachments.count - maxVisibleCount
+                    if remaining > 0 {
+                        mediaGridCell(attachment: attachments[3])
+                            .overlay {
+                                Color.black.opacity(0.5)
+                                Text("+\(remaining)")
+                                    .font(.title2.bold())
+                                    .foregroundStyle(.white)
+                            }
+                    } else {
+                        mediaGridCell(attachment: attachments[3])
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func mediaGridCell(attachment: ChatMediaAttachment) -> some View {
+        MediaAttachmentView(
+            attachment: attachment,
+            isMine: message.isMine,
+            maxMediaWidth: .infinity,
+            maxMediaHeight: 200,
+            onDownload: {
+                onDownloadMedia?(message.id, attachment.originalHashHex)
+            },
+            onTapImage: {
+                onTapImage?(attachment)
+            }
+        )
+        .clipped()
     }
 
     private func markdownBubble(text: String) -> some View {

@@ -286,6 +286,20 @@ private func screenView(
                     caption: caption
                 ))
             },
+            onSendMediaBatch: { chatId, items, caption in
+                let batchItems = items.map { item in
+                    MediaBatchItem(
+                        dataBase64: item.data.base64EncodedString(),
+                        mimeType: item.mimeType,
+                        filename: item.filename
+                    )
+                }
+                manager.dispatch(.sendChatMediaBatch(
+                    chatId: chatId,
+                    items: batchItems,
+                    caption: caption
+                ))
+            },
             onHypernoteAction: { chatId, actionName, messageId, form in
                 manager.dispatch(.hypernoteAction(
                     chatId: chatId,
