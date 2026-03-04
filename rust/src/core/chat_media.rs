@@ -478,6 +478,15 @@ impl AppCore {
 
         let (request_id, encrypted_data, expected_hash_hex, upload_mime, blossom_servers) = {
             let Some(sess) = self.session.as_mut() else {
+                if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
+                    outbox.remove(&temp_rumor_id);
+                }
+                if let Some(overrides) = self.delivery_overrides.get_mut(&chat_id) {
+                    overrides.remove(&temp_rumor_id);
+                }
+                let _ = std::fs::remove_file(&local_path);
+                self.refresh_current_chat_if_open(&chat_id);
+                self.refresh_chat_list_from_storage();
                 return;
             };
 
@@ -703,13 +712,8 @@ impl AppCore {
             return;
         }
 
-        // Remove the temporary outbox entry and delivery override.
-        if let Some(outbox) = self.local_outbox.get_mut(&pending.chat_id) {
-            outbox.remove(&pending.temp_rumor_id);
-        }
-        if let Some(overrides) = self.delivery_overrides.get_mut(&pending.chat_id) {
-            overrides.remove(&pending.temp_rumor_id);
-        }
+        // Remove the temporary outbox entry and delivery override + refresh UI.
+        cleanup_optimistic(self);
 
         let Some(sess) = self.session.as_mut() else {
             return;
