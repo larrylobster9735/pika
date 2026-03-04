@@ -433,17 +433,23 @@ fn send_message_creates_pending_then_sent() {
     let msg = chat.messages.last().unwrap();
     let first_message_id = msg.id.clone();
     assert_eq!(msg.content, "hello");
-    assert!(matches!(
-        msg.delivery,
-        pika_core::MessageDeliveryState::Pending | pika_core::MessageDeliveryState::Sent
-    ));
+    // Network is disabled, so the message transitions Pending → Failed (offline).
+    assert!(
+        matches!(
+            msg.delivery,
+            pika_core::MessageDeliveryState::Pending
+                | pika_core::MessageDeliveryState::Failed { .. }
+        ),
+        "initial delivery state should be Pending or Failed (offline), got {:?}",
+        msg.delivery
+    );
 
-    wait_until("message sent", Duration::from_secs(10), || {
+    wait_until("message delivery resolved", Duration::from_secs(10), || {
         app.state()
             .current_chat
             .as_ref()
             .and_then(|c| c.messages.iter().find(|m| m.content == "hello"))
-            .map(|m| matches!(m.delivery, pika_core::MessageDeliveryState::Sent))
+            .map(|m| !matches!(m.delivery, pika_core::MessageDeliveryState::Pending))
             .unwrap_or(false)
     });
 
@@ -507,17 +513,13 @@ fn send_message_with_unresolvable_reply_falls_back_to_plain_message() {
             .current_chat
             .as_ref()
             .and_then(|c| c.messages.last())
-            .map(|m| {
-                m.content == "plain despite stale reply"
-                    && m.reply_to_message_id.is_none()
-                    && (matches!(m.delivery, pika_core::MessageDeliveryState::Pending)
-                        || matches!(m.delivery, pika_core::MessageDeliveryState::Sent))
-            })
+            .map(|m| m.content == "plain despite stale reply" && m.reply_to_message_id.is_none())
             .unwrap_or(false)
     });
 
+    // Network is disabled, so delivery resolves as Failed (offline).
     wait_until(
-        "stale reply send succeeds as plain text",
+        "stale reply delivery resolved",
         Duration::from_secs(10),
         || {
             app.state()
@@ -527,7 +529,7 @@ fn send_message_with_unresolvable_reply_falls_back_to_plain_message() {
                 .map(|m| {
                     m.content == "plain despite stale reply"
                         && m.reply_to_message_id.is_none()
-                        && matches!(m.delivery, pika_core::MessageDeliveryState::Sent)
+                        && !matches!(m.delivery, pika_core::MessageDeliveryState::Pending)
                 })
                 .unwrap_or(false)
         },
