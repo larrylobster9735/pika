@@ -6,6 +6,10 @@ struct ChatMediaGalleryView: View {
 
     @State private var fullscreenAttachment: ChatMediaAttachment?
 
+    private var viewableAttachments: [ChatMediaAttachment] {
+        items.compactMap { $0.attachment.localPath != nil ? $0.attachment : nil }
+    }
+
     private let columns = [
         GridItem(.flexible(), spacing: 2),
         GridItem(.flexible(), spacing: 2),
@@ -42,7 +46,10 @@ struct ChatMediaGalleryView: View {
         .navigationTitle("Media")
         .navigationBarTitleDisplayMode(.inline)
         .fullScreenCover(item: $fullscreenAttachment) { attachment in
-            FullscreenImageViewer(attachment: attachment)
+            FullscreenImageViewer(
+                attachments: viewableAttachments,
+                selected: attachment
+            )
         }
     }
 
