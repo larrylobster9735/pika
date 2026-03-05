@@ -1805,19 +1805,18 @@ impl AppCore {
             return;
         };
 
-        let records = chat_media_db::get_all_chat_media(conn, &account_pubkey, chat_id);
+        let records = chat_media_db::get_gallery_media(conn, &account_pubkey, chat_id);
 
         let items: Vec<MediaGalleryItem> = records
             .iter()
-            .filter_map(|record| {
-                let att = attachment_from_record(&self.data_dir, chat_id, &account_pubkey, record);
-                if !matches!(att.kind, ChatMediaKind::Image | ChatMediaKind::Video) {
-                    return None;
-                }
-                Some(MediaGalleryItem {
-                    attachment: att,
-                    timestamp: record.created_at,
-                })
+            .map(|record| MediaGalleryItem {
+                attachment: attachment_from_record(
+                    &self.data_dir,
+                    chat_id,
+                    &account_pubkey,
+                    record,
+                ),
+                timestamp: record.created_at,
             })
             .collect();
 

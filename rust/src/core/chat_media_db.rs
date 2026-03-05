@@ -185,6 +185,52 @@ pub(super) fn get_all_chat_media(
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Like `get_all_chat_media` but only returns image/* and video/* records.
+/// The LIMIT is applied *after* filtering so the gallery always gets up to 500
+/// actual gallery items.
+pub(super) fn get_gallery_media(
+    conn: &Connection,
+    account_pubkey: &str,
+    chat_id: &str,
+) -> Vec<ChatMediaRecord> {
+    let mut stmt = match conn.prepare(
+        r#"
+        SELECT
+            account_pubkey,
+            chat_id,
+            original_hash_hex,
+            encrypted_hash_hex,
+            url,
+            mime_type,
+            filename,
+            nonce_hex,
+            scheme_version,
+            created_at
+        FROM chat_media
+        WHERE account_pubkey = ?1 AND chat_id = ?2
+          AND (mime_type LIKE 'image/%' OR mime_type LIKE 'video/%')
+        ORDER BY created_at DESC
+        LIMIT 500
+        "#,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%e, "failed to prepare get_gallery_media query");
+            return vec![];
+        }
+    };
+
+    let rows = match stmt.query_map(params![account_pubkey, chat_id], record_from_row) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%e, "failed to query get_gallery_media");
+            return vec![];
+        }
+    };
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
