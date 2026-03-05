@@ -1116,21 +1116,7 @@ impl AppCore {
                 .entry(chat_id.clone())
                 .or_default()
                 .insert(temp_rumor_id.clone(), delivery.clone());
-
-            // Try in-place update: clear progress spinner and set failed delivery.
-            if !self.mutate_current_chat_messages(&chat_id, |msgs| {
-                if let Some(msg) = msgs.iter_mut().find(|m| m.id == temp_rumor_id) {
-                    msg.delivery = delivery;
-                    for att in &mut msg.media {
-                        att.upload_progress = None;
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                self.refresh_current_chat_if_open(&chat_id);
-            }
+            self.fail_delivery_or_refresh(&chat_id, &temp_rumor_id, delivery);
             self.refresh_chat_list_from_storage();
             return;
         }
@@ -1256,20 +1242,7 @@ impl AppCore {
                 .entry(chat_id.clone())
                 .or_default()
                 .insert(temp_rumor_id.clone(), delivery.clone());
-
-            if !self.mutate_current_chat_messages(&chat_id, |msgs| {
-                if let Some(msg) = msgs.iter_mut().find(|m| m.id == temp_rumor_id) {
-                    msg.delivery = delivery;
-                    for att in &mut msg.media {
-                        att.upload_progress = None;
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                self.refresh_current_chat_if_open(&chat_id);
-            }
+            self.fail_delivery_or_refresh(&chat_id, &temp_rumor_id, delivery);
             self.refresh_chat_list_from_storage();
             return;
         }
@@ -1312,19 +1285,7 @@ impl AppCore {
                 .entry(chat_id.clone())
                 .or_default()
                 .insert(temp_rumor_id.clone(), delivery.clone());
-            if !self.mutate_current_chat_messages(&chat_id, |msgs| {
-                if let Some(msg) = msgs.iter_mut().find(|m| m.id == temp_rumor_id) {
-                    msg.delivery = delivery;
-                    for att in &mut msg.media {
-                        att.upload_progress = None;
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                self.refresh_current_chat_if_open(&chat_id);
-            }
+            self.fail_delivery_or_refresh(&chat_id, &temp_rumor_id, delivery);
             self.refresh_chat_list_from_storage();
             return;
         }

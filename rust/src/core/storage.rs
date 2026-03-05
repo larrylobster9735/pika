@@ -727,6 +727,51 @@ impl AppCore {
         }
     }
 
+    /// In-place update: set delivery state on a message. Falls back to full refresh if
+    /// the message isn't found in the current chat state.
+    pub(super) fn update_delivery_or_refresh(
+        &mut self,
+        chat_id: &str,
+        message_id: &str,
+        delivery: MessageDeliveryState,
+    ) {
+        let mid = message_id.to_string();
+        if !self.mutate_current_chat_messages(chat_id, |msgs| {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == mid) {
+                msg.delivery = delivery;
+                true
+            } else {
+                false
+            }
+        }) {
+            self.refresh_current_chat_if_open(chat_id);
+        }
+    }
+
+    /// In-place update: set delivery state on a message and update upload_progress on all
+    /// its media attachments. Falls back to full refresh if the message isn't found.
+    pub(super) fn fail_delivery_or_refresh(
+        &mut self,
+        chat_id: &str,
+        message_id: &str,
+        delivery: MessageDeliveryState,
+    ) {
+        let mid = message_id.to_string();
+        if !self.mutate_current_chat_messages(chat_id, |msgs| {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == mid) {
+                msg.delivery = delivery;
+                for att in &mut msg.media {
+                    att.upload_progress = None;
+                }
+                true
+            } else {
+                false
+            }
+        }) {
+            self.refresh_current_chat_if_open(chat_id);
+        }
+    }
+
     /// Check if a download is already in-flight for this chat + hash.
     fn is_media_download_pending(&self, chat_id: &str, original_hash_hex: &str) -> bool {
         self.pending_media_downloads.values().any(|p| {

@@ -3421,36 +3421,24 @@ impl AppCore {
             %rumor_id,
             "message_publish_result"
         );
-        let delivery;
-        let per_chat = self.delivery_overrides.entry(chat_id.clone()).or_default();
-        if ok {
-            delivery = MessageDeliveryState::Sent;
-            per_chat.insert(rumor_id.clone(), delivery.clone());
+        let delivery = if ok {
             self.pending_sends
                 .remove(&chat_id, &rumor_id, self.profile_db.as_ref());
             self.failed_sends
                 .remove(&rumor_id, self.profile_db.as_ref());
+            MessageDeliveryState::Sent
         } else {
             let reason = error.unwrap_or_else(|| "publish failed".into());
-            delivery = MessageDeliveryState::Failed {
-                reason: reason.clone(),
-            };
-            per_chat.insert(rumor_id.clone(), delivery.clone());
             self.failed_sends
                 .insert(&rumor_id, &chat_id, &reason, self.profile_db.as_ref());
-        }
+            MessageDeliveryState::Failed { reason }
+        };
+        self.delivery_overrides
+            .entry(chat_id.clone())
+            .or_default()
+            .insert(rumor_id.clone(), delivery.clone());
         self.refresh_chat_list_from_storage();
-        // Try lightweight in-place delivery update; fall back to full refresh.
-        if !self.mutate_current_chat_messages(&chat_id, |msgs| {
-            if let Some(msg) = msgs.iter_mut().find(|m| m.id == rumor_id) {
-                msg.delivery = delivery;
-                true
-            } else {
-                false
-            }
-        }) {
-            self.refresh_current_chat_if_open(&chat_id);
-        }
+        self.update_delivery_or_refresh(&chat_id, &rumor_id, delivery);
     }
 
     fn handle_peer_key_package_fetched(
@@ -5198,17 +5186,11 @@ impl AppCore {
                     .entry(chat_id.clone())
                     .or_default()
                     .insert(message_id.clone(), MessageDeliveryState::Pending);
-                let mid = message_id.clone();
-                if !self.mutate_current_chat_messages(&chat_id, |msgs| {
-                    if let Some(msg) = msgs.iter_mut().find(|m| m.id == mid) {
-                        msg.delivery = MessageDeliveryState::Pending;
-                        true
-                    } else {
-                        false
-                    }
-                }) {
-                    self.refresh_current_chat_if_open(&chat_id);
-                }
+                self.update_delivery_or_refresh(
+                    &chat_id,
+                    &message_id,
+                    MessageDeliveryState::Pending,
+                );
                 self.refresh_chat_list_from_storage();
 
                 if !network_enabled {
