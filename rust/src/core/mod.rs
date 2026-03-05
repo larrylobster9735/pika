@@ -4714,6 +4714,7 @@ impl AppCore {
                     let _ = conn.execute("DELETE FROM chat_media", []);
                 }
                 let _ = std::fs::remove_dir_all(chat_media::media_root(&self.data_dir));
+                self.media_cache.clear();
                 self.state.media_gallery = None;
                 self.emit_state();
                 self.toast("Media cache wiped");
