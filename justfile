@@ -1,4 +1,5 @@
 set shell := ["bash", "-c"]
+set dotenv-load := true
 
 # List available recipes.
 default:
@@ -684,17 +685,24 @@ ios-xcframework: ios-gen-swift ios-rust
 
 # Generate Xcode project via xcodegen.
 ios-xcodeproj:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cd ios && rm -rf Pika.xcodeproj && xcodegen generate
+    # If PIKA_IOS_DEVELOPMENT_TEAM is set, stamp it on all targets so Xcode
+    # opens with signing already configured (no manual team picker step).
+    if [ -n "${PIKA_IOS_DEVELOPMENT_TEAM:-}" ]; then
+      sed -i '' "s/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ${PIKA_IOS_DEVELOPMENT_TEAM};/" \
+        Pika.xcodeproj/project.pbxproj
+    fi
 
-# Prepare for App Store: build both xcframework slices and regenerate project.
+# Prepare for App Store: build xcframework, regenerate project, open Xcode.
 
-# After running, open Xcode, select your dev team, and Product > Archive.
+# Set PIKA_IOS_DEVELOPMENT_TEAM in .env so all targets get the signing team automatically.
 ios-appstore: ios-xcframework ios-xcodeproj
     @echo ""
     @echo "Ready for App Store build."
-    @echo "  1. Open Xcode:  open ios/Pika.xcodeproj"
-    @echo "  2. Select your development team in Signing & Capabilities"
-    @echo "  3. Product > Archive"
+    @echo "  1. Xcode is opening…"
+    @echo "  2. Product > Archive"
     @echo ""
     open ios/Pika.xcodeproj
 
