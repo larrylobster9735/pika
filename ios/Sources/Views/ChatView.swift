@@ -665,7 +665,14 @@ struct ChatView: View {
                     showMicButton: onSendMedia != nil,
                     isInputFocused: $isInputFocused,
                     onSend: { sendMessage() },
-                    onStartVoiceRecording: { startVoiceRecording() }
+                    onStartVoiceRecording: { startVoiceRecording() },
+                    onImagePaste: onSendMedia == nil ? nil : { data, mimeType in
+                        let ext = mimeType == "image/gif" ? "gif" : "png"
+                        let filename = "sticker.\(ext)"
+                        let caption = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !caption.isEmpty { messageText = "" }
+                        onSendMedia?(chatId, data, "", filename, caption)
+                    }
                 )
                 .onChangeCompat(of: messageText) { newValue in
                     if chat.isGroup {

@@ -92,7 +92,10 @@ struct FullscreenImageViewer: View {
     @ViewBuilder
     private func imageContent(attachment: ChatMediaAttachment, geo: GeometryProxy) -> some View {
         if let localPath = attachment.localPath {
-            CachedAsyncImage(url: URL(fileURLWithPath: localPath)) { image in
+            CachedAsyncImage(
+                url: URL(fileURLWithPath: localPath),
+                animatedContentMode: .scaleAspectFit
+            ) { image in
                 image
                     .resizable()
                     .scaledToFit()

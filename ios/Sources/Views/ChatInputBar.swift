@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct ChatInputBar: View {
@@ -13,6 +14,7 @@ struct ChatInputBar: View {
     @FocusState.Binding var isInputFocused: Bool
     let onSend: () -> Void
     let onStartVoiceRecording: () -> Void
+    var onImagePaste: ((Data, String) -> Void)? = nil
 
     @State private var showPhotoPicker = false
 
@@ -71,27 +73,24 @@ struct ChatInputBar: View {
                 }
 
                 HStack(spacing: 10) {
-                    TextEditor(text: $messageText)
-                        .focused($isInputFocused)
-                        .frame(minHeight: 36, maxHeight: 150)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .scrollContentBackground(.hidden)
-                        .onAppear {
-                            if ProcessInfo.processInfo.isiOSAppOnMac {
-                                isInputFocused = true
-                            }
+                    StickerAwareTextView(
+                        text: $messageText,
+                        isFocused: $isInputFocused,
+                        maxHeight: 150,
+                        onSend: onSend,
+                        onImagePaste: onImagePaste
+                    )
+                    .frame(minHeight: 36)
+                    .overlay(alignment: .topLeading) {
+                        if messageText.isEmpty {
+                            Text("Message")
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 5)
+                                .padding(.top, 8)
+                                .allowsHitTesting(false)
                         }
-                        .modifier(ReturnKeyPressModifier(onSend: onSend))
-                        .overlay(alignment: .topLeading) {
-                            if messageText.isEmpty {
-                                Text("Message")
-                                    .foregroundStyle(.tertiary)
-                                    .padding(.leading, 5)
-                                    .padding(.top, 8)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        .accessibilityIdentifier(TestIds.chatMessageInput)
+                    }
+                    .accessibilityIdentifier(TestIds.chatMessageInput)
 
                     let isEmpty = messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         && stagedMedia.isEmpty
@@ -161,6 +160,234 @@ private struct StagedMediaThumbnail: View {
             }
             .offset(x: 4, y: -4)
         }
+    }
+}
+
+// MARK: - Sticker-aware text view
+
+/// A `UITextView` wrapper that intercepts image paste from sticker keyboards
+/// and forwards image data via `onImagePaste`.
+struct StickerAwareTextView: UIViewRepresentable {
+    @Binding var text: String
+    var isFocused: FocusState<Bool>.Binding
+    var maxHeight: CGFloat = 150
+    var onSend: (() -> Void)?
+    var onImagePaste: ((Data, String) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> PastableTextView {
+        let tv = PastableTextView()
+        tv.delegate = context.coordinator
+        tv.pasteDelegate = context.coordinator
+        tv.maxAllowedHeight = maxHeight
+        tv.onImagePaste = { data, mime in
+            onImagePaste?(data, mime)
+        }
+        tv.onReturnKey = { onSend?() }
+        tv.font = .preferredFont(forTextStyle: .body)
+        tv.backgroundColor = .clear
+        tv.textContainerInset = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+        tv.textContainer.lineFragmentPadding = 5
+        tv.isScrollEnabled = false
+        tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tv.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        // Auto-focus on Mac Catalyst
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            DispatchQueue.main.async { tv.becomeFirstResponder() }
+        }
+        return tv
+    }
+
+    func updateUIView(_ uiView: PastableTextView, context: Context) {
+        context.coordinator.parent = self
+
+        if uiView.text != text {
+            uiView.text = text
+            uiView.recalculateHeight()
+        }
+        uiView.onImagePaste = { data, mime in
+            onImagePaste?(data, mime)
+        }
+        uiView.onReturnKey = { onSend?() }
+    }
+
+    class Coordinator: NSObject, UITextViewDelegate, UITextPasteDelegate {
+        var parent: StickerAwareTextView
+
+        init(parent: StickerAwareTextView) {
+            self.parent = parent
+        }
+
+        // MARK: - UITextPasteDelegate
+
+        func textPasteConfigurationSupporting(
+            _ textPasteConfigurationSupporting: UITextPasteConfigurationSupporting,
+            transform item: UITextPasteItem
+        ) {
+            if item.itemProvider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                item.itemProvider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
+                    guard let data = data else { return }
+                    DispatchQueue.main.async {
+                        guard let tv = textPasteConfigurationSupporting as? PastableTextView else { return }
+                        tv.onImagePaste?(data, "image/png")
+                        self?.stripAttachments(in: tv)
+                    }
+                }
+                item.setNoResult()
+                return
+            }
+            item.setDefaultResult()
+        }
+
+        // MARK: - UITextViewDelegate
+
+        func textViewDidChange(_ textView: UITextView) {
+            (textView as? PastableTextView)?.recalculateHeight()
+
+            guard textView.text.contains("\u{FFFC}") else {
+                parent.text = textView.text
+                return
+            }
+
+            if let data = extractStickerImage(from: textView) {
+                stripAttachments(in: textView)
+                (textView as? PastableTextView)?.onImagePaste?(data, "image/png")
+                return
+            }
+
+            parent.text = textView.text
+        }
+
+        // MARK: - Helpers
+
+        /// Extracts image data from sticker content (NSAdaptiveImageGlyph or NSTextAttachment).
+        private func extractStickerImage(from textView: UITextView) -> Data? {
+            let storage = textView.textStorage
+            let range = NSRange(location: 0, length: storage.length)
+
+            // iOS 18+: NSAdaptiveImageGlyph (used by sticker keyboard)
+            if #available(iOS 18.0, *) {
+                var result: Data?
+                storage.enumerateAttributes(in: range) { attrs, _, stop in
+                    for (_, value) in attrs {
+                        if let glyph = value as? NSAdaptiveImageGlyph,
+                           let image = UIImage(data: glyph.imageContent),
+                           let pngData = image.pngData() {
+                            result = pngData
+                            stop.pointee = true
+                            return
+                        }
+                    }
+                }
+                if result != nil { return result }
+            }
+
+            // Fallback: NSTextAttachment
+            var result: Data?
+            storage.enumerateAttribute(.attachment, in: range) { value, _, stop in
+                guard let attachment = value as? NSTextAttachment else { return }
+                if let data = attachment.contents {
+                    result = data
+                } else if let image = attachment.image, let data = image.pngData() {
+                    result = data
+                } else if let fw = attachment.fileWrapper, let data = fw.regularFileContents {
+                    result = data
+                } else if let image = attachment.image(forBounds: attachment.bounds, textContainer: nil, characterIndex: 0),
+                          let data = image.pngData() {
+                    result = data
+                }
+                if result != nil { stop.pointee = true }
+            }
+            return result
+        }
+
+        /// Strips object-replacement characters and syncs the text binding.
+        private func stripAttachments(in textView: UITextView) {
+            let plain = textView.text.replacingOccurrences(of: "\u{FFFC}", with: "")
+            textView.text = plain
+            parent.text = plain
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            parent.isFocused.wrappedValue = true
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            parent.isFocused.wrappedValue = false
+        }
+    }
+}
+
+/// UITextView subclass that intercepts paste, manages dynamic height, and detects image content.
+class PastableTextView: UITextView {
+    var onImagePaste: ((Data, String) -> Void)?
+    var onReturnKey: (() -> Void)?
+    var maxAllowedHeight: CGFloat = 150
+
+    override var intrinsicContentSize: CGSize {
+        let size = sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude))
+        let clamped = min(size.height, maxAllowedHeight)
+        return CGSize(width: UIView.noIntrinsicMetric, height: clamped)
+    }
+
+    /// Recalculates intrinsic height and toggles scrolling when content exceeds max.
+    func recalculateHeight() {
+        let contentHeight = sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude)).height
+        let shouldScroll = contentHeight > maxAllowedHeight
+        if isScrollEnabled != shouldScroll {
+            isScrollEnabled = shouldScroll
+        }
+        invalidateIntrinsicContentSize()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        recalculateHeight()
+    }
+
+    override func paste(_ sender: Any?) {
+        let pb = UIPasteboard.general
+
+        // Check for GIF data first (preserves animation)
+        if let gifData = pb.data(forPasteboardType: "com.compuserve.gif") {
+            onImagePaste?(gifData, "image/gif")
+            return
+        }
+
+        // Check for PNG data
+        if let pngData = pb.data(forPasteboardType: "public.png") {
+            onImagePaste?(pngData, "image/png")
+            return
+        }
+
+        // Fallback: any image on pasteboard
+        if pb.hasImages, let image = pb.image, let pngData = image.pngData() {
+            onImagePaste?(pngData, "image/png")
+            return
+        }
+
+        super.paste(sender)
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) && UIPasteboard.general.hasImages {
+            return true
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Handle Return key to send (without Shift)
+        if let key = presses.first?.key,
+           key.keyCode == .keyboardReturnOrEnter,
+           !key.modifierFlags.contains(.shift) {
+            onReturnKey?()
+            return
+        }
+        super.pressesBegan(presses, with: event)
     }
 }
 
