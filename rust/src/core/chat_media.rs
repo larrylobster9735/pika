@@ -295,7 +295,7 @@ pub(super) fn media_root(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("chat_media")
 }
 
-fn media_file_path(
+pub(super) fn media_file_path(
     data_dir: &str,
     account_pubkey: &str,
     chat_id: &str,
@@ -330,7 +330,7 @@ pub(super) fn is_imeta_tag(tag: &Tag) -> bool {
     matches!(tag.kind(), TagKind::Custom(kind) if kind.as_ref() == "imeta")
 }
 
-fn resolve_mime_type(mime_type: &str, filename: &str) -> String {
+pub(super) fn resolve_mime_type(mime_type: &str, filename: &str) -> String {
     if mime_type.trim().is_empty() {
         mime_type_for_filename(filename)
     } else {
@@ -383,14 +383,35 @@ impl AppCore {
         reference: &MediaReference,
         encrypted_hash_hex: Option<String>,
     ) -> ChatMediaAttachment {
-        let original_hash_hex = hex::encode(reference.original_hash);
-        let local_path = path_if_exists(&media_file_path(
-            &self.data_dir,
-            account_pubkey,
+        self.attachment_from_reference_inner(
             chat_id,
-            &original_hash_hex,
-            &reference.filename,
-        ));
+            account_pubkey,
+            reference,
+            encrypted_hash_hex,
+            true,
+        )
+    }
+
+    fn attachment_from_reference_inner(
+        &self,
+        chat_id: &str,
+        account_pubkey: &str,
+        reference: &MediaReference,
+        encrypted_hash_hex: Option<String>,
+        check_local_path: bool,
+    ) -> ChatMediaAttachment {
+        let original_hash_hex = hex::encode(reference.original_hash);
+        let local_path = if check_local_path {
+            path_if_exists(&media_file_path(
+                &self.data_dir,
+                account_pubkey,
+                chat_id,
+                &original_hash_hex,
+                &reference.filename,
+            ))
+        } else {
+            None
+        };
         let (width, height) = reference
             .dimensions
             .map(|(w, h)| (Some(w), Some(h)))
@@ -413,6 +434,47 @@ impl AppCore {
             upload_progress: None,
             blurhash: None,
         }
+    }
+
+    /// Build media attachments without checking local file paths or persisting to DB.
+    /// Used for fast initial render — local paths are resolved asynchronously after.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn chat_media_attachments_fast(
+        &self,
+        mdk: &PikaMdk,
+        group_id: &GroupId,
+        chat_id: &str,
+        account_pubkey: &str,
+        tags: &Tags,
+    ) -> Vec<ChatMediaAttachment> {
+        let manager = mdk.media_manager(group_id.clone());
+        let mut out = Vec::new();
+        for tag in tags.iter() {
+            if !is_imeta_tag(tag) {
+                continue;
+            }
+            let reference = match manager.parse_imeta_tag(tag) {
+                Ok(reference) => reference,
+                Err(e) => {
+                    tracing::warn!(%e, "invalid imeta tag in chat message");
+                    continue;
+                }
+            };
+            let encrypted_hash_hex = self
+                .media_cache
+                .get(chat_id)
+                .and_then(|cache| cache.get(&hex::encode(reference.original_hash)))
+                .map(|r| r.encrypted_hash_hex.clone())
+                .filter(|h| !h.is_empty());
+            out.push(self.attachment_from_reference_inner(
+                chat_id,
+                account_pubkey,
+                &reference,
+                encrypted_hash_hex,
+                false,
+            ));
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -804,6 +866,61 @@ impl AppCore {
         );
     }
 
+    /// Handle resolved local paths from background file existence checks.
+    /// Patches local_path on media attachments in the current chat and triggers auto-downloads.
+    pub(super) fn handle_media_local_paths_resolved(
+        &mut self,
+        chat_id: String,
+        resolved: Vec<(String, Option<String>)>,
+    ) {
+        let mut needs_download: Vec<(String, String)> = Vec::new();
+        let resolved_map: HashMap<String, Option<String>> = resolved.into_iter().collect();
+
+        self.mutate_current_chat_messages(&chat_id, |msgs| {
+            let mut changed = false;
+            for msg in msgs.iter_mut() {
+                for att in msg.media.iter_mut() {
+                    if let Some(local_path) = resolved_map.get(&att.original_hash_hex) {
+                        att.local_path = local_path.clone();
+                        changed = true;
+                        if local_path.is_none()
+                            && att.upload_progress.is_none()
+                            && matches!(
+                                att.kind,
+                                ChatMediaKind::Image
+                                    | ChatMediaKind::VoiceNote
+                                    | ChatMediaKind::Video
+                            )
+                        {
+                            needs_download.push((msg.id.clone(), att.original_hash_hex.clone()));
+                        }
+                    }
+                }
+            }
+            changed
+        });
+
+        // Trigger auto-downloads for attachments not found locally.
+        let chat_id_str = chat_id.to_string();
+        const MAX_CONCURRENT_AUTO_DOWNLOADS: usize = 5;
+        let already_pending = self
+            .pending_media_downloads
+            .values()
+            .filter(|p| p.chat_id == chat_id_str)
+            .count();
+        let available_slots = MAX_CONCURRENT_AUTO_DOWNLOADS.saturating_sub(already_pending);
+        let mut auto_download_count = 0;
+        for (message_id, hash) in needs_download {
+            if auto_download_count >= available_slots {
+                break;
+            }
+            if !self.is_media_download_pending(&chat_id_str, &hash) {
+                self.download_chat_media(chat_id_str.clone(), message_id, hash);
+                auto_download_count += 1;
+            }
+        }
+    }
+
     /// Clean up an optimistic outbox entry and refresh UI.
     fn cleanup_outbox_entry(&mut self, chat_id: &str, temp_rumor_id: &str) {
         if let Some(outbox) = self.local_outbox.get_mut(chat_id) {
@@ -814,19 +931,6 @@ impl AppCore {
         }
         self.refresh_current_chat_if_open(chat_id);
         self.refresh_chat_list_from_storage();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn handle_chat_media_batch_preprocessed(
-        &mut self,
-        _chat_id: String,
-        _caption: String,
-        _temp_rumor_id: String,
-        _account_pubkey: String,
-        _items: Vec<crate::updates::PreprocessedMediaItem>,
-        _error: Option<String>,
-    ) {
-        // TODO: move batch preprocessing off main thread (same pattern as single media)
     }
 
     pub(super) fn send_chat_media_batch(
@@ -2426,5 +2530,75 @@ mod tests {
         assert!(result.is_some(), "image/jpg should be accepted");
         let (_, _, _, mime) = result.unwrap();
         assert_eq!(mime, "image/jpeg");
+    }
+
+    // --- preprocess_single_media tests ---
+
+    #[test]
+    fn preprocess_single_media_decodes_and_writes_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let jpeg_bytes = make_jpeg(100, 100);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+
+        let result = preprocess_single_media(
+            &data_dir,
+            "account1",
+            "chat1",
+            &b64,
+            "image/jpeg",
+            "photo.jpg",
+        );
+        let pp = result.expect("preprocessing should succeed");
+        assert_eq!(pp.media_mime, "image/jpeg");
+        assert_eq!(pp.local_filename, "photo.jpg");
+        assert!(!pp.pre_hash_hex.is_empty());
+        // File should have been written.
+        assert!(
+            std::path::Path::new(&pp.local_path).exists(),
+            "local file should exist"
+        );
+        // Blurhash should be computed for images.
+        assert!(pp.blurhash.is_some());
+    }
+
+    #[test]
+    fn preprocess_single_media_resizes_large_image() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let jpeg_bytes = make_jpeg(3200, 2400);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+
+        let pp = preprocess_single_media(
+            &data_dir,
+            "account1",
+            "chat1",
+            &b64,
+            "image/jpeg",
+            "big.jpg",
+        )
+        .expect("preprocessing should succeed");
+        assert_eq!(pp.width, Some(1600));
+        assert_eq!(pp.height, Some(1200));
+    }
+
+    #[test]
+    fn preprocess_single_media_rejects_empty_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"");
+
+        let result = preprocess_single_media(&data_dir, "a", "c", &b64, "image/jpeg", "empty.jpg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn preprocess_single_media_rejects_invalid_base64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+
+        let result =
+            preprocess_single_media(&data_dir, "a", "c", "not-base64!!!", "image/jpeg", "x.jpg");
+        assert!(result.is_err());
     }
 }

@@ -3056,6 +3056,9 @@ impl AppCore {
                 encrypted_data,
                 error,
             } => self.handle_chat_media_download_fetched(request_id, encrypted_data, error),
+            InternalEvent::ChatMediaLocalPathsResolved { chat_id, resolved } => {
+                self.handle_media_local_paths_resolved(chat_id, resolved);
+            }
             InternalEvent::ChatMediaPreprocessed {
                 chat_id,
                 caption,
@@ -3083,21 +3086,6 @@ impl AppCore {
                 width,
                 height,
                 blurhash,
-                error,
-            ),
-            InternalEvent::ChatMediaBatchPreprocessed {
-                chat_id,
-                caption,
-                temp_rumor_id,
-                account_pubkey,
-                items,
-                error,
-            } => self.handle_chat_media_batch_preprocessed(
-                chat_id,
-                caption,
-                temp_rumor_id,
-                account_pubkey,
-                items,
                 error,
             ),
             InternalEvent::PeerKeyPackageFetched {
@@ -7687,6 +7675,43 @@ mod tests {
             };
             assert_eq!(item.mime_type, "image/png");
             assert_eq!(item.filename, "photo.png");
+        }
+
+        #[test]
+        fn wipe_media_cache_clears_in_memory_cache() {
+            use super::super::chat_media_db;
+            use crate::AppAction;
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let data_dir = tempdir.path().to_string_lossy().into_owned();
+            let mut core = make_core(data_dir);
+
+            // Populate the in-memory media cache.
+            core.media_cache
+                .entry("chat1".to_string())
+                .or_default()
+                .insert(
+                    "hash1".to_string(),
+                    chat_media_db::ChatMediaRecord {
+                        account_pubkey: "acc".to_string(),
+                        chat_id: "chat1".to_string(),
+                        original_hash_hex: "hash1".to_string(),
+                        encrypted_hash_hex: String::new(),
+                        url: String::new(),
+                        mime_type: "image/jpeg".to_string(),
+                        filename: "photo.jpg".to_string(),
+                        nonce_hex: String::new(),
+                        scheme_version: String::new(),
+                        created_at: 100,
+                    },
+                );
+            assert!(!core.media_cache.is_empty());
+
+            core.handle_action(AppAction::WipeMediaCache);
+            assert!(
+                core.media_cache.is_empty(),
+                "WipeMediaCache should clear in-memory media cache"
+            );
         }
     }
 }
