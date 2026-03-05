@@ -291,6 +291,7 @@ fn attachment_from_record(
         scheme_version: record.scheme_version.clone(),
         local_path,
         upload_progress: None,
+        blurhash: None,
     }
 }
 
