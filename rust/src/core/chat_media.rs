@@ -211,7 +211,7 @@ fn sanitize_filename(filename: &str) -> String {
     }
 }
 
-fn media_root(data_dir: &str) -> PathBuf {
+pub(super) fn media_root(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("chat_media")
 }
 
@@ -1816,7 +1816,6 @@ impl AppCore {
                 Some(MediaGalleryItem {
                     attachment: att,
                     timestamp: record.created_at,
-                    display_timestamp: storage::format_display_timestamp(record.created_at),
                 })
             })
             .collect();

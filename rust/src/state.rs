@@ -418,7 +418,6 @@ pub struct MediaGalleryState {
 pub struct MediaGalleryItem {
     pub attachment: ChatMediaAttachment,
     pub timestamp: i64,
-    pub display_timestamp: String,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

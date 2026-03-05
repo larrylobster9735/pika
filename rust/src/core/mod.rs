@@ -4663,9 +4663,9 @@ impl AppCore {
                 if let Some(conn) = self.chat_media_db.as_ref() {
                     let _ = conn.execute("DELETE FROM chat_media", []);
                 }
-                // Delete cached media files on disk.
-                let media_dir = std::path::Path::new(&self.data_dir).join("chat_media");
-                let _ = std::fs::remove_dir_all(&media_dir);
+                let _ = std::fs::remove_dir_all(chat_media::media_root(&self.data_dir));
+                self.state.media_gallery = None;
+                self.emit_state();
                 self.toast("Media cache wiped");
             }
             AppAction::OpenPeerProfile { pubkey } => {
