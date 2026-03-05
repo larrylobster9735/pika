@@ -1,6 +1,19 @@
 use crate::state::AppState;
 use crate::AppAction;
 
+/// Result of preprocessing a single media item off the main thread.
+#[derive(Debug, Clone)]
+pub struct PreprocessedMediaItem {
+    pub media_data: Vec<u8>,
+    pub media_mime: String,
+    pub local_filename: String,
+    pub pre_hash_hex: String,
+    pub local_path: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub blurhash: Option<String>,
+}
+
 #[derive(uniffi::Enum, Clone, Debug)]
 #[allow(clippy::large_enum_variant)] // uniffi enums cannot use Box<T> indirection
 pub enum AppUpdate {
@@ -64,6 +77,33 @@ pub enum InternalEvent {
     ChatMediaDownloadFetched {
         request_id: String,
         encrypted_data: Option<Vec<u8>>,
+        error: Option<String>,
+    },
+    /// Heavy preprocessing (decode, resize, hash, blurhash, file write) finished
+    /// off the main thread.  The main actor can now insert the outbox entry and
+    /// start encryption + upload.
+    ChatMediaPreprocessed {
+        chat_id: String,
+        caption: String,
+        temp_rumor_id: String,
+        account_pubkey: String,
+        media_data: Vec<u8>,
+        media_mime: String,
+        local_filename: String,
+        pre_hash_hex: String,
+        local_path: String,
+        width: Option<u32>,
+        height: Option<u32>,
+        blurhash: Option<String>,
+        error: Option<String>,
+    },
+    /// Batch variant of ChatMediaPreprocessed.
+    ChatMediaBatchPreprocessed {
+        chat_id: String,
+        caption: String,
+        temp_rumor_id: String,
+        account_pubkey: String,
+        items: Vec<PreprocessedMediaItem>,
         error: Option<String>,
     },
     KeyPackagePublished {

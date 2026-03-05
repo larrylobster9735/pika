@@ -55,6 +55,86 @@ fn maybe_resize_image(data: &[u8], mime_type: &str) -> Option<(Vec<u8>, u32, u32
     }
 }
 
+/// Result of preprocessing a single media item (decode, resize, hash, blurhash, file write).
+struct SingleMediaPreprocessed {
+    media_data: Vec<u8>,
+    media_mime: String,
+    local_filename: String,
+    pre_hash_hex: String,
+    local_path: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    blurhash: Option<String>,
+}
+
+/// Run the expensive media preprocessing off the main actor thread.
+fn preprocess_single_media(
+    data_dir: &str,
+    account_pubkey: &str,
+    chat_id: &str,
+    data_base64: &str,
+    mime_type: &str,
+    filename: &str,
+) -> Result<SingleMediaPreprocessed, String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|e| format!("Invalid media data: {e}"))?;
+    if decoded.is_empty() {
+        return Err("Pick media first".into());
+    }
+    if decoded.len() > MAX_CHAT_MEDIA_BYTES {
+        return Err("Media too large (max 32 MB)".into());
+    }
+
+    let (media_data, media_mime, was_resized, resize_dims) =
+        match maybe_resize_image(&decoded, mime_type) {
+            Some((resized_bytes, w, h, out_mime)) => {
+                (resized_bytes, out_mime.to_string(), true, Some((w, h)))
+            }
+            None => (decoded, mime_type.to_string(), false, None),
+        };
+
+    let pre_hash = Sha256::digest(&media_data);
+    let pre_hash_hex = hex::encode(pre_hash);
+
+    let local_filename = if was_resized {
+        let stem = filename.rsplitn(2, '.').last().unwrap_or(filename);
+        let ext = if media_mime == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        };
+        format!("{stem}.{ext}")
+    } else {
+        filename.to_string()
+    };
+
+    let local_path = media_file_path(
+        data_dir,
+        account_pubkey,
+        chat_id,
+        &pre_hash_hex,
+        &local_filename,
+    );
+    write_media_file(&local_path, &media_data).map_err(|e| format!("Media cache failed: {e}"))?;
+
+    let (width, height) = resize_dims
+        .map(|(w, h)| (Some(w), Some(h)))
+        .unwrap_or((None, None));
+    let blurhash = compute_blurhash(&media_data);
+
+    Ok(SingleMediaPreprocessed {
+        media_data,
+        media_mime,
+        local_filename,
+        pre_hash_hex,
+        local_path: local_path.to_string_lossy().to_string(),
+        width,
+        height,
+        blurhash,
+    })
+}
+
 /// Encode a small blurhash (4×3 components) from image bytes.
 /// Returns `None` for non-image data or decode failures.
 fn compute_blurhash(data: &[u8]) -> Option<String> {
@@ -425,22 +505,6 @@ impl AppCore {
             return;
         }
 
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(data_base64) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.toast(format!("Invalid media data: {e}"));
-                return;
-            }
-        };
-        if decoded.is_empty() {
-            self.toast("Pick media first");
-            return;
-        }
-        if decoded.len() > MAX_CHAT_MEDIA_BYTES {
-            self.toast("Media too large (max 32 MB)");
-            return;
-        }
-
         let filename = filename.trim().to_string();
         if filename.is_empty() {
             self.toast("Filename is required");
@@ -448,85 +512,36 @@ impl AppCore {
         }
 
         let mime_type = resolve_mime_type(&mime_type, &filename);
-
         let caption = caption.trim().to_string();
 
-        // --- Phase A: Preprocess + show bubble immediately ---
-
-        // Try to resize large JPEG/PNG images (bakes in EXIF orientation).
-        let (media_data, media_mime, was_resized, resize_dims) =
-            match maybe_resize_image(&decoded, &mime_type) {
-                Some((resized_bytes, w, h, out_mime)) => {
-                    (resized_bytes, out_mime.to_string(), true, Some((w, h)))
-                }
-                None => (decoded, mime_type.clone(), false, None),
-            };
-
-        // Compute hash of the data we'll give to MDK.
-        let pre_hash = Sha256::digest(&media_data);
-        let pre_hash_hex = hex::encode(pre_hash);
-
-        // Validate session state before writing anything.
-        let (account_pubkey, group, local_keys) = {
+        let account_pubkey = {
             let Some(sess) = self.session.as_ref() else {
                 return;
             };
-            let Some(group) = sess.groups.get(&chat_id).cloned() else {
+            if !sess.groups.contains_key(&chat_id) {
                 self.toast("Chat not found");
                 return;
-            };
-            let Some(local_keys) = sess.local_keys.clone() else {
-                self.toast("Media upload requires local key signer");
-                return;
-            };
-            (sess.pubkey.to_hex(), group, local_keys)
+            }
+            sess.pubkey.to_hex()
         };
 
-        // Write the (potentially resized) data to local cache.
-        let local_filename = if was_resized {
-            let stem = filename.rsplitn(2, '.').last().unwrap_or(&filename);
-            let ext = if media_mime == "image/png" {
-                "png"
-            } else {
-                "jpg"
-            };
-            format!("{stem}.{ext}")
-        } else {
-            filename.clone()
-        };
-        let local_path = media_file_path(
-            &self.data_dir,
-            &account_pubkey,
-            &chat_id,
-            &pre_hash_hex,
-            &local_filename,
-        );
-        if let Err(e) = write_media_file(&local_path, &media_data) {
-            self.toast(format!("Media cache failed: {e}"));
-            return;
-        }
-
-        // Build temporary attachment and insert outbox entry so the bubble appears now.
-        let (width, height) = resize_dims
-            .map(|(w, h)| (Some(w), Some(h)))
-            .unwrap_or((None, None));
-        let kind = infer_media_kind(&media_mime, &local_filename);
-        let blurhash = compute_blurhash(&media_data);
+        // Show a placeholder bubble immediately while preprocessing runs in background.
         let temp_rumor_id = uuid::Uuid::new_v4().to_string();
+        let kind = infer_media_kind(&mime_type, &filename);
         let temp_attachment = ChatMediaAttachment {
-            original_hash_hex: pre_hash_hex.clone(),
+            original_hash_hex: String::new(),
             encrypted_hash_hex: None,
             url: String::new(),
-            mime_type: media_mime.clone(),
-            filename: local_filename.clone(),
+            mime_type: mime_type.clone(),
+            filename: filename.clone(),
             kind,
-            width,
-            height,
+            width: None,
+            height: None,
             nonce_hex: String::new(),
             scheme_version: String::new(),
-            local_path: Some(local_path.to_string_lossy().to_string()),
+            local_path: None,
             upload_progress: Some(0.0),
-            blurhash,
+            blurhash: None,
         };
 
         self.delivery_overrides
@@ -561,26 +576,134 @@ impl AppCore {
                 },
             );
 
-        // Bubble is now visible in the UI.
         self.refresh_current_chat_if_open(&chat_id);
         self.refresh_chat_list_from_storage();
 
-        // --- Phase B: Encrypt ---
+        // --- Heavy work: decode, resize, hash, blurhash, file write — off main thread ---
+        let tx = self.core_sender.clone();
+        let data_dir = self.data_dir.clone();
+        self.runtime.spawn_blocking(move || {
+            let result = preprocess_single_media(
+                &data_dir,
+                &account_pubkey,
+                &chat_id,
+                &data_base64,
+                &mime_type,
+                &filename,
+            );
+            match result {
+                Ok(pp) => {
+                    let _ = tx.send(CoreMsg::Internal(Box::new(
+                        InternalEvent::ChatMediaPreprocessed {
+                            chat_id,
+                            caption,
+                            temp_rumor_id,
+                            account_pubkey,
+                            media_data: pp.media_data,
+                            media_mime: pp.media_mime,
+                            local_filename: pp.local_filename,
+                            pre_hash_hex: pp.pre_hash_hex,
+                            local_path: pp.local_path,
+                            width: pp.width,
+                            height: pp.height,
+                            blurhash: pp.blurhash,
+                            error: None,
+                        },
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(CoreMsg::Internal(Box::new(
+                        InternalEvent::ChatMediaPreprocessed {
+                            chat_id,
+                            caption,
+                            temp_rumor_id,
+                            account_pubkey,
+                            media_data: vec![],
+                            media_mime: String::new(),
+                            local_filename: String::new(),
+                            pre_hash_hex: String::new(),
+                            local_path: String::new(),
+                            width: None,
+                            height: None,
+                            blurhash: None,
+                            error: Some(e),
+                        },
+                    )));
+                }
+            }
+        });
+    }
 
-        let (request_id, encrypted_data, expected_hash_hex, upload_mime, blossom_servers) = {
-            let Some(sess) = self.session.as_mut() else {
-                if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
-                    outbox.remove(&temp_rumor_id);
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_chat_media_preprocessed(
+        &mut self,
+        chat_id: String,
+        caption: String,
+        temp_rumor_id: String,
+        account_pubkey: String,
+        media_data: Vec<u8>,
+        media_mime: String,
+        local_filename: String,
+        pre_hash_hex: String,
+        local_path: String,
+        width: Option<u32>,
+        height: Option<u32>,
+        blurhash: Option<String>,
+        error: Option<String>,
+    ) {
+        if let Some(e) = error {
+            // Clean up the placeholder outbox entry.
+            if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
+                outbox.remove(&temp_rumor_id);
+            }
+            if let Some(overrides) = self.delivery_overrides.get_mut(&chat_id) {
+                overrides.remove(&temp_rumor_id);
+            }
+            self.refresh_current_chat_if_open(&chat_id);
+            self.refresh_chat_list_from_storage();
+            self.toast(e);
+            return;
+        }
+
+        // Update the placeholder outbox attachment with real data.
+        let kind = infer_media_kind(&media_mime, &local_filename);
+        if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
+            if let Some(entry) = outbox.get_mut(&temp_rumor_id) {
+                if let Some(att) = entry.media.first_mut() {
+                    att.original_hash_hex = pre_hash_hex.clone();
+                    att.mime_type = media_mime.clone();
+                    att.filename = local_filename.clone();
+                    att.kind = kind;
+                    att.width = width;
+                    att.height = height;
+                    att.local_path = Some(local_path.clone());
+                    att.blurhash = blurhash;
                 }
-                if let Some(overrides) = self.delivery_overrides.get_mut(&chat_id) {
-                    overrides.remove(&temp_rumor_id);
-                }
-                let _ = std::fs::remove_file(&local_path);
-                self.refresh_current_chat_if_open(&chat_id);
-                self.refresh_chat_list_from_storage();
+            }
+        }
+
+        // Validate session and get group info for encryption.
+        let (group, local_keys) = {
+            let Some(sess) = self.session.as_ref() else {
+                self.cleanup_outbox_entry(&chat_id, &temp_rumor_id);
                 return;
             };
+            let Some(group) = sess.groups.get(&chat_id).cloned() else {
+                self.cleanup_outbox_entry(&chat_id, &temp_rumor_id);
+                self.toast("Chat not found");
+                return;
+            };
+            let Some(local_keys) = sess.local_keys.clone() else {
+                self.cleanup_outbox_entry(&chat_id, &temp_rumor_id);
+                self.toast("Media upload requires local key signer");
+                return;
+            };
+            (group, local_keys)
+        };
 
+        // --- Encrypt (still on main thread — needs MDK) ---
+        let (request_id, encrypted_data, expected_hash_hex, upload_mime, blossom_servers) = {
+            let sess = self.session.as_mut().unwrap();
             let manager = sess.mdk.media_manager(group.mls_group_id.clone());
             let mut upload = match manager.encrypt_for_upload_with_options(
                 &media_data,
@@ -590,16 +713,7 @@ impl AppCore {
             ) {
                 Ok(upload) => upload,
                 Err(e) => {
-                    // Clean up the optimistic outbox entry and cache file on failure.
-                    if let Some(outbox) = self.local_outbox.get_mut(&chat_id) {
-                        outbox.remove(&temp_rumor_id);
-                    }
-                    if let Some(overrides) = self.delivery_overrides.get_mut(&chat_id) {
-                        overrides.remove(&temp_rumor_id);
-                    }
-                    let _ = std::fs::remove_file(&local_path);
-                    self.refresh_current_chat_if_open(&chat_id);
-                    self.refresh_chat_list_from_storage();
+                    self.cleanup_outbox_entry(&chat_id, &temp_rumor_id);
                     self.toast(format!("Media encryption failed: {e}"));
                     return;
                 }
@@ -607,9 +721,7 @@ impl AppCore {
 
             let original_hash_hex = hex::encode(upload.original_hash);
 
-            // If MDK re-encoded (sanitize_exif: true), the hash may differ from our
-            // pre-computed one. Copy the local file under the new hash path so
-            // lookups by original_hash_hex find it, and update the outbox entry.
+            // If MDK re-encoded, the hash may differ. Update the outbox entry.
             if original_hash_hex != pre_hash_hex {
                 let final_local_path = media_file_path(
                     &self.data_dir,
@@ -618,13 +730,13 @@ impl AppCore {
                     &original_hash_hex,
                     &local_filename,
                 );
-                let effective_path = if final_local_path != local_path {
+                let local_path_buf = PathBuf::from(&local_path);
+                let effective_path = if final_local_path != local_path_buf {
                     if let Err(e) = write_media_file(&final_local_path, &media_data) {
                         tracing::warn!(%e, "failed to copy local preview to final hash path");
-                        // Fall back to original path — file still exists there.
-                        &local_path
+                        &local_path_buf
                     } else {
-                        let _ = std::fs::remove_file(&local_path);
+                        let _ = std::fs::remove_file(&local_path_buf);
                         &final_local_path
                     }
                 } else {
@@ -680,7 +792,7 @@ impl AppCore {
             )
         };
 
-        // --- Phase C: Upload (async, unchanged) ---
+        self.refresh_current_chat_if_open(&chat_id);
 
         self.spawn_media_upload(
             request_id,
@@ -690,6 +802,31 @@ impl AppCore {
             expected_hash_hex,
             local_keys,
         );
+    }
+
+    /// Clean up an optimistic outbox entry and refresh UI.
+    fn cleanup_outbox_entry(&mut self, chat_id: &str, temp_rumor_id: &str) {
+        if let Some(outbox) = self.local_outbox.get_mut(chat_id) {
+            outbox.remove(temp_rumor_id);
+        }
+        if let Some(overrides) = self.delivery_overrides.get_mut(chat_id) {
+            overrides.remove(temp_rumor_id);
+        }
+        self.refresh_current_chat_if_open(chat_id);
+        self.refresh_chat_list_from_storage();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_chat_media_batch_preprocessed(
+        &mut self,
+        _chat_id: String,
+        _caption: String,
+        _temp_rumor_id: String,
+        _account_pubkey: String,
+        _items: Vec<crate::updates::PreprocessedMediaItem>,
+        _error: Option<String>,
+    ) {
+        // TODO: move batch preprocessing off main thread (same pattern as single media)
     }
 
     pub(super) fn send_chat_media_batch(
