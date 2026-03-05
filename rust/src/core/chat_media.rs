@@ -375,7 +375,7 @@ impl AppCore {
                         original_hash_hex: original_hash_hex.clone(),
                         encrypted_hash_hex: String::new(),
                         url: reference.url.clone(),
-                        mime_type: reference.mime_type.clone(),
+                        mime_type: resolve_mime_type(&reference.mime_type, &reference.filename),
                         filename: reference.filename.clone(),
                         nonce_hex: hex::encode(reference.nonce),
                         scheme_version: reference.scheme_version.clone(),

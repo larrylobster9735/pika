@@ -2820,6 +2820,7 @@ impl AppCore {
             self.state.current_chat = None;
             self.state.active_call = None;
             self.state.voice_recording = None;
+            self.state.media_gallery = None;
             self.state.call_timeline = vec![];
             self.state.chat_list = vec![];
             self.state.busy = BusyState::idle();

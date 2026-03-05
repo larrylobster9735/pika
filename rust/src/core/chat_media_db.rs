@@ -476,4 +476,76 @@ mod tests {
             "initial empty hash stored as-is"
         );
     }
+
+    // --- get_gallery_media MIME filtering tests ---
+
+    #[test]
+    fn gallery_includes_image_and_video_excludes_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = open_chat_media_db(&dir.path().to_string_lossy()).expect("open db");
+
+        let mut img = sample_record("acc-a", "chat-a", "hash-1", 100);
+        img.mime_type = "image/jpeg".to_string();
+
+        let mut vid = sample_record("acc-a", "chat-a", "hash-2", 200);
+        vid.mime_type = "video/mp4".to_string();
+
+        let mut audio = sample_record("acc-a", "chat-a", "hash-3", 300);
+        audio.mime_type = "audio/mp4".to_string();
+        audio.filename = "voice_123.m4a".to_string();
+
+        let mut file = sample_record("acc-a", "chat-a", "hash-4", 400);
+        file.mime_type = "application/pdf".to_string();
+        file.filename = "doc.pdf".to_string();
+
+        upsert_chat_media(&conn, &img).expect("upsert img");
+        upsert_chat_media(&conn, &vid).expect("upsert vid");
+        upsert_chat_media(&conn, &audio).expect("upsert audio");
+        upsert_chat_media(&conn, &file).expect("upsert file");
+
+        let results = get_gallery_media(&conn, "acc-a", "chat-a");
+        assert_eq!(results.len(), 2);
+        // Newest first
+        assert_eq!(results[0].original_hash_hex, "hash-2"); // video
+        assert_eq!(results[1].original_hash_hex, "hash-1"); // image
+    }
+
+    #[test]
+    fn gallery_matches_normalized_mime_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = open_chat_media_db(&dir.path().to_string_lossy()).expect("open db");
+
+        let mut upper = sample_record("acc-a", "chat-a", "hash-1", 100);
+        upper.mime_type = "Image/PNG".to_string();
+
+        let mut video_upper = sample_record("acc-a", "chat-a", "hash-2", 200);
+        video_upper.mime_type = "Video/QuickTime".to_string();
+
+        upsert_chat_media(&conn, &upper).expect("upsert");
+        upsert_chat_media(&conn, &video_upper).expect("upsert");
+
+        // SQLite LIKE is case-insensitive for ASCII, so these should match
+        let results = get_gallery_media(&conn, "acc-a", "chat-a");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn gallery_excludes_whitespace_padded_mime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = open_chat_media_db(&dir.path().to_string_lossy()).expect("open db");
+
+        let mut padded = sample_record("acc-a", "chat-a", "hash-1", 100);
+        padded.mime_type = " image/jpeg ".to_string();
+
+        upsert_chat_media(&conn, &padded).expect("upsert");
+
+        // Whitespace-padded mime won't match LIKE 'image/%', demonstrating
+        // why callers must normalize before upserting.
+        let results = get_gallery_media(&conn, "acc-a", "chat-a");
+        assert_eq!(
+            results.len(),
+            0,
+            "whitespace-padded mime must not match gallery filter"
+        );
+    }
 }
