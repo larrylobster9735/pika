@@ -49,6 +49,7 @@ struct ChatMediaGalleryView: View {
             FullscreenImageViewer(
                 attachments: viewableAttachments,
                 selected: attachment,
+                sourceFrame: ImageViewerTransition.sourceFrame,
                 onDismiss: { fullscreenAttachment = nil }
             )
         }

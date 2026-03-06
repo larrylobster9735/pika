@@ -17,24 +17,29 @@ struct FullscreenImageViewer: View {
     @State private var backgroundOpacity: Double = 0.0
     @State private var dismissScale: CGFloat = 1.0
     @State private var zoomScales: [String: CGFloat] = [:]
-    private let sourceFrame = ImageViewerTransition.sourceFrame
+    let sourceFrame: CGRect
 
     private var isZoomed: Bool {
         (zoomScales[currentId] ?? 1.0) > 1.01
     }
 
-    init(attachment: ChatMediaAttachment, onDismiss: @escaping () -> Void) {
+    init(
+        attachment: ChatMediaAttachment, sourceFrame: CGRect = .zero,
+        onDismiss: @escaping () -> Void
+    ) {
         self.attachments = [attachment]
         self._currentId = State(initialValue: attachment.id)
+        self.sourceFrame = sourceFrame
         self.onDismiss = onDismiss
     }
 
     init(
         attachments: [ChatMediaAttachment], selected: ChatMediaAttachment,
-        onDismiss: @escaping () -> Void
+        sourceFrame: CGRect = .zero, onDismiss: @escaping () -> Void
     ) {
         self.attachments = attachments
         self._currentId = State(initialValue: selected.id)
+        self.sourceFrame = sourceFrame
         self.onDismiss = onDismiss
     }
 
@@ -62,7 +67,7 @@ struct FullscreenImageViewer: View {
                 .mask(dismissClipMask(geo: geo))
                 .scaleEffect(dismissScale)
                 .offset(x: dragOffset.width, y: dragOffset.height)
-                .simultaneousGesture(makeDismissGesture(geo: geo))
+                .gesture(makeDismissGesture(geo: geo))
             }
             .overlay(alignment: .top) {
                 controlsBar(topInset: geo.safeAreaInsets.top, geo: geo)

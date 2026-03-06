@@ -284,6 +284,7 @@ struct ChatView: View {
         .overFullScreenCover(item: $fullscreenImageAttachment) { attachment in
             FullscreenImageViewer(
                 attachment: attachment,
+                sourceFrame: ImageViewerTransition.sourceFrame,
                 onDismiss: { fullscreenImageAttachment = nil }
             )
         }
