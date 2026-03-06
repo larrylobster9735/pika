@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var navPath: [Screen] = []
     @State private var isCallScreenPresented = false
     @State private var videoPipeline = VideoCallPipeline()
+    @State private var pendingPeerProfileAction: PendingPeerProfileAction?
 
     var body: some View {
         WithPerceptionTracking {
@@ -35,6 +36,7 @@ struct ContentView: View {
                                 manager: manager,
                                 state: appState,
                                 screen: router.defaultScreen,
+                                onSetPendingPeerProfileAction: { pendingPeerProfileAction = $0 },
                                 onOpenCallScreen: {
                                     isCallScreenPresented = true
                                 }
@@ -44,6 +46,7 @@ struct ContentView: View {
                                     manager: manager,
                                     state: appState,
                                     screen: screen,
+                                    onSetPendingPeerProfileAction: { pendingPeerProfileAction = $0 },
                                     onOpenCallScreen: {
                                         isCallScreenPresented = true
                                     }
@@ -87,6 +90,7 @@ struct ContentView: View {
             }
             .onChangeCompat(of: manager.state.currentChat?.chatId) { newChatId in
                 AppDelegate.activeChatId = newChatId
+                handlePendingPeerProfileAction()
             }
             .onChangeCompat(of: manager.state.activeCall, withOld: { old, new in
                 videoPipeline.syncWithCallState(new)
@@ -182,6 +186,25 @@ struct ContentView: View {
             )
         }
     }
+
+    private func handlePendingPeerProfileAction() {
+        guard let pendingPeerProfileAction,
+              let currentChat = manager.state.currentChat,
+              !currentChat.isGroup,
+              let peer = currentChat.members.first,
+              peer.npub == pendingPeerProfileAction.npub else {
+            return
+        }
+
+        switch pendingPeerProfileAction.kind {
+        case .audio:
+            manager.dispatch(.startCall(chatId: currentChat.chatId))
+        case .video:
+            manager.dispatch(.startVideoCall(chatId: currentChat.chatId))
+        }
+
+        self.pendingPeerProfileAction = nil
+    }
 }
 
 @MainActor
@@ -190,6 +213,7 @@ private func screenView(
     manager: AppManager,
     state: AppState,
     screen: Screen,
+    onSetPendingPeerProfileAction: @escaping @MainActor (PendingPeerProfileAction?) -> Void,
     onOpenCallScreen: @escaping @MainActor () -> Void
 ) -> some View {
     switch screen {
@@ -339,8 +363,36 @@ private func screenView(
             set: { if !$0 { manager.dispatch(.closePeerProfile) } }
         )) {
             if let profile = state.peerProfile {
+                let directChatId = directMessageChatId(for: profile, in: state)
                 PeerProfileSheet(
                     profile: profile,
+                    onMessage: {
+                        onSetPendingPeerProfileAction(nil)
+                        if let directChatId {
+                            manager.dispatch(.openChat(chatId: directChatId))
+                        } else {
+                            manager.dispatch(.createChat(peerNpub: profile.npub))
+                        }
+                        manager.dispatch(.closePeerProfile)
+                    },
+                    onStartCall: {
+                        if let directChatId {
+                            manager.dispatch(.startCall(chatId: directChatId))
+                        } else {
+                            onSetPendingPeerProfileAction(.init(kind: .audio, npub: profile.npub))
+                            manager.dispatch(.createChat(peerNpub: profile.npub))
+                        }
+                        manager.dispatch(.closePeerProfile)
+                    },
+                    onStartVideoCall: {
+                        if let directChatId {
+                            manager.dispatch(.startVideoCall(chatId: directChatId))
+                        } else {
+                            onSetPendingPeerProfileAction(.init(kind: .video, npub: profile.npub))
+                            manager.dispatch(.createChat(peerNpub: profile.npub))
+                        }
+                        manager.dispatch(.closePeerProfile)
+                    },
                     onFollow: { manager.dispatch(.followUser(pubkey: profile.pubkey)) },
                     onUnfollow: { manager.dispatch(.unfollowUser(pubkey: profile.pubkey)) },
                     onOpenMediaGallery: {
@@ -389,6 +441,21 @@ private func screenView(
             if let profile = state.peerProfile {
                 PeerProfileSheet(
                     profile: profile,
+                    onMessage: {
+                        onSetPendingPeerProfileAction(nil)
+                        manager.dispatch(.createChat(peerNpub: profile.npub))
+                        manager.dispatch(.closePeerProfile)
+                    },
+                    onStartCall: {
+                        onSetPendingPeerProfileAction(.init(kind: .audio, npub: profile.npub))
+                        manager.dispatch(.createChat(peerNpub: profile.npub))
+                        manager.dispatch(.closePeerProfile)
+                    },
+                    onStartVideoCall: {
+                        onSetPendingPeerProfileAction(.init(kind: .video, npub: profile.npub))
+                        manager.dispatch(.createChat(peerNpub: profile.npub))
+                        manager.dispatch(.closePeerProfile)
+                    },
                     onFollow: { manager.dispatch(.followUser(pubkey: profile.pubkey)) },
                     onUnfollow: { manager.dispatch(.unfollowUser(pubkey: profile.pubkey)) },
                     onOpenMediaGallery: nil,
@@ -459,6 +526,16 @@ private func groupInfoState(from state: AppState) -> GroupInfoViewState {
     GroupInfoViewState(chat: state.currentChat)
 }
 
+private struct PendingPeerProfileAction: Equatable {
+    enum Kind: Equatable {
+        case audio
+        case video
+    }
+
+    let kind: Kind
+    let npub: String
+}
+
 /// Remove delivered notifications that belong to the given chat.
 func clearDeliveredNotifications(forChatId chatId: String) {
     let center = UNUserNotificationCenter.current()
@@ -480,6 +557,17 @@ private func myNpub(from state: AppState) -> String? {
     default:
         return nil
     }
+}
+
+@MainActor
+private func directMessageChatId(for profile: PeerProfileState, in state: AppState) -> String? {
+    guard let currentChat = state.currentChat,
+          !currentChat.isGroup,
+          currentChat.members.first?.pubkey == profile.pubkey else {
+        return nil
+    }
+
+    return currentChat.chatId
 }
 
 @MainActor

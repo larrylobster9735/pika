@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct LoginView: View {
     let state: LoginViewState
@@ -67,12 +68,7 @@ struct LoginView: View {
                 }
                 .padding(.vertical, 4)
 
-                SecureField("Enter your nsec", text: $nsecInput)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(anyBusy)
-                    .accessibilityIdentifier(TestIds.loginNsecInput)
+                privateKeyInput(isDisabled: anyBusy)
 
                 Button {
                     onLogin(nsecInput)
@@ -106,12 +102,12 @@ struct LoginView: View {
                 }
 
                 if showAdvanced {
-                    TextField("Enter bunker URI", text: $bunkerUriInput)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(anyBusy)
-                        .accessibilityIdentifier(TestIds.loginBunkerUriInput)
+                    textInputCard(
+                        prompt: "Enter bunker URI",
+                        text: $bunkerUriInput,
+                        isDisabled: anyBusy,
+                        accessibilityIdentifier: TestIds.loginBunkerUriInput
+                    )
 
                     Button {
                         onBunkerLogin(bunkerUriInput)
@@ -156,6 +152,63 @@ struct LoginView: View {
             .padding(.bottom, 32)
         }
         .padding(.horizontal, 28)
+    }
+
+    private func privateKeyInput(isDisabled: Bool) -> some View {
+        HStack(spacing: 12) {
+            SecureField("Enter your private key (nsec123...)", text: $nsecInput)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.password)
+                .disabled(isDisabled)
+                .accessibilityIdentifier(TestIds.loginNsecInput)
+
+            Button("Paste") {
+                nsecInput = UIPasteboard.general.string?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.tint)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+            .background(Color(.secondarySystemBackground), in: Capsule())
+            .disabled(isDisabled)
+            .accessibilityIdentifier(TestIds.loginPastePrivateKey)
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .frame(minHeight: 56)
+        .background(inputBackground)
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color(.separator).opacity(0.18), lineWidth: 0.8)
+        }
+        .shadow(color: .black.opacity(0.04), radius: 10, y: 2)
+    }
+
+    private func textInputCard(
+        prompt: String,
+        text: Binding<String>,
+        isDisabled: Bool,
+        accessibilityIdentifier: String
+    ) -> some View {
+        TextField(prompt, text: text)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .disabled(isDisabled)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 56)
+            .background(inputBackground)
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.18), lineWidth: 0.8)
+            }
+            .shadow(color: .black.opacity(0.04), radius: 10, y: 2)
+            .accessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    private var inputBackground: some ShapeStyle {
+        Color(.systemBackground)
     }
 }
 

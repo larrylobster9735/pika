@@ -81,191 +81,145 @@ struct MyNpubQrSheet: View {
     }
 
     @ViewBuilder
-    private var photoSection: some View {
-        Section {
-            VStack(spacing: 12) {
-                AvatarView(
-                    name: profile.name.isEmpty ? nil : profile.name,
-                    npub: npub,
-                    pictureUrl: profile.pictureUrl,
-                    size: 96
-                )
-
-                if isLoadingPhoto {
-                    ProgressView()
-                }
-
-                PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                    Label("Upload New Photo", systemImage: "photo")
-                }
-                .buttonStyle(.bordered)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
-        }
-    }
-
-    @ViewBuilder
-    private var profileSection: some View {
-        Section("Profile") {
-            TextField("Name", text: $nameDraft)
-                .textInputAutocapitalization(.words)
-                .autocorrectionDisabled(false)
-
-            TextField("About", text: $aboutDraft, axis: .vertical)
-                .lineLimit(3...6)
-
-            Button("Save Changes") {
-                onSaveProfile(nameDraft, aboutDraft)
-            }
-            .disabled(!hasProfileChanges)
-        }
-    }
-
-    @ViewBuilder
-    private var npubSection: some View {
-        Section {
-            HStack(alignment: .center, spacing: 12) {
-                Text(npub)
-                    .font(.system(.footnote, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .accessibilityIdentifier(TestIds.chatListMyNpubValue)
-
-                Spacer()
-
-                copyAccessory(
-                    copied: didCopyNpub,
-                    testId: TestIds.chatListMyNpubCopy,
-                    accessibilityLabel: didCopyNpub ? "Copied npub" : "Copy npub"
-                ) {
-                    copyToClipboard(npub, kind: .npub)
+    private var profileEditor: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionHeader("Profile")
+            card {
+                VStack(spacing: 0) {
+                    labeledTextFieldRow(label: "Name", prompt: "Your display name", text: $nameDraft)
+                    Divider()
+                    labeledAboutRow
                 }
             }
-        } header: {
-            Text("Public Key")
-        } footer: {
-            Text("Share your npub with people you trust.")
-        }
-    }
-
-    @ViewBuilder
-    private var qrSection: some View {
-        Section("QR Code") {
-            if let img = qrImage(from: npub) {
-                HStack {
-                    Spacer()
-                    Image(uiImage: img)
-                        .interpolation(.none)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 220, height: 220)
-                        .background(.white)
-                        .clipShape(.rect(cornerRadius: 12))
-                        .accessibilityIdentifier(TestIds.chatListMyNpubQr)
-                    Spacer()
-                }
-            } else {
-                Text("Could not generate QR code.")
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func nsecSection(_ nsec: String) -> some View {
-        Section {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                if showNsec {
-                    Text(nsec)
-                        .font(.system(.footnote, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                } else {
-                    Text(String(repeating: "•", count: 24))
-                        .font(.system(.footnote, design: .monospaced))
-                }
-
-                Spacer()
-
+            if hasProfileChanges {
                 Button {
-                    showNsec.toggle()
+                    onSaveProfile(nameDraft, aboutDraft)
                 } label: {
-                    Image(systemName: showNsec ? "eye.slash" : "eye")
+                    Text("Save Changes")
+                        .frame(maxWidth: .infinity)
                 }
-                .accessibilityIdentifier(TestIds.myNpubNsecToggle)
-            }
-            .accessibilityIdentifier(TestIds.myNpubNsecValue)
-
-            HStack {
-                Spacer()
-                copyAccessory(
-                    copied: didCopyNsec,
-                    testId: TestIds.myNpubNsecCopy,
-                    accessibilityLabel: didCopyNsec ? "Copied nsec" : "Copy nsec"
-                ) {
-                    copyToClipboard(nsec, kind: .nsec)
-                }
-            }
-        } header: {
-            Text("Private Key (nsec)")
-        } footer: {
-            Text("Keep this private. Anyone with your nsec can control your account.")
-        }
-    }
-
-    @ViewBuilder
-    private var logoutSection: some View {
-        Section {
-            Button("Log out", role: .destructive) {
-                showLogoutConfirm = true
-            }
-            .accessibilityIdentifier(TestIds.chatListLogout)
-        } footer: {
-            Text("You can log back in with your nsec.")
-        }
-    }
-
-    @ViewBuilder
-    private var notificationsSection: some View {
-        Section {
-            NavigationLink("Notifications") {
-                NotificationSettingsView()
+                .buttonStyle(.borderedProminent)
             }
         }
     }
 
     @ViewBuilder
-    private var appVersionSection: some View {
-        Section {
-            HStack(spacing: 12) {
-                Button {
-                    handleAppVersionTap()
-                } label: {
-                    Text(appVersionDisplay)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier(TestIds.myProfileAppVersionValue)
-                .accessibilityLabel("Copy app version")
+    private var shareProfileSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Profile code")
+            card {
+                VStack(spacing: 0) {
+                    if let img = qrImage(from: npub) {
+                        Image(uiImage: img)
+                            .interpolation(.none)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 220, height: 220)
+                            .background(.white)
+                            .clipShape(.rect(cornerRadius: 12))
+                            .padding(.vertical, 18)
+                            .accessibilityIdentifier(TestIds.chatListMyNpubQr)
+                    } else {
+                        Text("Could not generate QR code.")
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 24)
+                    }
 
-                copyAccessory(
-                    copied: didCopyAppVersion,
-                    testId: TestIds.myProfileAppVersionCopy,
-                    accessibilityLabel: didCopyAppVersion ? "Copied app version" : "Copy app version"
-                ) {
-                    copyToClipboard(appVersionDisplay, kind: .appVersion)
+                    Divider()
+
+                    publicKeyRow(
+                        npub,
+                        copied: didCopyNpub,
+                        testId: TestIds.chatListMyNpubCopy,
+                        accessibilityLabel: didCopyNpub ? "Copied code" : "Copy code"
+                    ) {
+                        copyToClipboard(npub, kind: .npub)
+                    }
                 }
             }
-        } header: {
-            Text("App Version")
-        } footer: {
-            if developerModeEnabled {
-                Text("Developer mode enabled.")
-            } else {
-                Text("Use copy when sharing troubleshooting details.")
+
+            Text("Share this code so people can start a conversation with you.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+        }
+    }
+
+    @ViewBuilder
+    private func accountKeySection(_ nsec: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Account Private Key")
+            card {
+                HStack(spacing: 12) {
+                    Group {
+                        if showNsec {
+                            Text(nsec)
+                                .font(.system(.footnote, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        } else {
+                            Text(verbatim: String(repeating: "•", count: 24))
+                                .font(.system(.footnote, design: .monospaced))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    HStack(spacing: 8) {
+                        Button {
+                            showNsec.toggle()
+                        } label: {
+                            Image(systemName: showNsec ? "eye.slash" : "eye")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.tint)
+                                .frame(width: 32, height: 32)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier(TestIds.myNpubNsecToggle)
+
+                        copyIconButton(
+                            copied: didCopyNsec,
+                            testId: TestIds.myNpubNsecCopy,
+                            accessibilityLabel: didCopyNsec ? "Copied private key" : "Copy private key"
+                        ) {
+                            copyToClipboard(nsec, kind: .nsec)
+                        }
+                    }
+                }
+                .padding(.leading, 16)
+                .padding(.trailing, 12)
+                .frame(minHeight: 56)
+                .accessibilityIdentifier(TestIds.myNpubNsecValue)
+            }
+
+            Text("Keep this private. Anyone with your account key can message as you.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+        }
+    }
+
+    @ViewBuilder
+    private var settingsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Settings")
+            card {
+                VStack(spacing: 0) {
+                    NavigationLink {
+                        NotificationSettingsView()
+                    } label: {
+                        settingsRow(title: "Notifications")
+                    }
+                    Divider()
+                    appVersionRow
+                    Divider()
+                    Button {
+                        showLogoutConfirm = true
+                    } label: {
+                        settingsRow(title: "Log out", tint: .red, showsChevron: false)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier(TestIds.chatListLogout)
+                }
             }
         }
     }
@@ -273,49 +227,62 @@ struct MyNpubQrSheet: View {
     @ViewBuilder
     private var developerSection: some View {
         if developerModeEnabled {
-            Section {
-                Button("Wipe Profile Cache") {
-                    onWipeProfileCache()
+            VStack(alignment: .leading, spacing: 8) {
+                sectionHeader("Developer Mode")
+                card {
+                    VStack(spacing: 0) {
+                        developerButton("Wipe Profile Cache") {
+                            onWipeProfileCache()
+                        }
+                        Divider()
+                        developerButton("Wipe Media Cache") {
+                            onWipeMediaCache()
+                        }
+                        Divider()
+                        developerButton("Wipe All Local Data", role: .destructive) {
+                            showWipeLocalDataConfirm = true
+                        }
+                    }
                 }
-                Button("Wipe Media Cache") {
-                    onWipeMediaCache()
-                }
-                Button("Wipe All Local Data", role: .destructive) {
-                    showWipeLocalDataConfirm = true
-                }
-            } header: {
-                Text("Developer Mode")
-            } footer: {
                 Text("Wipe Profile Cache clears cached profiles and pictures. Wipe Media Cache clears the media DB and downloaded files. Wipe All Local Data deletes everything and logs out.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
             }
         }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        photoSection
-        profileSection
-        npubSection
-        qrSection
-        if let nsec = nsecProvider() {
-            nsecSection(nsec)
-        }
-        appVersionSection
-        developerSection
-        notificationsSection
-        logoutSection
-    }
-
     var body: some View {
         NavigationStack {
-            List { content }
-            .listStyle(.insetGrouped)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    profileHeader
+                    profileEditor
+                    shareProfileSection
+                    if let nsec = nsecProvider() {
+                        accountKeySection(nsec)
+                    }
+                    settingsSection
+                    developerSection
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 20)
+                .padding(.bottom, 32)
+            }
+            .background(Color(.systemGroupedBackground))
             .navigationTitle("Profile")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Close") {
+                    Button {
                         dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 30, height: 30)
+                            .background(Color(.tertiarySystemFill), in: Circle())
                     }
+                    .buttonStyle(.plain)
                     .accessibilityIdentifier(TestIds.chatListMyNpubClose)
                 }
             }
@@ -344,7 +311,7 @@ struct MyNpubQrSheet: View {
                 .accessibilityIdentifier(TestIds.chatListLogoutConfirm)
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("You can log back in with your nsec.")
+                Text("You can log back in with your private key.")
             }
             .confirmationDialog("Wipe all local data?", isPresented: $showWipeLocalDataConfirm, titleVisibility: .visible) {
                 Button("Wipe All Local Data", role: .destructive) {
@@ -359,6 +326,205 @@ struct MyNpubQrSheet: View {
         .overlay(alignment: .bottom) {
             copyToastOverlay
         }
+    }
+
+    private var profileHeader: some View {
+        VStack(spacing: 10) {
+            ZStack(alignment: .bottomTrailing) {
+                AvatarView(
+                    name: profile.name.isEmpty ? nil : profile.name,
+                    npub: npub,
+                    pictureUrl: profile.pictureUrl,
+                    size: 112
+                )
+
+                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    Image(systemName: "pencil")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.tint)
+                        .frame(width: 30, height: 30)
+                        .background(Color(.systemBackground), in: Circle())
+                        .overlay {
+                            Circle()
+                                .stroke(Color(.separator), lineWidth: 0.5)
+                        }
+                        .shadow(color: .black.opacity(0.08), radius: 8, y: 2)
+                }
+                .buttonStyle(.plain)
+                .offset(x: -4, y: -4)
+            }
+            .frame(maxWidth: .infinity)
+
+            if isLoadingPhoto {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Text("Tap to change photo")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var labeledAboutRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("Bio")
+                .foregroundStyle(.secondary)
+                .frame(width: 72, alignment: .leading)
+                .padding(.top, 14)
+
+            TextField("Write something about yourself", text: $aboutDraft, axis: .vertical)
+                .font(.body)
+                .lineLimit(3...6)
+                .padding(.vertical, 12)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var appVersionRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                handleAppVersionTap()
+            } label: {
+                HStack {
+                    Text("App version")
+                        .font(.body)
+                        .fontWeight(.regular)
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Text(appVersionDisplay)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .font(.body)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier(TestIds.myProfileAppVersionValue)
+
+            copyIconButton(
+                copied: didCopyAppVersion,
+                testId: TestIds.myProfileAppVersionCopy,
+                accessibilityLabel: didCopyAppVersion ? "Copied app version" : "Copy app version"
+            ) {
+                copyToClipboard(appVersionDisplay, kind: .appVersion)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 48)
+    }
+
+    private func labeledTextFieldRow(label: String, prompt: String, text: Binding<String>) -> some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 72, alignment: .leading)
+
+            TextField(prompt, text: text)
+                .font(.body)
+                .textInputAutocapitalization(.words)
+                .autocorrectionDisabled(false)
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 48)
+    }
+
+    private func settingsRow(title: String, tint: Color = .primary, showsChevron: Bool = true) -> some View {
+        HStack {
+            Text(title)
+                .font(.body)
+                .fontWeight(.regular)
+                .foregroundStyle(tint)
+            Spacer()
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 48)
+        .contentShape(Rectangle())
+    }
+
+    private func developerButton(
+        _ title: String,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            HStack {
+                Text(title)
+                    .foregroundStyle(role == .destructive ? .red : .primary)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+    }
+
+    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0, content: content)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.18), lineWidth: 0.8)
+            }
+            .shadow(color: .black.opacity(0.04), radius: 10, y: 2)
+    }
+
+    private func copyIconButton(
+        copied: Bool,
+        testId: String,
+        accessibilityLabel: String,
+        onCopy: @escaping () -> Void
+    ) -> some View {
+        Button(action: onCopy) {
+            Image(systemName: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(copied ? Color.green : Color.accentColor)
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(testId)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func publicKeyRow(
+        _ value: String,
+        copied: Bool,
+        testId: String,
+        accessibilityLabel: String,
+        onCopy: @escaping () -> Void
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text(value)
+                .font(.system(.footnote, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier(TestIds.chatListMyNpubValue)
+
+            copyIconButton(
+                copied: copied,
+                testId: testId,
+                accessibilityLabel: accessibilityLabel,
+                onCopy: onCopy
+            )
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .frame(minHeight: 56)
     }
 
     private func syncDraftsIfNeeded(force: Bool) {
