@@ -17,7 +17,7 @@ settings:
     # PIKA_APP_GROUP: derived from bundle ID. Override via xcodebuild if needed.
     PIKA_APP_GROUP: "group.$(PIKA_APP_BUNDLE_ID)"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: 1.0
+    MARKETING_VERSION: 1.0.0
     CURRENT_PROJECT_VERSION: 1
     SWIFT_VERSION: 5.0
 
@@ -63,8 +63,12 @@ targets:
       - target: PikaNotificationService
       - target: PikaShareExtension
     postBuildScripts:
-      - name: "Stamp build number"
+      - name: "Stamp version and build number"
         script: |
+          if [ -f "${PROJECT_DIR}/../VERSION" ]; then
+            APP_VERSION=$(cat "${PROJECT_DIR}/../VERSION" | tr -d '[:space:]')
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+          fi
           if [ -f "${PROJECT_DIR}/.build-number" ]; then
             BUILD_NUMBER=$(cat "${PROJECT_DIR}/.build-number")
           else
@@ -93,8 +97,12 @@ targets:
       - framework: Frameworks/PikaNSE.xcframework
         embed: false
     postBuildScripts:
-      - name: "Stamp build number"
+      - name: "Stamp version and build number"
         script: |
+          if [ -f "${PROJECT_DIR}/../VERSION" ]; then
+            APP_VERSION=$(cat "${PROJECT_DIR}/../VERSION" | tr -d '[:space:]')
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+          fi
           if [ -f "${PROJECT_DIR}/.build-number" ]; then
             BUILD_NUMBER=$(cat "${PROJECT_DIR}/.build-number")
           else
@@ -123,8 +131,12 @@ targets:
       - framework: Frameworks/PikaShare.xcframework
         embed: false
     postBuildScripts:
-      - name: "Stamp build number"
+      - name: "Stamp version and build number"
         script: |
+          if [ -f "${PROJECT_DIR}/../VERSION" ]; then
+            APP_VERSION=$(cat "${PROJECT_DIR}/../VERSION" | tr -d '[:space:]')
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+          fi
           if [ -f "${PROJECT_DIR}/.build-number" ]; then
             BUILD_NUMBER=$(cat "${PROJECT_DIR}/.build-number")
           else

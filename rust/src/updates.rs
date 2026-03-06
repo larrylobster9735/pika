@@ -254,6 +254,11 @@ pub enum InternalEvent {
         payload: Vec<u8>,
     },
 
+    // Min-version check result from server.
+    MinVersionChecked {
+        update_required: bool,
+    },
+
     // Deferred session initialization work (yields to pending user actions first).
     CompleteSessionInit,
 

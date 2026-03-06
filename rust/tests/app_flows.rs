@@ -18,13 +18,26 @@ fn wait_until(what: &str, timeout: Duration, f: impl FnMut() -> bool) {
 }
 
 fn write_config(data_dir: &str, disable_network: bool) {
-    write_config_with_external_signer(data_dir, disable_network, None);
+    write_config_ext(data_dir, disable_network, None, None);
+}
+
+fn write_config_with_notification_url(data_dir: &str, notification_url: &str) {
+    write_config_ext(data_dir, false, None, Some(notification_url));
 }
 
 fn write_config_with_external_signer(
     data_dir: &str,
     disable_network: bool,
     enable_external_signer: Option<bool>,
+) {
+    write_config_ext(data_dir, disable_network, enable_external_signer, None);
+}
+
+fn write_config_ext(
+    data_dir: &str,
+    disable_network: bool,
+    enable_external_signer: Option<bool>,
+    notification_url: Option<&str>,
 ) {
     let path = std::path::Path::new(data_dir).join("pika_config.json");
     let mut v = serde_json::json!({
@@ -35,6 +48,9 @@ fn write_config_with_external_signer(
     });
     if let Some(enabled) = enable_external_signer {
         v["enable_external_signer"] = serde_json::Value::Bool(enabled);
+    }
+    if let Some(url) = notification_url {
+        v["notification_url"] = serde_json::Value::String(url.to_string());
     }
     std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
 }
@@ -331,7 +347,11 @@ impl BunkerSignerConnector for SequenceBunkerSignerConnector {
 fn create_account_navigates_to_chat_list() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     let collector = Collector::new();
     app.listen_for_updates(Box::new(collector.clone()));
 
@@ -365,7 +385,11 @@ fn create_account_navigates_to_chat_list() {
 fn push_and_pop_stack_updates_router() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -389,7 +413,11 @@ fn push_and_pop_stack_updates_router() {
 fn send_message_creates_pending_then_sent() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -476,7 +504,11 @@ fn send_message_creates_pending_then_sent() {
 fn send_message_with_unresolvable_reply_falls_back_to_plain_message() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -540,7 +572,11 @@ fn send_message_with_unresolvable_reply_falls_back_to_plain_message() {
 fn start_call_toggle_mute_and_end_transitions_state() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -595,7 +631,11 @@ fn start_call_toggle_mute_and_end_transitions_state() {
 fn logout_resets_state() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -635,7 +675,11 @@ fn wipe_local_data_removes_persistent_files() {
     let data_dir = dir.path().to_path_buf();
     write_config(&data_dir.to_string_lossy(), true);
 
-    let app = FfiApp::new(data_dir.to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        data_dir.to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -692,7 +736,7 @@ fn restore_session_recovers_chat_history() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config(&data_dir, true);
 
-    let app = FfiApp::new(data_dir.clone(), String::new());
+    let app = FfiApp::new(data_dir.clone(), String::new(), String::new());
     let collector = Collector::new();
     app.listen_for_updates(Box::new(collector.clone()));
     app.dispatch(AppAction::CreateAccount);
@@ -745,7 +789,7 @@ fn restore_session_recovers_chat_history() {
     };
 
     // New process instance restores from the same encrypted per-identity DB.
-    let app2 = FfiApp::new(data_dir, String::new());
+    let app2 = FfiApp::new(data_dir, String::new(), String::new());
     app2.dispatch(AppAction::RestoreSession { nsec });
     wait_until(
         "restored session logged in",
@@ -783,7 +827,11 @@ fn restore_session_recovers_chat_history() {
 fn paging_loads_older_messages_in_pages() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -906,7 +954,11 @@ fn paging_loads_older_messages_in_pages() {
 fn restore_session_with_invalid_nsec_shows_toast_and_stays_logged_out() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     app.dispatch(AppAction::RestoreSession {
         nsec: "not-a-real-nsec".into(),
@@ -929,7 +981,11 @@ fn restore_session_with_invalid_nsec_shows_toast_and_stays_logged_out() {
 fn create_chat_with_invalid_peer_npub_shows_toast_and_does_not_navigate() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
@@ -960,7 +1016,7 @@ fn begin_external_signer_login_is_owned_by_rust_and_logs_in() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: true,
         pubkey: Some("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into()),
@@ -1010,7 +1066,7 @@ fn begin_external_signer_login_failure_shows_rust_toast_and_clears_busy() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1044,7 +1100,7 @@ fn restore_session_external_signer_keeps_current_user_in_auth_state() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1083,7 +1139,7 @@ fn begin_bunker_login_is_owned_by_rust_and_emits_descriptor_update() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let collector = Collector::new();
     app.listen_for_updates(Box::new(collector.clone()));
 
@@ -1150,7 +1206,7 @@ fn begin_bunker_login_failure_shows_toast_and_clears_busy() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let connector = MockBunkerSignerConnector::failure(
         BunkerConnectErrorKind::InvalidUri,
         "invalid bunker URI",
@@ -1180,7 +1236,7 @@ fn begin_nostr_connect_login_launches_uri_and_logs_in() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1254,7 +1310,7 @@ fn begin_nostr_connect_login_retries_bunker_without_secret_on_new_secret_reject(
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1315,7 +1371,7 @@ fn begin_nostr_connect_login_does_not_retry_without_new_secret_marker() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1376,7 +1432,7 @@ fn begin_nostr_connect_login_reuses_persisted_secret() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir.clone(), String::new());
+    let app = FfiApp::new(data_dir.clone(), String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1415,7 +1471,7 @@ fn begin_nostr_connect_login_reuses_persisted_secret() {
 
     drop(app);
 
-    let app_after_restart = FfiApp::new(data_dir, String::new());
+    let app_after_restart = FfiApp::new(data_dir, String::new(), String::new());
     let bridge_after_restart = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1448,7 +1504,7 @@ fn reset_nostr_connect_pairing_rotates_persisted_client_pair() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1503,7 +1559,7 @@ fn pending_nostr_connect_login_survives_app_restart() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir.clone(), String::new());
+    let app = FfiApp::new(data_dir.clone(), String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1522,7 +1578,7 @@ fn pending_nostr_connect_login_survives_app_restart() {
 
     drop(app);
 
-    let app_after_restart = FfiApp::new(data_dir, String::new());
+    let app_after_restart = FfiApp::new(data_dir, String::new(), String::new());
     let canonical_bunker_uri =
         "bunker://79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798?relay=wss://relay.example.com";
     let (connector, _expected_user_pubkey) =
@@ -1557,7 +1613,7 @@ fn begin_nostr_connect_login_without_bridge_shows_toast() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     app.dispatch(AppAction::BeginNostrConnectLogin);
 
     wait_until("toast shown", Duration::from_secs(10), || {
@@ -1579,7 +1635,7 @@ fn nostr_connect_callback_without_pending_is_noop() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     app.dispatch(AppAction::NostrConnectCallback {
         url: "pika://nostrconnect-return".into(),
     });
@@ -1597,7 +1653,7 @@ fn nostr_connect_callback_without_connect_response_does_not_log_in() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1635,7 +1691,7 @@ fn nostr_connect_connect_response_without_callback_does_not_log_in() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1673,7 +1729,7 @@ fn foregrounded_continues_pending_nostr_connect_login() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let bridge = MockExternalSignerBridge::new(ExternalSignerHandshakeResult {
         ok: false,
         pubkey: None,
@@ -1720,7 +1776,7 @@ fn restore_session_bunker_uses_stored_client_key_and_logs_in() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     let canonical_bunker_uri =
         "bunker://79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798?relay=wss://relay.restore";
     let (connector, _expected_user_pubkey) =
@@ -1764,7 +1820,7 @@ fn restore_session_bunker_with_invalid_client_key_shows_toast() {
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config_with_external_signer(&data_dir, true, Some(true));
 
-    let app = FfiApp::new(data_dir, String::new());
+    let app = FfiApp::new(data_dir, String::new(), String::new());
     app.dispatch(AppAction::RestoreSessionBunker {
         bunker_uri:
             "bunker://79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798?relay=wss://relay.example.com"
@@ -1790,7 +1846,7 @@ fn react_to_message_shows_reaction_on_message() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().to_string_lossy().to_string();
     write_config(&data_dir, true);
-    let app = FfiApp::new(data_dir.clone(), String::new());
+    let app = FfiApp::new(data_dir.clone(), String::new(), String::new());
     let collector = Collector::new();
     app.listen_for_updates(Box::new(collector.clone()));
     app.dispatch(AppAction::CreateAccount);
@@ -1926,7 +1982,7 @@ fn react_to_message_shows_reaction_on_message() {
             .expect("missing AccountCreated update with nsec")
     };
 
-    let app2 = FfiApp::new(data_dir, String::new());
+    let app2 = FfiApp::new(data_dir, String::new(), String::new());
     app2.dispatch(AppAction::RestoreSession { nsec });
     wait_until(
         "restored session logged in",
@@ -1970,7 +2026,11 @@ fn react_to_message_shows_reaction_on_message() {
 fn reactions_survive_interleaved_typing_indicators() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), true);
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })
@@ -2054,4 +2114,61 @@ fn reactions_survive_interleaved_typing_indicators() {
     assert!(msg.reactions[0].reacted_by_me);
     // Typing indicators must not leak as messages.
     assert_eq!(chat.messages.len(), 1);
+}
+
+#[test]
+fn min_version_check_e2e() {
+    // Start one pika-server with MIN_APP_VERSION=1.0.0.
+    std::env::set_var("MIN_APP_VERSION", "1.0.0");
+    let infra = support::TestInfra::start_backend();
+    std::env::remove_var("MIN_APP_VERSION");
+    let server_url = infra.server_url.as_ref().expect("server_url");
+
+    // --- Outdated app: version below minimum -> update_required = true ---
+    {
+        let dir = tempdir().unwrap();
+        write_config_with_notification_url(&dir.path().to_string_lossy(), server_url);
+        let app = FfiApp::new(
+            dir.path().to_string_lossy().to_string(),
+            String::new(),
+            "0.1.0".to_string(),
+        );
+
+        assert!(!app.state().update_required);
+        app.dispatch(AppAction::Foregrounded);
+        wait_until("update_required set", Duration::from_secs(10), || {
+            app.state().update_required
+        });
+        assert!(app.state().update_required);
+    }
+
+    // --- Current app: version matches minimum -> update_required = false ---
+    {
+        let dir = tempdir().unwrap();
+        write_config_with_notification_url(&dir.path().to_string_lossy(), server_url);
+        let app = FfiApp::new(
+            dir.path().to_string_lossy().to_string(),
+            String::new(),
+            "1.0.0".to_string(),
+        );
+
+        app.dispatch(AppAction::Foregrounded);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!app.state().update_required);
+    }
+
+    // --- Server down: unreachable -> update_required stays false ---
+    {
+        let dir = tempdir().unwrap();
+        write_config_with_notification_url(&dir.path().to_string_lossy(), "http://127.0.0.1:1");
+        let app = FfiApp::new(
+            dir.path().to_string_lossy().to_string(),
+            String::new(),
+            "0.1.0".to_string(),
+        );
+
+        app.dispatch(AppAction::Foregrounded);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(!app.state().update_required);
+    }
 }

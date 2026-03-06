@@ -58,8 +58,16 @@ fn alice_sends_bob_receives() {
     write_config(&dir_a.path().to_string_lossy(), &infra.relay_url);
     write_config(&dir_b.path().to_string_lossy(), &infra.relay_url);
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     alice.dispatch(AppAction::CreateAccount);
     bob.dispatch(AppAction::CreateAccount);
@@ -156,8 +164,16 @@ fn call_invite_with_invalid_relay_auth_is_rejected() {
     write_config(&dir_a.path().to_string_lossy(), &infra.relay_url);
     write_config(&dir_b.path().to_string_lossy(), &infra.relay_url);
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     alice.dispatch(AppAction::CreateAccount);
     bob.dispatch(AppAction::CreateAccount);
@@ -238,7 +254,11 @@ fn optimistic_send_shows_sent_even_on_rejection() {
     let dir = tempdir().unwrap();
     write_config(&dir.path().to_string_lossy(), &infra.relay_url);
 
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
     app.dispatch(AppAction::CreateAccount);
     wait_until("logged in", Duration::from_secs(10), || {
         matches!(app.state().auth, AuthState::LoggedIn { .. })

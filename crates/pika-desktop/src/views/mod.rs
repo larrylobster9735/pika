@@ -14,3 +14,4 @@ pub mod new_group_chat;
 pub mod peer_profile;
 pub mod theme_picker;
 pub mod toast;
+pub mod update_banner;

@@ -16,19 +16,20 @@ pub enum ProfileName {
     Relay,
     RelayMoq,
     RelayBot,
+    RelayServer,
     Backend,
     Postgres,
 }
 
 impl ProfileName {
     pub fn needs_postgres(self) -> bool {
-        matches!(self, Self::Backend | Self::Postgres)
+        matches!(self, Self::Backend | Self::RelayServer | Self::Postgres)
     }
 
     pub fn needs_relay(self) -> bool {
         matches!(
             self,
-            Self::Relay | Self::RelayMoq | Self::RelayBot | Self::Backend
+            Self::Relay | Self::RelayMoq | Self::RelayBot | Self::RelayServer | Self::Backend
         )
     }
 
@@ -37,7 +38,7 @@ impl ProfileName {
     }
 
     pub fn needs_server(self) -> bool {
-        matches!(self, Self::Backend)
+        matches!(self, Self::Backend | Self::RelayServer)
     }
 
     pub fn needs_bot(self) -> bool {
@@ -53,10 +54,11 @@ impl FromStr for ProfileName {
             "relay" => Ok(Self::Relay),
             "relay-moq" => Ok(Self::RelayMoq),
             "relay-bot" => Ok(Self::RelayBot),
+            "relay-server" => Ok(Self::RelayServer),
             "backend" => Ok(Self::Backend),
             "postgres" => Ok(Self::Postgres),
             _ => bail!(
-                "unknown profile: {s} (expected: relay, relay-moq, relay-bot, backend, postgres)"
+                "unknown profile: {s} (expected: relay, relay-moq, relay-bot, relay-server, backend, postgres)"
             ),
         }
     }
@@ -68,6 +70,7 @@ impl std::fmt::Display for ProfileName {
             Self::Relay => write!(f, "relay"),
             Self::RelayMoq => write!(f, "relay-moq"),
             Self::RelayBot => write!(f, "relay-bot"),
+            Self::RelayServer => write!(f, "relay-server"),
             Self::Backend => write!(f, "backend"),
             Self::Postgres => write!(f, "postgres"),
         }

@@ -1,20 +1,37 @@
 package com.pika.app.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.Scaffold
 import com.pika.app.AppManager
 import com.pika.app.rust.AppAction
@@ -56,6 +73,37 @@ fun PikaApp(manager: AppManager) {
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
+        topBar = {
+            if (state.updateRequired) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF2196F3))
+                        .clickable {
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(
+                                "https://play.google.com/store/apps/details?id=${context.packageName}"
+                            ))
+                            context.startActivity(intent)
+                        }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.ArrowUpward,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Text(
+                        "A new version of Pika is available. Please update.",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                    Spacer(Modifier.weight(1f))
+                }
+            }
+        },
     ) { padding ->
         val router = state.router
         when (router.defaultScreen) {

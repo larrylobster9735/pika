@@ -96,8 +96,16 @@ fn call_over_local_moq_relay() {
         moq_url,
     );
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     alice.dispatch(AppAction::CreateAccount);
     bob.dispatch(AppAction::CreateAccount);
@@ -516,6 +524,7 @@ fn run_pikachat_call_test(relay_url: &str, moq_url: &str) {
     let caller = FfiApp::new(
         caller_dir.path().to_string_lossy().to_string(),
         String::new(),
+        String::new(),
     );
 
     caller.dispatch(AppAction::CreateAccount);
@@ -853,7 +862,11 @@ fn call_deployed_bot() {
     let dir = tempdir().unwrap();
     write_config_multi(&dir.path().to_string_lossy(), &relays, &kp_relays, &moq_url);
 
-    let app = FfiApp::new(dir.path().to_string_lossy().to_string(), String::new());
+    let app = FfiApp::new(
+        dir.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     app.dispatch(AppAction::Login { nsec });
     wait_until("logged in", Duration::from_secs(20), || {

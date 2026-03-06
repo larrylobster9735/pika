@@ -215,6 +215,19 @@ pub async fn health_check() -> Result<Json<()>, (StatusCode, String)> {
     Ok(Json(()))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinVersionResponse {
+    pub min_version: String,
+}
+
+pub async fn min_version(
+    Extension(state): Extension<State>,
+) -> Result<Json<MinVersionResponse>, (StatusCode, String)> {
+    Ok(Json(MinVersionResponse {
+        min_version: state.min_app_version.clone(),
+    }))
+}
+
 pub(crate) fn handle_anyhow_error(function: &str, err: anyhow::Error) -> (StatusCode, String) {
     error!("Error in {function}: {err:?}");
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}"))

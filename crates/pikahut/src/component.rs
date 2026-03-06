@@ -361,15 +361,32 @@ impl Server {
         let log_file = std::fs::File::create(&log_path)?;
         let stderr_file = log_file.try_clone()?;
 
-        let child = Command::new("cargo")
-            .args(["run", "-q", "-p", "pika-server"])
+        // Helper: inherit env var if set, otherwise use the provided default.
+        let env_or = |key: &str, default: &str| -> (String, String) {
+            let val = std::env::var(key).unwrap_or_else(|_| default.to_string());
+            (key.to_string(), val)
+        };
+
+        let mut cmd = Command::new("cargo");
+        cmd.args(["run", "-q", "-p", "pika-server"])
             .env("RELAYS", relay_url)
             .env("DATABASE_URL", database_url)
-            .env("NOTIFICATION_PORT", port.to_string())
-            .env(
-                "RUST_LOG",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-            )
+            .env("NOTIFICATION_PORT", port.to_string());
+
+        // Required env vars that may not be set in test/local environments.
+        for (key, val) in [
+            env_or("PIKA_AGENT_MICROVM_SPAWNER_URL", "http://127.0.0.1:1"),
+            env_or(
+                "PIKA_ADMIN_BOOTSTRAP_NPUBS",
+                "npub1u8lnhlw5usp3t9vmpz60ejpyt649z33hu82wc2hpv6m5xdqmuxhs46turz",
+            ),
+            env_or("PIKA_ADMIN_SESSION_SECRET", "pikahut-test-secret-0000"),
+            env_or("RUST_LOG", "info"),
+        ] {
+            cmd.env(key, val);
+        }
+
+        let child = cmd
             .current_dir(&config.workspace_root)
             .stdout(StdStdio::from(log_file))
             .stderr(StdStdio::from(stderr_file))

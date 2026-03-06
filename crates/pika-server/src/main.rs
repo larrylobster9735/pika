@@ -18,7 +18,9 @@ use crate::agent_api_v1_contract::{
 };
 use crate::models::group_subscription::{GroupFilterInfo, GroupSubscription};
 use crate::models::MIGRATIONS;
-use crate::routes::{broadcast, health_check, register, subscribe_groups, unsubscribe_groups};
+use crate::routes::{
+    broadcast, health_check, min_version, register, subscribe_groups, unsubscribe_groups,
+};
 use a2::Client as ApnsClient;
 use axum::http::{StatusCode, Uri};
 use axum::routing::{get, post};
@@ -39,6 +41,7 @@ pub struct State {
     pub apns_topic: String,
     pub channel: Arc<Mutex<watch::Sender<GroupFilterInfo>>>,
     pub admin_config: Arc<admin::AdminConfig>,
+    pub min_app_version: String,
     pub trust_forwarded_host: bool,
 }
 
@@ -171,6 +174,9 @@ async fn main() -> anyhow::Result<()> {
 
     drop(connection);
 
+    let min_app_version = std::env::var("MIN_APP_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    info!(min_app_version = %min_app_version, "Minimum app version configured");
+
     let state = State {
         db_pool: db_pool.clone(),
         apns_client: apns_client.clone(),
@@ -178,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         apns_topic: apns_topic.clone(),
         channel,
         admin_config: Arc::new(admin::AdminConfig::from_env()?),
+        min_app_version,
         trust_forwarded_host: env_truthy("PIKA_TRUST_X_FORWARDED_HOST"),
     };
 
@@ -187,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server_router = Router::new()
         .route("/health-check", get(health_check))
+        .route("/min-version", get(min_version))
         .route("/register", post(register))
         .route("/subscribe-groups", post(subscribe_groups))
         .route("/unsubscribe-groups", post(unsubscribe_groups))

@@ -6,6 +6,7 @@ mod chat_media_db;
 mod config;
 mod group_profile;
 mod interop;
+mod min_version;
 mod profile;
 mod profile_db;
 mod profile_pics;
@@ -745,6 +746,9 @@ pub struct AppCore {
     /// same group is rejected with a toast while the lock is held.
     pending_group_ops: HashSet<String>,
 
+    app_version: String,
+    last_min_version_check: Option<std::time::Instant>,
+
     call_runtime: call_runtime::CallRuntime,
     call_session_params: Option<call_control::CallSessionParams>,
     call_timeline_logged_keys: HashSet<String>,
@@ -758,11 +762,13 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         update_sender: Sender<AppUpdate>,
         core_sender: Sender<CoreMsg>,
         data_dir: String,
         keychain_group: String,
+        app_version: String,
         shared_state: Arc<RwLock<crate::state::AppState>>,
         external_signer_bridge: SharedExternalSignerBridge,
         bunker_signer_connector: SharedBunkerSignerConnector,
@@ -828,6 +834,8 @@ impl AppCore {
             bunker_signer_connector,
             data_dir,
             keychain_group,
+            app_version,
+            last_min_version_check: None,
             config,
             runtime,
             session: None,
@@ -3215,6 +3223,12 @@ impl AppCore {
                 tracing::debug!(event_id = %event.id.to_hex(), "group_message_received");
                 self.handle_group_message(event);
             }
+            InternalEvent::MinVersionChecked { update_required } => {
+                if update_required != self.state.update_required {
+                    self.state.update_required = update_required;
+                    self.emit_state();
+                }
+            }
             InternalEvent::CompleteSessionInit => {
                 self.deferred_session_init_pending = false;
                 if !self.is_logged_in() {
@@ -3228,6 +3242,7 @@ impl AppCore {
                     self.publish_key_package_relays_best_effort();
                     self.ensure_key_package_published_best_effort();
                     self.recompute_subscriptions();
+                    self.check_min_version();
                 }
                 self.register_push_device();
             }
@@ -4661,6 +4676,9 @@ impl AppCore {
             }
             AppAction::Foregrounded => {
                 // Native should send lifecycle signals as actions. Rust owns all state changes.
+                if self.network_enabled() {
+                    self.check_min_version();
+                }
                 if self.is_logged_in() {
                     self.reopen_mdk(); // Pick up NSE's ratchet changes
 
@@ -5804,6 +5822,7 @@ mod tests {
             update_tx,
             core_tx,
             data_dir,
+            String::new(),
             String::new(),
             Arc::new(RwLock::new(crate::state::AppState::empty())),
             external_signer_bridge,

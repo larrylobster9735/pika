@@ -2302,6 +2302,7 @@ mod tests {
             core_tx,
             data_dir,
             String::new(),
+            String::new(),
             std::sync::Arc::new(std::sync::RwLock::new(crate::state::AppState::empty())),
             esb,
             bsc,

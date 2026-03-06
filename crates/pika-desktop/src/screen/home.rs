@@ -910,6 +910,11 @@ impl State {
 
         let mut main_column = column![];
 
+        // ── Update required banner ──────────────────────────────────
+        if state.update_required {
+            main_column = main_column.push(views::update_banner::view());
+        }
+
         // ── Incoming call banner ────────────────────────────────────
         if let Some(call) = &state.active_call {
             if matches!(call.status, CallStatus::Ringing) {

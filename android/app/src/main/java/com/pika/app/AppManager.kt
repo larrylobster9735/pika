@@ -86,6 +86,7 @@ class AppManager private constructor(context: Context) : AppReconciler {
             callTimeline = emptyList(),
             toast = null,
             developerMode = false,
+            updateRequired = false,
             voiceRecording = null,
             mediaGallery = null,
         ),
@@ -98,7 +99,10 @@ class AppManager private constructor(context: Context) : AppReconciler {
         ensureDefaultConfig(appContext)
 
         val dataDir = context.filesDir.absolutePath
-        rust = FfiApp(dataDir, "")
+        val appVersion = try {
+            appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName ?: "0.0.0"
+        } catch (_: Exception) { "0.0.0" }
+        rust = FfiApp(dataDir, "", appVersion)
         rust.setExternalSignerBridge(AmberRustBridge())
         val initial = rust.state()
         state = initial

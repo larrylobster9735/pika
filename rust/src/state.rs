@@ -21,6 +21,7 @@ pub struct AppState {
     pub call_timeline: Vec<CallTimelineEvent>,
     pub toast: Option<String>,
     pub developer_mode: bool,
+    pub update_required: bool,
     pub voice_recording: Option<VoiceRecordingState>,
     pub media_gallery: Option<MediaGalleryState>,
 }
@@ -44,6 +45,7 @@ impl AppState {
             call_timeline: vec![],
             toast: None,
             developer_mode: false,
+            update_required: false,
             voice_recording: None,
             media_gallery: None,
         }

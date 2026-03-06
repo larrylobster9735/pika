@@ -98,8 +98,16 @@ fn group_profile_visible_to_other_member() {
     write_config(&dir_a.path().to_string_lossy(), &infra.relay_url);
     write_config(&dir_b.path().to_string_lossy(), &infra.relay_url);
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     create_account_and_wait(&alice);
     create_account_and_wait(&bob);
@@ -171,9 +179,21 @@ fn new_member_receives_rebroadcasted_group_profiles() {
     write_config(&dir_b.path().to_string_lossy(), &infra.relay_url);
     write_config(&dir_c.path().to_string_lossy(), &infra.relay_url);
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
-    let charlie = FfiApp::new(dir_c.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let charlie = FfiApp::new(
+        dir_c.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     create_account_and_wait(&alice);
     create_account_and_wait(&bob);
@@ -318,8 +338,16 @@ fn dm_profile_visible_to_peer() {
     write_config(&dir_a.path().to_string_lossy(), &infra.relay_url);
     write_config(&dir_b.path().to_string_lossy(), &infra.relay_url);
 
-    let alice = FfiApp::new(dir_a.path().to_string_lossy().to_string(), String::new());
-    let bob = FfiApp::new(dir_b.path().to_string_lossy().to_string(), String::new());
+    let alice = FfiApp::new(
+        dir_a.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
+    let bob = FfiApp::new(
+        dir_b.path().to_string_lossy().to_string(),
+        String::new(),
+        String::new(),
+    );
 
     create_account_and_wait(&alice);
     create_account_and_wait(&bob);

@@ -107,7 +107,11 @@ impl AppManager {
         ensure_default_config(&data_dir)?;
 
         let nsec_store = FileNsecStore::new(data_dir.join("desktop_nsec.txt"));
-        let core = FfiApp::new(data_dir.to_string_lossy().to_string(), String::new());
+        let core = FfiApp::new(
+            data_dir.to_string_lossy().to_string(),
+            String::new(),
+            crate::app_version().to_string(),
+        );
         let initial = core.state();
 
         let inner = Arc::new(Inner {

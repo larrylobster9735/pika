@@ -801,7 +801,7 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_pika_core_fn_free_ffiapp(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_pika_core_fn_constructor_ffiapp_new(`dataDir`: RustBuffer.ByValue,`keychainGroup`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_pika_core_fn_constructor_ffiapp_new(`dataDir`: RustBuffer.ByValue,`keychainGroup`: RustBuffer.ByValue,`appVersion`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_pika_core_fn_method_ffiapp_dispatch(`ptr`: Long,`action`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -973,7 +973,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_pika_core_checksum_method_ffiapp_state() != 64637.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_pika_core_checksum_constructor_ffiapp_new() != 52759.toShort()) {
+    if (lib.uniffi_pika_core_checksum_constructor_ffiapp_new() != 24320.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_pika_core_checksum_method_appreconciler_reconcile() != 10811.toShort()) {
@@ -1565,12 +1565,12 @@ open class FfiApp: Disposable, AutoCloseable, FfiAppInterface
         this.handle = 0
         this.cleanable = null
     }
-    constructor(`dataDir`: kotlin.String, `keychainGroup`: kotlin.String) :
+    constructor(`dataDir`: kotlin.String, `keychainGroup`: kotlin.String, `appVersion`: kotlin.String) :
         this(UniffiWithHandle, 
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_pika_core_fn_constructor_ffiapp_new(
     
-        FfiConverterString.lower(`dataDir`),FfiConverterString.lower(`keychainGroup`),_status)
+        FfiConverterString.lower(`dataDir`),FfiConverterString.lower(`keychainGroup`),FfiConverterString.lower(`appVersion`),_status)
 }
     )
 
@@ -1785,6 +1785,8 @@ data class AppState (
     , 
     var `developerMode`: kotlin.Boolean
     , 
+    var `updateRequired`: kotlin.Boolean
+    , 
     var `voiceRecording`: VoiceRecordingState?
     , 
     var `mediaGallery`: MediaGalleryState?
@@ -1817,6 +1819,7 @@ public object FfiConverterTypeAppState: FfiConverterRustBuffer<AppState> {
             FfiConverterSequenceTypeCallTimelineEvent.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalTypeVoiceRecordingState.read(buf),
             FfiConverterOptionalTypeMediaGalleryState.read(buf),
         )
@@ -1836,6 +1839,7 @@ public object FfiConverterTypeAppState: FfiConverterRustBuffer<AppState> {
             FfiConverterSequenceTypeCallTimelineEvent.allocationSize(value.`callTimeline`) +
             FfiConverterOptionalString.allocationSize(value.`toast`) +
             FfiConverterBoolean.allocationSize(value.`developerMode`) +
+            FfiConverterBoolean.allocationSize(value.`updateRequired`) +
             FfiConverterOptionalTypeVoiceRecordingState.allocationSize(value.`voiceRecording`) +
             FfiConverterOptionalTypeMediaGalleryState.allocationSize(value.`mediaGallery`)
     )
@@ -1854,6 +1858,7 @@ public object FfiConverterTypeAppState: FfiConverterRustBuffer<AppState> {
             FfiConverterSequenceTypeCallTimelineEvent.write(value.`callTimeline`, buf)
             FfiConverterOptionalString.write(value.`toast`, buf)
             FfiConverterBoolean.write(value.`developerMode`, buf)
+            FfiConverterBoolean.write(value.`updateRequired`, buf)
             FfiConverterOptionalTypeVoiceRecordingState.write(value.`voiceRecording`, buf)
             FfiConverterOptionalTypeMediaGalleryState.write(value.`mediaGallery`, buf)
     }

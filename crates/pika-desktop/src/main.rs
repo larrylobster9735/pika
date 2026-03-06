@@ -16,8 +16,13 @@ use pika_core::{project_desktop, AppAction, AppState, AuthState, CallStatus, Des
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// App version from the root VERSION file, embedded at compile time.
+pub fn app_version() -> &'static str {
+    include_str!("../../../VERSION").trim()
+}
+
 pub fn app_version_display() -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = app_version();
     if let Some(build) = option_env!("PIKA_BUILD_NUMBER") {
         format!("v{version} ({build})")
     } else {
