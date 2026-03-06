@@ -1,17 +1,18 @@
 ---
 name: swiftui-expert-skill
-description: Write, review, or improve SwiftUI code following best practices for state management, view composition, performance, and iOS 26+ Liquid Glass adoption. Use when building new SwiftUI features, refactoring existing views, reviewing code quality, or adopting modern SwiftUI patterns.
+description: Write, review, or improve SwiftUI code using native semantic UI components, strong state management, performance-conscious composition, and deliberate iOS 26+ Liquid Glass adoption. Use when building new SwiftUI features, refactoring existing views, reviewing code quality, or adopting modern SwiftUI patterns.
 ---
 
 # SwiftUI Expert Skill
 
 ## Overview
-Use this skill to build, review, or improve SwiftUI features with correct state management, optimal view composition, and iOS 26+ Liquid Glass styling. Prioritize native APIs, Apple design guidance, and performance-conscious patterns. This skill focuses on facts and best practices without enforcing specific architectural patterns.
+Use this skill to build, review, or improve SwiftUI features with correct state management, native semantic UI structure, optimal view composition, and iOS 26+ Liquid Glass styling. Prioritize system containers and controls first, then layer visual polish and Liquid Glass on top of a correct hierarchy. This skill focuses on facts and best practices without enforcing specific architectural patterns.
 
 ## Workflow Decision Tree
 
 ### 1) Review existing SwiftUI code
 - Check property wrapper usage against the selection guide (see `references/state-management.md`)
+- Inspect semantic container choice and native control usage (see `references/native-semantic-ui.md`)
 - Verify modern API usage and deprecation replacements (see `references/modern-apis.md`)
 - Verify text formatting and search patterns (see `references/text-formatting.md`)
 - Verify view composition follows extraction rules (see `references/view-structure.md`)
@@ -20,9 +21,11 @@ Use this skill to build, review, or improve SwiftUI features with correct state 
 - Check animation patterns for correctness (see `references/animation-basics.md`, `references/animation-transitions.md`)
 - Inspect Liquid Glass usage for correctness and consistency (see `references/liquid-glass.md`)
 - Validate iOS 26+ availability handling with sensible fallbacks
+- For UI-focused changes, verify the result in simulator or previews against real app states before calling the screen complete
 
 ### 2) Improve existing SwiftUI code
 - Audit state management for correct wrapper selection (see `references/state-management.md`)
+- Replace stack-heavy custom screen structure with semantic containers where appropriate (see `references/native-semantic-ui.md`)
 - Replace deprecated APIs with modern equivalents (see `references/modern-apis.md`)
 - Replace legacy string/text formatting patterns (see `references/text-formatting.md`)
 - Extract complex views into separate subviews (see `references/view-structure.md`)
@@ -30,14 +33,19 @@ Use this skill to build, review, or improve SwiftUI features with correct state 
 - Ensure ForEach uses stable identity (see `references/list-patterns.md`)
 - Improve animation patterns (use value parameter, proper transitions, see `references/animation-basics.md`, `references/animation-transitions.md`)
 - Suggest image downsampling when `UIImage(data:)` is used (as optional optimization, see `references/image-optimization.md`)
-- Adopt Liquid Glass only when explicitly requested by the user
+- Preserve existing user-facing actions, accessibility IDs, and test hooks during visual refactors
+- Do not invent product behavior or ship placeholder/debug copy while redesigning UI
+- Validate UI-focused changes one screen at a time in simulator before broad rollout
+- Adopt Liquid Glass when requested by the user or when the product's design direction clearly calls for it, after hierarchy and semantics are correct
 
 ### 3) Implement new SwiftUI feature
 - Design data flow first: identify owned vs injected state (see `references/state-management.md`)
+- Select semantic containers and system controls before custom layout (see `references/native-semantic-ui.md`)
 - Structure views for optimal diffing (extract subviews early, see `references/view-structure.md`)
 - Keep business logic in services and models for testability (see `references/layout-best-practices.md`)
 - Use correct animation patterns (implicit vs explicit, transitions, see `references/animation-basics.md`, `references/animation-transitions.md`, `references/animation-advanced.md`)
-- Apply glass effects after layout/appearance modifiers (see `references/liquid-glass.md`)
+- Use supported app actions and real product states; don't invent buttons, copy, or flows that do not exist
+- Apply Liquid Glass after hierarchy, accessibility, and interaction states are correct (see `references/liquid-glass.md`)
 - Gate iOS 26+ features with `#available` and provide fallbacks
 
 ## Core Guidelines
@@ -60,6 +68,17 @@ Use this skill to build, review, or improve SwiftUI features with correct state 
 - Keep business logic in services and models; views should orchestrate UI flow
 - Action handlers should reference methods, not contain inline logic
 - Views should work in any context (don't assume screen size or presentation style)
+
+### Native Semantics First
+- Start with `Form`, `Section`, `List`, `LabeledContent`, `NavigationStack`, `TextField`, `TextEditor`, `PasteButton`, `PhotosPicker`, `ShareLink`, `ToolbarItem`, and `ContentUnavailableView` when they fit the interaction (see `references/native-semantic-ui.md`)
+- Use `Form` and `Section` for settings, profile editing, and structured data-entry flows before building custom card stacks
+- Use `LabeledContent`, plain text sections, or list rows for read-only content; do not mimic editable form fields for display-only data
+- Prefer system row, disclosure, and destructive-action patterns over custom button bars when the semantics match
+- Use raw `VStack` and `HStack` for screen-level structure only when semantic containers cannot express the UI cleanly
+- Keep accessibility identifiers unique and preserve existing IDs during refactors unless tests and callers are updated together
+- Do not remove working actions or ship placeholder/debug copy during visual changes
+- Validate visual refactors in the simulator one screen at a time; treat simulator review as required, not optional
+- Apply Liquid Glass after semantics and information hierarchy are correct
 
 ### Performance
 - Pass only needed values to views (avoid large "config" or "context" objects)
@@ -90,9 +109,10 @@ Use this skill to build, review, or improve SwiftUI features with correct state 
 - Implicit animations override explicit animations (later in view tree wins)
 
 ### Liquid Glass (iOS 26+)
-**Only adopt when explicitly requested by the user.**
+**Treat Liquid Glass as a first-class iOS 26+ option when the user's request or the app's design direction calls for it.**
 - Use native `glassEffect`, `GlassEffectContainer`, and glass button styles
 - Wrap multiple glass elements in `GlassEffectContainer`
+- Apply glass only after hierarchy, semantics, and interaction states are correct
 - Apply `.glassEffect()` after layout and visual modifiers
 - Use `.interactive()` only for tappable/focusable elements
 - Use `glassEffectID` with `@Namespace` for morphing transitions
@@ -109,6 +129,15 @@ Use this skill to build, review, or improve SwiftUI features with correct state 
 | `@Bindable` | iOS 17+: Injected `@Observable` needing bindings |
 | `let` | Read-only value from parent |
 | `var` | Read-only value watched via `.onChange()` |
+
+### Semantic Container Selection
+| Use | Prefer |
+|-----|--------|
+| Editable settings/profile fields | `Form` + `Section` + `TextField` / `TextEditor` |
+| Read-only label/value rows | `LabeledContent` or grouped `List` / `Section` rows |
+| Dynamic collections | `List` with stable IDs |
+| Share/import actions | `ShareLink`, `PasteButton`, `PhotosPicker` |
+| Empty states | `ContentUnavailableView` with fallback when unavailable |
 
 ### Liquid Glass Patterns
 ```swift
@@ -154,6 +183,14 @@ Button("Confirm") { }
 - [ ] Deprecated APIs replaced by current SwiftUI alternatives
 - [ ] Navigation uses `NavigationStack` + type-safe destinations where appropriate
 - [ ] Interaction semantics prefer `Button` over `onTapGesture` when possible
+
+### Native Semantics & Product Integrity (see `references/native-semantic-ui.md`)
+- [ ] Screen-level structure starts from semantic containers before custom stacks
+- [ ] Edit and display states use different affordances (editable controls vs read-only content)
+- [ ] Existing user-facing actions are preserved; no fake or placeholder features introduced
+- [ ] Accessibility identifiers remain unique and intentional
+- [ ] Icon-only controls have explicit accessibility labels
+- [ ] UI-focused changes were verified in simulator or previews against real states
 
 ### ScrollView (see `references/scroll-patterns.md`)
 - [ ] Using `ScrollViewReader` with stable IDs for programmatic scrolling
@@ -214,6 +251,7 @@ Button("Confirm") { }
 - `references/performance-patterns.md` - Performance optimization techniques and anti-patterns
 - `references/list-patterns.md` - ForEach identity, stability, and list best practices
 - `references/layout-best-practices.md` - Layout patterns, context-agnostic views, and testability
+- `references/native-semantic-ui.md` - Native semantic containers, forms, settings, profile patterns, and screen-by-screen validation guidance
 - `references/animation-basics.md` - Core animation concepts, implicit/explicit animations, timing, performance
 - `references/animation-transitions.md` - Transitions, custom transitions, Animatable protocol
 - `references/animation-advanced.md` - Transactions, phase/keyframe animations (iOS 17+), completion handlers (iOS 17+)
