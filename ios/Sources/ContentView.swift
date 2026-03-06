@@ -74,12 +74,7 @@ struct ContentView: View {
                 }
             }
             .overlay(alignment: .top) {
-                VStack(spacing: 0) {
-                    if appState.updateRequired {
-                        updateBanner
-                    }
-                    toastOverlay
-                }
+                toastOverlay
             }
             .animation(.easeInOut(duration: 0.25), value: visibleToast)
             .onAppear {
@@ -124,23 +119,6 @@ struct ContentView: View {
             }
         }
     }
-
-    @ViewBuilder
-    private var updateBanner: some View {
-        Link(destination: URL(string: "https://apps.apple.com/app/id6741372509")!) {
-            HStack {
-                Image(systemName: "arrow.up.circle.fill")
-                Text("A new version of Pika is available. Please update.")
-                    .font(.subheadline.weight(.medium))
-                Spacer()
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(Color.blue)
-        }
-    }
-
     @ViewBuilder
     private var toastOverlay: some View {
         if let toast = visibleToast {

@@ -27,6 +27,8 @@ struct InvertedMessageList: UIViewRepresentable {
     var onLoadOlderMessages: (() -> Void)?
 
     // Scroll state
+    var visualTopInset: CGFloat
+    var visualBottomInset: CGFloat
     @Binding var isAtBottom: Bool
     @Binding var shouldStickToBottom: Bool
     var activeReactionMessageId: String?
@@ -37,10 +39,11 @@ struct InvertedMessageList: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITableView {
-        let tableView = UITableView(frame: .zero, style: .plain)
+        let tableView = InsetAwareTableView(frame: .zero, style: .plain)
         tableView.transform = CGAffineTransform(scaleX: 1, y: -1)
         tableView.separatorStyle = .none
         tableView.backgroundColor = .clear
+        tableView.contentInsetAdjustmentBehavior = .never
         tableView.showsVerticalScrollIndicator = true
         tableView.alwaysBounceVertical = false
         tableView.keyboardDismissMode = .interactive
@@ -48,6 +51,9 @@ struct InvertedMessageList: UIViewRepresentable {
         tableView.estimatedRowHeight = 80
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         tableView.delegate = context.coordinator
+        tableView.onLayoutChange = { [weak coordinator = context.coordinator] in
+            _ = coordinator?.applyLayoutMetricsIfNeeded()
+        }
         context.coordinator.tableView = tableView
 
         // Set up diffable data source.
@@ -74,6 +80,7 @@ struct InvertedMessageList: UIViewRepresentable {
         // Apply initial snapshot.
         let invertedRows = buildInvertedRows()
         context.coordinator.applyRows(invertedRows, animated: false)
+        context.coordinator.applyLayoutMetricsIfNeeded()
 
         return tableView
     }
@@ -81,6 +88,7 @@ struct InvertedMessageList: UIViewRepresentable {
     func updateUIView(_ tableView: UITableView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+        let layoutMetricsChanged = coordinator.applyLayoutMetricsIfNeeded()
 
         let newInverted = buildInvertedRows()
         let newIDs = newInverted.map(\.id)
@@ -114,6 +122,10 @@ struct InvertedMessageList: UIViewRepresentable {
             coordinator.lastScrollToBottomTrigger = scrollToBottomTrigger
             coordinator.scrollToBottom(animated: true)
         }
+
+        if layoutMetricsChanged && shouldStickToBottom {
+            coordinator.scrollToBottom(animated: false)
+        }
     }
 
     /// Build the inverted row array: reversed timeline rows, plus typing indicator at index 0.
@@ -143,6 +155,7 @@ struct InvertedMessageList: UIViewRepresentable {
         weak var tableView: UITableView?
         var lastScrollToBottomTrigger: Int = 0
         private var requestedOldestId: String?
+        private var lastAppliedLayoutMetrics: InvertedMessageListLayoutMetrics?
 
         init(parent: InvertedMessageList) {
             self.parent = parent
@@ -162,11 +175,30 @@ struct InvertedMessageList: UIViewRepresentable {
         }
 
         func scrollToBottom(animated: Bool) {
-            guard let tableView,
-                  let dataSource,
-                  dataSource.snapshot().numberOfItems > 0 else { return }
-            // In inverted table, row 0 = newest message = visual bottom.
-            tableView.scrollToRow(at: IndexPath(row: 0, section: 0), at: .top, animated: animated)
+            guard let tableView else { return }
+            tableView.setContentOffset(
+                InvertedMessageListLayout.bottomContentOffset(
+                    adjustedTopInset: tableView.adjustedContentInset.top
+                ),
+                animated: animated
+            )
+        }
+
+        @discardableResult
+        func applyLayoutMetricsIfNeeded() -> Bool {
+            guard let tableView else { return false }
+
+            let metrics = InvertedMessageListLayout.metrics(
+                visualTopReserve: parent.visualTopInset,
+                visualBottomReserve: parent.visualBottomInset,
+                safeAreaInsets: tableView.safeAreaInsets
+            )
+
+            guard metrics != lastAppliedLayoutMetrics else { return false }
+            lastAppliedLayoutMetrics = metrics
+            tableView.contentInset = metrics.contentInset
+            tableView.scrollIndicatorInsets = metrics.scrollIndicatorInsets
+            return true
         }
 
         // MARK: Delegate — Pagination
@@ -196,7 +228,10 @@ struct InvertedMessageList: UIViewRepresentable {
         // MARK: Delegate — Scroll Tracking
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            let nearBottom = scrollView.contentOffset.y < 50
+            let nearBottom = InvertedMessageListLayout.isNearBottom(
+                contentOffsetY: scrollView.contentOffset.y,
+                adjustedTopInset: scrollView.adjustedContentInset.top
+            )
             if parent.isAtBottom != nearBottom {
                 DispatchQueue.main.async {
                     self.parent.isAtBottom = nearBottom
@@ -210,7 +245,10 @@ struct InvertedMessageList: UIViewRepresentable {
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-            let nearBottom = scrollView.contentOffset.y < 50
+            let nearBottom = InvertedMessageListLayout.isNearBottom(
+                contentOffsetY: scrollView.contentOffset.y,
+                adjustedTopInset: scrollView.adjustedContentInset.top
+            )
             if !nearBottom && parent.shouldStickToBottom {
                 DispatchQueue.main.async {
                     self.parent.shouldStickToBottom = false
@@ -229,7 +267,10 @@ struct InvertedMessageList: UIViewRepresentable {
         }
 
         private func updateStickyAfterScroll(_ scrollView: UIScrollView) {
-            let nearBottom = scrollView.contentOffset.y < 50
+            let nearBottom = InvertedMessageListLayout.isNearBottom(
+                contentOffsetY: scrollView.contentOffset.y,
+                adjustedTopInset: scrollView.adjustedContentInset.top
+            )
             if nearBottom != parent.shouldStickToBottom {
                 DispatchQueue.main.async {
                     self.parent.shouldStickToBottom = nearBottom
@@ -295,6 +336,20 @@ struct InvertedMessageList: UIViewRepresentable {
             }) else { return }
             tableView.scrollToRow(at: IndexPath(row: index, section: 0), at: .middle, animated: true)
         }
+    }
+}
+
+private final class InsetAwareTableView: UITableView {
+    var onLayoutChange: (() -> Void)?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onLayoutChange?()
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        onLayoutChange?()
     }
 }
 

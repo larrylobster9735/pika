@@ -12,6 +12,7 @@ info:
     @echo "iOS"
     @echo "  Simulator:"
     @echo "    just run-ios"
+    @echo "    just run-swift        # skip Rust rebuild; reuse existing iOS artifacts"
     @echo "  Hardware device:"
     @echo "    just run-ios --device --udid <UDID>"
     @echo "  List targets (devices + simulators):"
@@ -729,6 +730,32 @@ ios-build-sim: ios-xcframework ios-xcodeproj
       PIKA_APP_BUNDLE_ID="${PIKA_IOS_BUNDLE_ID:-org.pikachat.pika.dev}" \
       PIKA_IOS_URL_SCHEME="${PIKA_IOS_URL_SCHEME:-pika}"
 
+# Build iOS app for simulator using existing Rust-generated artifacts.
+ios-build-swift-sim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SIM_ARCH="${PIKA_IOS_SIM_ARCH:-arm64}"
+    DERIVED_DATA_PATH="${PIKA_IOS_DERIVED_DATA_PATH:-ios/build}"
+    CODE_SIGNING_ALLOWED="${PIKA_IOS_CODE_SIGNING_ALLOWED:-YES}"
+    if [ -n "${PIKA_IOS_SIM_UDID:-}" ]; then
+      DEST="id=${PIKA_IOS_SIM_UDID}"
+    else
+      DEST="platform=iOS Simulator,name=iPhone 16"
+    fi
+    ./tools/xcodebuild-compact \
+      -project ios/Pika.xcodeproj \
+      -scheme Pika \
+      -configuration Debug \
+      -destination "$DEST" \
+      -derivedDataPath "$DERIVED_DATA_PATH" \
+      build \
+      -skipMacroValidation \
+      ARCHS="$SIM_ARCH" \
+      ONLY_ACTIVE_ARCH=YES \
+      CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED" \
+      PIKA_APP_BUNDLE_ID="${PIKA_IOS_BUNDLE_ID:-org.pikachat.pika.dev}" \
+      PIKA_IOS_URL_SCHEME="${PIKA_IOS_URL_SCHEME:-pika}"
+
 # Run iOS UI tests on simulator (skips E2E deployed-bot test).
 ios-ui-test: ios-xcframework ios-xcodeproj
     udid="$(./tools/ios-sim-ensure | sed -n 's/^ok: ios simulator ready (udid=\(.*\))$/\1/p')"; \
@@ -761,6 +788,10 @@ run-android *ARGS:
 # Build, install, and launch iOS app on simulator/device.
 run-ios *ARGS:
     ./tools/pika-run ios run {{ ARGS }}
+
+# Build, install, and launch iOS app using existing Rust-generated artifacts.
+run-swift *ARGS:
+    PIKA_IOS_SKIP_RUST_REBUILD=1 ./tools/pika-run ios run {{ ARGS }}
 
 # Build-check the desktop ICED app.
 desktop-check:

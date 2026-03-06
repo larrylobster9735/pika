@@ -45,6 +45,8 @@ struct ChatView: View {
     @State private var fullscreenImageAttachments: [ChatMediaAttachment] = []
     @State private var showPollComposer = false
     @State private var scrollToBottomTrigger = 0
+    @State private var messageInputBarHeight: CGFloat = 0
+    @State private var topOverlayHeight: CGFloat = 0
     @State private var voiceRecorder: VoiceRecorder
     @State private var showMicPermissionDenied = false
     @FocusState private var isInputFocused: Bool
@@ -108,25 +110,37 @@ struct ChatView: View {
 
     @ViewBuilder
     private func loadedChat(_ chat: ChatViewState) -> some View {
-        VStack(spacing: 8) {
-            if let liveCall = callFor(chat), liveCall.isLive {
-                ActiveCallPill(
-                    call: liveCall,
-                    peerName: chatTitle(chat),
-                    onTap: {
-                        onOpenCallScreen()
-                    }
+        GeometryReader { geo in
+            ZStack {
+                chatBackground
+                    .ignoresSafeArea()
+
+                messageList(
+                    chat,
+                    visualTopInset: topOverlayHeight,
+                    visualBottomInset: messageInputBarHeight
                 )
-                .padding(.horizontal, 12)
-                .padding(.top, 2)
+                .ignoresSafeArea(edges: [.top, .bottom])
             }
-            messageList(chat)
+            .overlay(alignment: .top) {
+                topOverlay(chat)
+                    .measureHeight($topOverlayHeight)
+            }
+            .overlay(alignment: .bottom) {
+                messageInputBar(chat: chat)
+                    .measureHeight($messageInputBarHeight)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                scrollToBottomButton(
+                    bottomPadding: geo.safeAreaInsets.bottom + messageInputBarHeight + scrollButtonBottomPadding
+                )
+            }
         }
-        .modifier(FloatingInputBarModifier(content: { messageInputBar(chat: chat) }))
         .blur(radius: contextMenuMessage == nil ? 0 : 24)
         .allowsHitTesting(contextMenuMessage == nil)
         .navigationTitle(chat.isGroup ? chatTitle(chat) : "")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
             if chat.isGroup {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -302,7 +316,11 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private func messageList(_ chat: ChatViewState) -> some View {
+    private func messageList(
+        _ chat: ChatViewState,
+        visualTopInset: CGFloat,
+        visualBottomInset: CGFloat
+    ) -> some View {
         let messagesById = Dictionary(uniqueKeysWithValues: chat.messages.map { ($0.id, $0) })
         InvertedMessageList(
             rows: timelineRows(chat),
@@ -342,6 +360,8 @@ struct ChatView: View {
                     callback(chatId, oldestId, 30)
                 }
             },
+            visualTopInset: visualTopInset,
+            visualBottomInset: visualBottomInset,
             isAtBottom: $isAtBottom,
             shouldStickToBottom: $shouldStickToBottom,
             activeReactionMessageId: activeReactionMessageId,
@@ -360,24 +380,6 @@ struct ChatView: View {
             guard shouldStickToBottom else { return }
             scrollToBottomTrigger += 1
         }
-        .overlay(alignment: .bottomTrailing) {
-            if !isAtBottom {
-                Button {
-                    shouldStickToBottom = true
-                    scrollToBottomTrigger += 1
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.footnote.weight(.semibold))
-                        .padding(10)
-                }
-                .foregroundStyle(.primary)
-                .background(.ultraThinMaterial, in: Circle())
-                .overlay(Circle().strokeBorder(.quaternary, lineWidth: 0.5))
-                .padding(.trailing, 16)
-                .padding(.bottom, scrollButtonBottomPadding)
-                .accessibilityLabel("Scroll to bottom")
-            }
-        }
     }
 
     private var loadingView: some View {
@@ -385,6 +387,48 @@ struct ChatView: View {
             ProgressView()
             Text("Loading chat...")
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private var chatBackground: some View {
+        Color(uiColor: .systemBackground)
+    }
+
+    @ViewBuilder
+    private func topOverlay(_ chat: ChatViewState) -> some View {
+        VStack(spacing: 0) {
+            if let liveCall = callFor(chat), liveCall.isLive {
+                ActiveCallPill(
+                    call: liveCall,
+                    peerName: chatTitle(chat),
+                    onTap: {
+                        onOpenCallScreen()
+                    }
+                )
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private func scrollToBottomButton(bottomPadding: CGFloat) -> some View {
+        if !isAtBottom {
+            Button {
+                shouldStickToBottom = true
+                scrollToBottomTrigger += 1
+            } label: {
+                Image(systemName: "arrow.down")
+                    .font(.footnote.weight(.semibold))
+                    .padding(10)
+            }
+            .foregroundStyle(.primary)
+            .background(.ultraThinMaterial, in: Circle())
+            .overlay(Circle().strokeBorder(.quaternary, lineWidth: 0.5))
+            .padding(.trailing, 16)
+            .padding(.bottom, bottomPadding)
+            .accessibilityLabel("Scroll to bottom")
         }
     }
 
@@ -1126,15 +1170,25 @@ struct UnreadDividerRow: View {
         .padding(.vertical, 8)
     }
 }
+private struct HeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
 
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
 
-
-private struct FloatingInputBarModifier<Bar: View>: ViewModifier {
-    @ViewBuilder var content: Bar
-
-    func body(content view: Content) -> some View {
-        view.safeAreaInset(edge: .bottom, spacing: 0) {
-            content
+private extension View {
+    func measureHeight(_ height: Binding<CGFloat>) -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear
+                    .preference(key: HeightPreferenceKey.self, value: geo.size.height)
+            }
+        )
+        .onPreferenceChange(HeightPreferenceKey.self) { newHeight in
+            guard abs(newHeight - height.wrappedValue) > 0.5 else { return }
+            height.wrappedValue = newHeight
         }
     }
 }

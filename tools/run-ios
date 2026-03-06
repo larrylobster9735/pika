@@ -56,6 +56,7 @@ if [ "${PIKA_IOS_DEVICE:-0}" = "1" ]; then
   MODE="device"
 fi
 SIM_UDID="${PIKA_IOS_SIM_UDID:-}"
+SKIP_RUST_REBUILD="${PIKA_IOS_SKIP_RUST_REBUILD:-0}"
 
 usage() {
   cat <<EOF
@@ -71,10 +72,42 @@ Env:
   PIKA_IOS_DEVICE=1         default to --device (if set, requires team id)
   PIKA_IOS_CONSOLE=1        default to --console
   PIKA_IOS_CODE_SIGNING_ALLOWED  YES|NO for simulator builds (default: YES)
+  PIKA_IOS_SKIP_RUST_REBUILD=1  reuse existing Rust-generated iOS artifacts
   PIKA_RUST_PROFILE         debug|release (default for run-ios: debug)
   PIKA_NO_RELAY_OVERRIDE=1  disable dev-friendly relay defaults
   PIKA_IOS_DEVICE_ALLOW_LOCAL_OVERRIDES=1  allow localhost relay/MoQ overrides on physical devices
 EOF
+}
+
+ensure_ios_generated_artifacts() {
+  local missing=0
+  local path
+  for path in \
+    ios/Frameworks/PikaCore.xcframework \
+    ios/Frameworks/PikaNSE.xcframework \
+    ios/Frameworks/PikaShare.xcframework \
+    ios/Bindings/pika_core.swift \
+    ios/NSEBindings/pika_nse.swift \
+    ios/ShareBindings/pika_share.swift
+  do
+    if [ ! -e "$path" ]; then
+      echo "error: missing iOS generated artifact: $path" >&2
+      missing=1
+    fi
+  done
+
+  if [ "$missing" = "1" ]; then
+    echo "hint: run \`just run-ios --sim\` once, or regenerate with \`just ios-xcframework ios-xcodeproj\`" >&2
+    exit 1
+  fi
+}
+
+ensure_ios_xcodeproj() {
+  if [ ! -d "ios/Pika.xcodeproj" ]; then
+    echo "error: missing ios/Pika.xcodeproj" >&2
+    echo "hint: run \`just run-ios --sim\` once, or regenerate with \`just ios-xcodeproj\`" >&2
+    exit 1
+  fi
 }
 
 callback_scheme_for_bundle_id() {
@@ -258,8 +291,14 @@ if [ "$MODE" = "device" ]; then
   # Faster dev loop defaults: debug Rust and only the required iOS Rust target.
   export PIKA_IOS_RUST_TARGETS="${PIKA_IOS_RUST_TARGETS:-aarch64-apple-ios}"
 
-  # Build core xcframework + (re)generate the project.
-  just ios-xcframework ios-xcodeproj
+  if [ "$SKIP_RUST_REBUILD" = "1" ]; then
+    echo "swift-only mode: reusing existing Rust-generated iOS artifacts"
+    ensure_ios_generated_artifacts
+    ensure_ios_xcodeproj
+  else
+    # Build core xcframework + (re)generate the project.
+    just ios-xcframework ios-xcodeproj
+  fi
 
   device_derived_data_path="${PIKA_IOS_DEVICE_DERIVED_DATA_PATH:-ios/build-device}"
 
@@ -403,7 +442,14 @@ fi
 derived_data_path="${PIKA_IOS_DERIVED_DATA_PATH:-ios/build}"
 export PIKA_IOS_DERIVED_DATA_PATH="$derived_data_path"
 
-just ios-build-sim
+if [ "$SKIP_RUST_REBUILD" = "1" ]; then
+  echo "swift-only mode: reusing existing Rust-generated iOS artifacts"
+  ensure_ios_generated_artifacts
+  ensure_ios_xcodeproj
+  just ios-build-swift-sim
+else
+  just ios-build-sim
+fi
 
 app_path="$derived_data_path/Build/Products/Debug-iphonesimulator/Pika.app"
 if [ ! -d "$app_path" ]; then
