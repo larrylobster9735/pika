@@ -4,14 +4,27 @@ import XCTest
 final class MessageCollectionLayoutTests: XCTestCase {
     func testViewportMetricsShareChromeGeometryAcrossListAndJumpButton() {
         let metrics = MessageCollectionLayout.viewportMetrics(
+            bottomChromeHeight: 72,
             extraBottomSpacing: 20,
             jumpButtonSpacing: 12
         )
 
-        XCTAssertEqual(metrics.contentInset.top, 0)
-        XCTAssertEqual(metrics.contentInset.bottom, 20)
-        XCTAssertEqual(metrics.scrollIndicatorInsets, .zero)
-        XCTAssertEqual(metrics.jumpButtonBottomOffset, 12)
+        XCTAssertEqual(metrics.bottomSpacerHeight, 92)
+        XCTAssertEqual(metrics.baseContentInset.top, 0)
+        XCTAssertEqual(metrics.baseContentInset.bottom, 0)
+        XCTAssertEqual(metrics.scrollIndicatorInsets.bottom, 72)
+        XCTAssertEqual(metrics.jumpButtonBottomOffset, 84)
+    }
+
+    func testEffectiveContentInsetBottomAlignsShortChats() {
+        let inset = MessageCollectionLayout.effectiveContentInset(
+            boundsHeight: 600,
+            contentHeight: 180,
+            baseInset: UIEdgeInsets(top: 0, left: 0, bottom: 20, right: 0)
+        )
+
+        XCTAssertEqual(inset.top, 400)
+        XCTAssertEqual(inset.bottom, 20)
     }
 
     func testNearBottomUsesVisibleViewportBottom() {
@@ -47,15 +60,15 @@ final class MessageCollectionLayoutTests: XCTestCase {
     func testUpdateClassificationUsesTailMutationForAppendAndTrim() {
         XCTAssertEqual(
             MessageCollectionLayout.classifyUpdate(
-                oldIDs: ["a", "b"],
-                newIDs: ["a", "b", "c"]
+                oldIDs: ["a", "b", MessageCollectionRowID.bottomSpacer],
+                newIDs: ["a", "b", "c", MessageCollectionRowID.bottomSpacer]
             ),
             .tailMutation
         )
         XCTAssertEqual(
             MessageCollectionLayout.classifyUpdate(
-                oldIDs: ["a", "b", "c"],
-                newIDs: ["a", "b"]
+                oldIDs: ["a", "b", "c", MessageCollectionRowID.bottomSpacer],
+                newIDs: ["a", "b", MessageCollectionRowID.bottomSpacer]
             ),
             .tailMutation
         )

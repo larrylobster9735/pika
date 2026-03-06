@@ -18,6 +18,7 @@ struct MessageCollectionList: UIViewRepresentable {
     struct ContentState: Equatable {
         let chat: ChatViewState
         let activeReactionMessageId: String?
+        let bottomSpacerHeight: CGFloat
     }
 
     let rows: [ChatView.ChatTimelineRow]
@@ -41,7 +42,11 @@ struct MessageCollectionList: UIViewRepresentable {
     var scrollRequest: ScrollRequest?
 
     private var contentState: ContentState {
-        ContentState(chat: chat, activeReactionMessageId: activeReactionMessageId)
+        ContentState(
+            chat: chat,
+            activeReactionMessageId: activeReactionMessageId,
+            bottomSpacerHeight: viewportMetrics.bottomSpacerHeight
+        )
     }
 
     func makeCoordinator() -> Coordinator {
@@ -52,7 +57,7 @@ struct MessageCollectionList: UIViewRepresentable {
         let layout = MessageCollectionList.makeLayout()
         let collectionView = BoundsAwareCollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.backgroundColor = .clear
-        collectionView.contentInsetAdjustmentBehavior = .never
+        collectionView.contentInsetAdjustmentBehavior = .automatic
         collectionView.alwaysBounceVertical = true
         collectionView.keyboardDismissMode = .interactive
         collectionView.delegate = context.coordinator
@@ -151,6 +156,7 @@ struct MessageCollectionList: UIViewRepresentable {
         if !chat.typingMembers.isEmpty {
             rendered.append(.typing)
         }
+        rendered.append(.bottomSpacer(height: viewportMetrics.bottomSpacerHeight))
         return rendered
     }
 
@@ -162,6 +168,7 @@ struct MessageCollectionList: UIViewRepresentable {
         weak var collectionView: UICollectionView?
         private var requestedOldestId: String?
         private var lastAppliedViewportMetrics: MessageCollectionViewportMetrics?
+        private var lastAppliedEffectiveInset: UIEdgeInsets?
         private var lastHandledScrollRequestID: Int?
         var lastContentState: ContentState?
 
@@ -200,6 +207,7 @@ struct MessageCollectionList: UIViewRepresentable {
 
         func scrollToBottom(animated: Bool) {
             guard let collectionView else { return }
+            applyEffectiveInsetsIfNeeded()
             collectionView.layoutIfNeeded()
             collectionView.setContentOffset(
                 MessageCollectionLayout.bottomContentOffset(
@@ -214,11 +222,13 @@ struct MessageCollectionList: UIViewRepresentable {
         @discardableResult
         func applyViewportMetricsIfNeeded(_ viewportMetrics: MessageCollectionViewportMetrics) -> Bool {
             guard let collectionView else { return false }
-            guard viewportMetrics != lastAppliedViewportMetrics else { return false }
-            lastAppliedViewportMetrics = viewportMetrics
-            collectionView.contentInset = viewportMetrics.contentInset
-            collectionView.scrollIndicatorInsets = viewportMetrics.scrollIndicatorInsets
-            return true
+            let metricsChanged = viewportMetrics != lastAppliedViewportMetrics
+            if metricsChanged {
+                lastAppliedViewportMetrics = viewportMetrics
+                collectionView.scrollIndicatorInsets = viewportMetrics.scrollIndicatorInsets
+            }
+            let insetChanged = applyEffectiveInsetsIfNeeded()
+            return metricsChanged || insetChanged
         }
 
         func consumeScrollRequestIfNeeded(_ request: ScrollRequest) -> ScrollRequest? {
@@ -235,8 +245,11 @@ struct MessageCollectionList: UIViewRepresentable {
         }
 
         func handleBoundsSizeChange() {
+            let insetChanged = applyEffectiveInsetsIfNeeded()
             guard parent.followsBottom else { return }
-            scrollToBottom(animated: false)
+            if insetChanged {
+                scrollToBottom(animated: false)
+            }
         }
 
         func captureTopAnchor() -> ScrollAnchor? {
@@ -259,6 +272,7 @@ struct MessageCollectionList: UIViewRepresentable {
                   let indexPath = dataSource.indexPath(for: anchor.itemID)
             else { return }
 
+            applyEffectiveInsetsIfNeeded()
             collectionView.layoutIfNeeded()
             collectionView.scrollToItem(at: indexPath, at: .top, animated: false)
             collectionView.layoutIfNeeded()
@@ -315,6 +329,10 @@ struct MessageCollectionList: UIViewRepresentable {
                 )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
+
+            case .bottomSpacer(let height):
+                Color.clear
+                    .frame(height: height)
 
             case .timeline(let timelineRow):
                 Group {
@@ -374,6 +392,22 @@ struct MessageCollectionList: UIViewRepresentable {
                 .compactMap { dataSource.itemIdentifier(for: $0) }
         }
 
+        @discardableResult
+        private func applyEffectiveInsetsIfNeeded() -> Bool {
+            guard let collectionView, let viewportMetrics = lastAppliedViewportMetrics else { return false }
+            collectionView.layoutIfNeeded()
+
+            let effectiveInset = MessageCollectionLayout.effectiveContentInset(
+                boundsHeight: collectionView.bounds.height,
+                contentHeight: collectionView.contentSize.height,
+                baseInset: viewportMetrics.baseContentInset
+            )
+            guard effectiveInset != lastAppliedEffectiveInset else { return false }
+            lastAppliedEffectiveInset = effectiveInset
+            collectionView.contentInset = effectiveInset
+            return true
+        }
+
         private func indexPathSort(_ lhs: IndexPath, _ rhs: IndexPath) -> Bool {
             if lhs.section == rhs.section {
                 return lhs.item < rhs.item
@@ -402,12 +436,15 @@ struct ScrollAnchor {
 
 enum RenderedRow: Identifiable {
     case typing
+    case bottomSpacer(height: CGFloat)
     case timeline(ChatView.ChatTimelineRow)
 
     var id: String {
         switch self {
         case .typing:
-            return "typing-indicator"
+            return MessageCollectionRowID.typingIndicator
+        case .bottomSpacer:
+            return MessageCollectionRowID.bottomSpacer
         case .timeline(let row):
             return row.id
         }

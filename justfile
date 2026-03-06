@@ -13,6 +13,7 @@ info:
     @echo "  Simulator:"
     @echo "    just run-ios"
     @echo "    just run-swift        # skip Rust rebuild; reuse existing iOS artifacts"
+    @echo "    just screenshot-booted-ios"
     @echo "  Hardware device:"
     @echo "    just run-ios --device --udid <UDID>"
     @echo "  List targets (devices + simulators):"
@@ -792,6 +793,17 @@ run-ios *ARGS:
 # Build, install, and launch iOS app using existing Rust-generated artifacts.
 run-swift *ARGS:
     PIKA_IOS_SKIP_RUST_REBUILD=1 ./tools/pika-run ios run {{ ARGS }}
+
+# Capture a screenshot from the booted iOS simulator and print the saved path.
+screenshot-booted-ios OUT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="{{ OUT }}"
+    if [ -z "$out" ]; then
+      out="/tmp/pika-ios-$(date +%Y%m%d-%H%M%S).png"
+    fi
+    xcrun simctl io booted screenshot "$out" >/dev/null 2>&1
+    echo "$out"
 
 # Build-check the desktop ICED app.
 desktop-check:

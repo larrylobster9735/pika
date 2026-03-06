@@ -46,6 +46,7 @@ struct ChatView: View {
     @State private var scrollRequest: MessageCollectionList.ScrollRequest?
     @State private var voiceRecorder: VoiceRecorder
     @State private var showMicPermissionDenied = false
+    @State private var inputBarHeight: CGFloat = 76
     @FocusState private var isInputFocused: Bool
 
     init(
@@ -105,7 +106,9 @@ struct ChatView: View {
 
     @ViewBuilder
     private func loadedChat(_ chat: ChatViewState) -> some View {
-        let viewportMetrics = MessageCollectionLayout.viewportMetrics()
+        let viewportMetrics = MessageCollectionLayout.viewportMetrics(
+            bottomChromeHeight: inputBarHeight
+        )
         ZStack {
             chatBackground
                 .ignoresSafeArea()
@@ -114,6 +117,7 @@ struct ChatView: View {
                 chat,
                 viewportMetrics: viewportMetrics
             )
+            .ignoresSafeArea(edges: [.top, .bottom])
             .overlay(alignment: .bottomTrailing) {
                 scrollToBottomButton(
                     bottomPadding: viewportMetrics.jumpButtonBottomOffset
@@ -125,6 +129,10 @@ struct ChatView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             messageInputBar(chat: chat)
+                .captureHeight { height in
+                    guard abs(height - inputBarHeight) > 0.5 else { return }
+                    inputBarHeight = height
+                }
         }
         .blur(radius: contextMenuMessage == nil ? 0 : 24)
         .allowsHitTesting(contextMenuMessage == nil)
@@ -854,6 +862,26 @@ struct ChatView: View {
                 showMicPermissionDenied = true
             }
         }
+    }
+}
+
+private struct ViewHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private extension View {
+    func captureHeight(_ onChange: @escaping (CGFloat) -> Void) -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(key: ViewHeightPreferenceKey.self, value: proxy.size.height)
+            }
+        }
+        .onPreferenceChange(ViewHeightPreferenceKey.self, perform: onChange)
     }
 }
 
