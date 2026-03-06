@@ -5477,6 +5477,10 @@ impl AppCore {
                 let fallback_kp_relays = self.key_package_relays();
                 let fallback_popular_relays = self.default_relays();
                 let chat_id_clone = chat_id.clone();
+                let peer_names: HashMap<PublicKey, String> = peer_pubkeys
+                    .iter()
+                    .map(|pk| (*pk, self.peer_display_name(pk)))
+                    .collect();
 
                 // Fetch key packages then add members.
                 self.runtime.spawn(async move {
@@ -5502,7 +5506,12 @@ impl AppCore {
                         let names: Vec<String> = fetched
                             .failed_peers
                             .iter()
-                            .map(|(pk, e)| format!("{}: {e}", &pk.to_hex()[..8]))
+                            .map(|(pk, e)| {
+                                let hex = pk.to_hex();
+                                let name =
+                                    peer_names.get(pk).map(|s| s.as_str()).unwrap_or(&hex[..8]);
+                                format!("{name}: {e}")
+                            })
                             .collect();
                         let _ = tx.send(CoreMsg::Internal(Box::new(InternalEvent::Toast(
                             format!("Failed to fetch key packages for: {}", names.join(", ")),
