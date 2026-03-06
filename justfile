@@ -273,6 +273,8 @@ pre-merge-agent-contracts:
     cargo test -p pikahut --test integration_deterministic agent_http_cli_new_local -- --ignored --nocapture
     cargo test -p pikahut --test integration_deterministic agent_http_cli_new_idempotent_local -- --ignored --nocapture
     cargo test -p pikahut --test integration_deterministic agent_http_cli_new_me_recover_local -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic agent_http_cli_chat_reply_local -- --ignored --nocapture
+    cargo test -p pikahut --test integration_deterministic agent_http_cli_chat_no_reply_timeout_local -- --ignored --nocapture
     @echo "pre-merge-agent-contracts complete"
 
 # CI-safe pre-merge for the RMP tooling lane.
@@ -873,6 +875,18 @@ agent-microvm *ARGS="":
 # Ensure/reuse agent, send one message, then optionally listen for reply.
 agent-microvm-chat MESSAGE="hello from pikachat cli" *ARGS="":
     ./scripts/pikachat-cli.sh agent chat "{{ MESSAGE }}" {{ ARGS }}
+
+# Tail local pika-server logs from the pikahut backend state dir.
+agent-microvm-server-logs STATE_DIR=".pikahut":
+    cargo run -p pikahut -- logs --state-dir {{ STATE_DIR }} --follow --component server
+
+# Tail remote vm-spawner logs on the pika-build microVM host.
+agent-microvm-vmspawner-logs:
+    nix develop .#infra -c just -f infra/justfile build-vmspawner-logs
+
+# Tail the guest agent log for a specific VM on the pika-build microVM host.
+agent-microvm-guest-logs VM_ID:
+    nix develop .#infra -c just -f infra/justfile build-guest-logs {{ VM_ID }}
 
 # Open local port-forward to remote vm-spawner (`http://127.0.0.1:8080`).
 agent-microvm-tunnel:

@@ -17,7 +17,9 @@ pub const AUTOSTART_IDENTITY_PATH: &str = "workspace/pika-agent/state/identity.j
 const DEFAULT_CREATE_VM_TIMEOUT_SECS: u64 = 60;
 const MIN_CREATE_VM_TIMEOUT_SECS: u64 = 10;
 const DELETE_VM_TIMEOUT: Duration = Duration::from_secs(30);
+const GET_VM_TIMEOUT: Duration = Duration::from_secs(15);
 const RECOVER_VM_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResolvedMicrovmParams {
@@ -40,8 +42,13 @@ pub struct GuestAutostartRequest {
 #[derive(Debug, Deserialize)]
 pub struct VmResponse {
     pub id: String,
-    #[serde(default)]
-    pub status: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VmStatusResponse {
+    pub id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -69,19 +76,39 @@ impl MicrovmSpawnerClient {
     }
 
     pub async fn create_vm(&self, req: &CreateVmRequest) -> anyhow::Result<VmResponse> {
+        self.create_vm_with_request_id(req, None).await
+    }
+
+    pub async fn create_vm_with_request_id(
+        &self,
+        req: &CreateVmRequest,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<VmResponse> {
         let url = format!("{}/vms", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(req)
-            .timeout(self.create_vm_timeout)
-            .send()
-            .await
-            .context("send create vm request")?;
+        let resp = with_request_id(
+            self.client
+                .post(&url)
+                .json(req)
+                .timeout(self.create_vm_timeout),
+            request_id,
+        )
+        .send()
+        .await
+        .context("send create vm request")?;
         let status = resp.status();
         if !status.is_success() {
+            let upstream_request_id = response_request_id(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("failed to create vm: {status} {text}");
+            anyhow::bail!(
+                "{}",
+                upstream_error_message(
+                    "create vm",
+                    None,
+                    status,
+                    upstream_request_id.as_deref(),
+                    &text
+                )
+            );
         }
         resp.json().await.context("decode create vm response")
     }
@@ -98,26 +125,142 @@ impl MicrovmSpawnerClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("failed to delete vm {vm_id}: {status} {text}");
+            anyhow::bail!(
+                "{}",
+                upstream_error_message("delete vm", Some(vm_id), status, None, &text)
+            );
         }
         Ok(())
     }
 
-    pub async fn recover_vm(&self, vm_id: &str) -> anyhow::Result<VmResponse> {
-        let url = format!("{}/vms/{vm_id}/recover", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(RECOVER_VM_TIMEOUT)
+    pub async fn get_vm(&self, vm_id: &str) -> anyhow::Result<VmStatusResponse> {
+        self.get_vm_with_request_id(vm_id, None).await
+    }
+
+    pub async fn get_vm_with_request_id(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<VmStatusResponse> {
+        let url = format!("{}/vms/{vm_id}", self.base_url);
+        let resp = with_request_id(self.client.get(&url).timeout(GET_VM_TIMEOUT), request_id)
             .send()
             .await
-            .context("send recover vm request")?;
+            .context("send get vm request")?;
         let status = resp.status();
         if !status.is_success() {
+            let upstream_request_id = response_request_id(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("failed to recover vm {vm_id}: {status} {text}");
+            anyhow::bail!(
+                "{}",
+                upstream_error_message(
+                    "get vm",
+                    Some(vm_id),
+                    status,
+                    upstream_request_id.as_deref(),
+                    &text
+                )
+            );
+        }
+        resp.json().await.context("decode get vm response")
+    }
+
+    pub async fn recover_vm(&self, vm_id: &str) -> anyhow::Result<VmResponse> {
+        self.recover_vm_with_request_id(vm_id, None).await
+    }
+
+    pub async fn recover_vm_with_request_id(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<VmResponse> {
+        let url = format!("{}/vms/{vm_id}/recover", self.base_url);
+        let resp = with_request_id(
+            self.client.post(&url).timeout(RECOVER_VM_TIMEOUT),
+            request_id,
+        )
+        .send()
+        .await
+        .context("send recover vm request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let upstream_request_id = response_request_id(resp.headers());
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "{}",
+                upstream_error_message(
+                    "recover vm",
+                    Some(vm_id),
+                    status,
+                    upstream_request_id.as_deref(),
+                    &text
+                )
+            );
         }
         resp.json().await.context("decode recover vm response")
+    }
+}
+
+fn with_request_id(
+    request: reqwest::RequestBuilder,
+    request_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match request_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(request_id) => request.header(REQUEST_ID_HEADER, request_id),
+        None => request,
+    }
+}
+
+fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn format_request_id_suffix(request_id: Option<&str>) -> String {
+    request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|request_id| format!(" (request_id={request_id})"))
+        .unwrap_or_default()
+}
+
+fn sanitize_upstream_body(body: &str) -> Option<String> {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed.trim();
+    if collapsed.is_empty() {
+        return None;
+    }
+    const MAX_LEN: usize = 240;
+    if collapsed.len() <= MAX_LEN {
+        return Some(collapsed.to_string());
+    }
+    let mut truncated = collapsed
+        .char_indices()
+        .take_while(|(byte_idx, _)| *byte_idx < MAX_LEN)
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    truncated.push_str("...");
+    Some(truncated)
+}
+
+fn upstream_error_message(
+    action: &str,
+    vm_id: Option<&str>,
+    status: reqwest::StatusCode,
+    request_id: Option<&str>,
+    body: &str,
+) -> String {
+    let vm_suffix = vm_id.map(|vm_id| format!(" {vm_id}")).unwrap_or_default();
+    let request_id_suffix = format_request_id_suffix(request_id);
+    match sanitize_upstream_body(body) {
+        Some(body) => {
+            format!("failed to {action}{vm_suffix}: {status}{request_id_suffix} body={body}")
+        }
+        None => format!("failed to {action}{vm_suffix}: {status}{request_id_suffix}"),
     }
 }
 
@@ -717,14 +860,14 @@ mod tests {
     fn microvm_params_provided_detects_presence() {
         assert!(!microvm_params_provided(&MicrovmProvisionParams::default()));
         assert!(microvm_params_provided(&MicrovmProvisionParams {
-            spawner_url: Some("http://127.0.0.1:8080".to_string()),
+            spawner_url: Some("http://127.0.0.1:8081".to_string()),
         }));
     }
 
     #[tokio::test]
     async fn create_vm_contract_request_shape() {
         let (base_url, rx) =
-            spawn_one_shot_server("200 OK", r#"{"id":"vm-123","status":"running"}"#);
+            spawn_one_shot_server("200 OK", r#"{"id":"vm-123","status":"starting"}"#);
         let client = MicrovmSpawnerClient::new(base_url);
         let req = CreateVmRequest {
             guest_autostart: Some(GuestAutostartRequest {
@@ -734,15 +877,22 @@ mod tests {
             }),
         };
 
-        let vm = client.create_vm(&req).await.expect("create vm succeeds");
+        let vm = client
+            .create_vm_with_request_id(&req, Some("req-create-123"))
+            .await
+            .expect("create vm succeeds");
         assert_eq!(vm.id, "vm-123");
-        assert_eq!(vm.status.as_deref(), Some("running"));
+        assert_eq!(vm.status, "starting");
 
         let captured = rx
             .recv_timeout(StdDuration::from_secs(2))
             .expect("captured request");
         assert_eq!(captured.method, "POST");
         assert_eq!(captured.path, "/vms");
+        assert_eq!(
+            captured.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            Some("req-create-123")
+        );
 
         let json: serde_json::Value =
             serde_json::from_str(&captured.body).expect("parse json body");
@@ -775,29 +925,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_vm_contract_request_shape() {
+        let (base_url, rx) =
+            spawn_one_shot_server("200 OK", r#"{"id":"vm-get-1","status":"running"}"#);
+        let client = MicrovmSpawnerClient::new(base_url);
+
+        let vm = client
+            .get_vm_with_request_id("vm-get-1", Some("req-get-789"))
+            .await
+            .expect("get vm succeeds");
+        assert_eq!(vm.id, "vm-get-1");
+        assert_eq!(vm.status, "running");
+
+        let captured = rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/vms/vm-get-1");
+        assert_eq!(
+            captured.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            Some("req-get-789")
+        );
+        assert!(captured.body.is_empty());
+    }
+
+    #[tokio::test]
     async fn recover_vm_contract_request_shape() {
         let (base_url, rx) =
-            spawn_one_shot_server("200 OK", r#"{"id":"vm-recover-1","status":"starting"}"#);
+            spawn_one_shot_server("200 OK", r#"{"id":"vm-recover-1","status":"running"}"#);
         let client = MicrovmSpawnerClient::new(base_url);
 
         let recovered = client
-            .recover_vm("vm-recover-1")
+            .recover_vm_with_request_id("vm-recover-1", Some("req-recover-456"))
             .await
             .expect("recover vm succeeds");
         assert_eq!(recovered.id, "vm-recover-1");
-        assert_eq!(recovered.status.as_deref(), Some("starting"));
+        assert_eq!(recovered.status, "running");
 
         let captured = rx
             .recv_timeout(StdDuration::from_secs(2))
             .expect("captured request");
         assert_eq!(captured.method, "POST");
         assert_eq!(captured.path, "/vms/vm-recover-1/recover");
+        assert_eq!(
+            captured.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            Some("req-recover-456")
+        );
         assert!(captured.body.is_empty());
     }
 
     #[tokio::test]
     async fn create_vm_surfaces_error_body() {
-        let (base_url, _rx) = spawn_one_shot_server("503 Service Unavailable", "spawner down");
+        let (base_url, _rx) =
+            spawn_one_shot_server("503 Service Unavailable", "spawner down\nwith extra detail");
         let client = MicrovmSpawnerClient::new(base_url);
         let req = CreateVmRequest {
             guest_autostart: None,
@@ -810,7 +990,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("failed to create vm"));
         assert!(msg.contains("503 Service Unavailable"));
-        assert!(msg.contains("spawner down"));
+        assert!(msg.contains("body=spawner down with extra detail"));
     }
 
     #[tokio::test]
@@ -826,7 +1006,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("failed to delete vm vm-stuck"));
         assert!(msg.contains("500 Internal Server Error"));
-        assert!(msg.contains("vm stuck in cleanup"));
+        assert!(msg.contains("body=vm stuck in cleanup"));
     }
 
     #[tokio::test]
@@ -841,7 +1021,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("failed to recover vm vm-bad"));
         assert!(msg.contains("503 Service Unavailable"));
-        assert!(msg.contains("vm reboot failed"));
+        assert!(msg.contains("body=vm reboot failed"));
+    }
+
+    #[test]
+    fn sanitize_upstream_body_trims_whitespace_and_truncates() {
+        assert_eq!(
+            sanitize_upstream_body("  some\n spaced\ttext  "),
+            Some("some spaced text".to_string())
+        );
+        let long = "a".repeat(300);
+        let sanitized = sanitize_upstream_body(&long).expect("sanitized body");
+        assert_eq!(sanitized.len(), 243);
+        assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn sanitize_upstream_body_truncates_on_utf8_boundaries() {
+        let body = "é".repeat(200);
+        let sanitized = sanitize_upstream_body(&body).expect("sanitized body");
+        assert!(sanitized.ends_with("..."));
+        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
     }
 
     #[test]

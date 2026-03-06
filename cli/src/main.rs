@@ -24,6 +24,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const CHANNELS_MANIFEST_JSON: &str = include_str!("../../config/channels.json");
+const AGENT_API_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn default_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
@@ -398,12 +400,15 @@ enum AgentCommand {
         http: AgentHttpArgs,
     },
 
-    /// Ensure/reuse your agent, send one message, and optionally listen for replies
+    /// Ensure/reuse your personal agent, send one message, and optionally listen for replies
+    #[command(after_help = "Behavior:
+  - if --listen-timeout is 0, the command only sends the message
+  - if listening times out without any reply message, the command exits with `no_reply_within_timeout`")]
     Chat {
         #[command(flatten)]
         http: AgentHttpArgs,
 
-        /// Message content to send to your agent
+        /// Message content to send to your personal agent
         message: String,
 
         /// Listen duration (seconds) after sending (0 disables listening)
@@ -1778,12 +1783,38 @@ fn parse_agent_fields(agent: &serde_json::Value) -> anyhow::Result<(String, Stri
     Ok((agent_id, state))
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ChatSendOutcome {
+    ReplyReceived,
+    NoReplyWithinTimeout,
+    ListenDisabled,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct ListenSummary {
+    saw_matching_message: bool,
+}
+
+fn find_direct_group_with_peer(
+    mdk: &mdk_util::PikaMdk,
+    my_pubkey: &PublicKey,
+    peer_pubkey: &PublicKey,
+) -> anyhow::Result<Option<mdk_storage_traits::groups::types::Group>> {
+    let groups = mdk.get_groups().context("get groups")?;
+    Ok(groups.into_iter().find(|g| {
+        let members = mdk.get_members(&g.mls_group_id).unwrap_or_default();
+        let others: Vec<_> = members.iter().filter(|p| *p != my_pubkey).collect();
+        others.len() == 1 && *others[0] == *peer_pubkey
+    }))
+}
+
 async fn send_to_agent_and_optionally_listen(
     chat_cli: &Cli,
     agent_npub: &str,
     message: &str,
     listen_timeout: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ChatSendOutcome> {
+    let send_started_at = Timestamp::now().as_secs();
     cmd_send(
         chat_cli,
         None,
@@ -1796,9 +1827,37 @@ async fn send_to_agent_and_optionally_listen(
     )
     .await?;
     if listen_timeout > 0 {
-        cmd_listen(chat_cli, listen_timeout, 86400).await?;
+        let (keys, mdk) = open(chat_cli)?;
+        let agent_pubkey = PublicKey::parse(agent_npub).context("parse agent npub")?;
+        let expected_group_id =
+            find_direct_group_with_peer(&mdk, &keys.public_key(), &agent_pubkey)?
+                .map(|group| hex::encode(group.nostr_group_id));
+        let summary = listen_for_incoming(
+            chat_cli,
+            listen_timeout,
+            listen_timeout.max(5),
+            Some(agent_pubkey),
+            expected_group_id.as_deref(),
+            Some(send_started_at),
+        )
+        .await?;
+        return Ok(if summary.saw_matching_message {
+            ChatSendOutcome::ReplyReceived
+        } else {
+            ChatSendOutcome::NoReplyWithinTimeout
+        });
     }
-    Ok(())
+    Ok(ChatSendOutcome::ListenDisabled)
+}
+
+fn finish_chat_send(outcome: ChatSendOutcome, listen_timeout: u64) -> anyhow::Result<()> {
+    match outcome {
+        ChatSendOutcome::ReplyReceived | ChatSendOutcome::ListenDisabled => Ok(()),
+        ChatSendOutcome::NoReplyWithinTimeout => anyhow::bail!(
+            "no_reply_within_timeout: sent message but no reply arrived within {}s",
+            listen_timeout
+        ),
+    }
 }
 
 fn ensure_identity_for_state_dir(state_dir: &Path, keys: &Keys) -> anyhow::Result<()> {
@@ -1859,47 +1918,44 @@ async fn cmd_agent_chat(
         last_agent_npub = agent_npub.clone();
 
         if state == "ready" {
-            return send_to_agent_and_optionally_listen(
+            let outcome = send_to_agent_and_optionally_listen(
                 &chat_cli,
                 &agent_npub,
                 message,
                 listen_timeout,
             )
-            .await;
+            .await?;
+            return finish_chat_send(outcome, listen_timeout);
         }
 
         if state == "creating" && !ensured.created && !tried_optimistic_send {
-            if send_to_agent_and_optionally_listen(&chat_cli, &agent_npub, message, listen_timeout)
-                .await
-                .is_ok()
+            match send_to_agent_and_optionally_listen(
+                &chat_cli,
+                &agent_npub,
+                message,
+                listen_timeout,
+            )
+            .await
             {
-                return Ok(());
+                Ok(outcome) => return finish_chat_send(outcome, listen_timeout),
+                Err(_) => {
+                    tried_optimistic_send = true;
+                    eprintln!("optimistic send failed; continuing with recover/poll");
+                }
             }
-            tried_optimistic_send = true;
-            eprintln!("optimistic send failed; continuing with recover/poll");
         }
 
         if state == "error" {
             eprintln!("agent in error state; requesting recover");
-            if let Err(err) =
-                call_agent_api(http, reqwest::Method::POST, AGENT_API_RECOVER_PATH).await
-            {
-                eprintln!("recover request failed while state=error on attempt {attempt}: {err}");
-            }
+            let _ = call_agent_api(http, reqwest::Method::POST, AGENT_API_RECOVER_PATH).await;
         } else if state == "creating"
             && !recovered_stalled_creating
             && recover_after_attempt > 0
             && attempt >= recover_after_attempt
         {
             eprintln!("agent still creating after {attempt} checks; requesting recover");
-            match call_agent_api(http, reqwest::Method::POST, AGENT_API_RECOVER_PATH).await {
-                Ok(_) => recovered_stalled_creating = true,
-                Err(err) => {
-                    eprintln!(
-                        "recover request failed while state=creating on attempt {attempt}: {err}"
-                    );
-                }
-            }
+            let _ = call_agent_api(http, reqwest::Method::POST, AGENT_API_RECOVER_PATH).await;
+            recovered_stalled_creating = true;
         }
 
         if attempt < poll_attempts {
@@ -1907,16 +1963,19 @@ async fn cmd_agent_chat(
         }
     }
 
-    anyhow::ensure!(!last_agent_npub.is_empty(), "timed out waiting for agent");
+    anyhow::ensure!(
+        !last_agent_npub.is_empty(),
+        "timed out waiting for personal agent"
+    );
     eprintln!(
         "agent did not become ready (state={}); trying best-effort send",
         last_state
     );
-    if send_to_agent_and_optionally_listen(&chat_cli, &last_agent_npub, message, listen_timeout)
-        .await
-        .is_ok()
+    if let Ok(outcome) =
+        send_to_agent_and_optionally_listen(&chat_cli, &last_agent_npub, message, listen_timeout)
+            .await
     {
-        return Ok(());
+        return finish_chat_send(outcome, listen_timeout);
     }
     anyhow::bail!(
         "agent chat failed: state remained {} and send failed; try `pikachat agent recover --api-base-url {} --nsec <nsec>`",
@@ -1998,8 +2057,8 @@ async fn call_agent_api_raw(
     let auth = build_nip98_authorization_header(&nsec, &method, &url)?;
 
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(AGENT_API_CONNECT_TIMEOUT)
+        .timeout(AGENT_API_TIMEOUT)
         .build()
         .context("build agent api client")?;
     let mut request = client
@@ -2249,8 +2308,14 @@ async fn cmd_update_group_profile(
 }
 
 /// Listen for new incoming messages and welcomes. Prints each as a JSON line to stdout.
-/// This is the one subcommand that *does* stay running — it's an event tail.
-async fn cmd_listen(cli: &Cli, timeout_sec: u64, lookback_sec: u64) -> anyhow::Result<()> {
+async fn listen_for_incoming(
+    cli: &Cli,
+    timeout_sec: u64,
+    lookback_sec: u64,
+    expected_sender: Option<PublicKey>,
+    expected_group_id_hex: Option<&str>,
+    min_created_at: Option<u64>,
+) -> anyhow::Result<ListenSummary> {
     let (keys, mdk) = open(cli)?;
     let client = client(cli, &keys).await?;
 
@@ -2290,6 +2355,7 @@ async fn cmd_listen(cli: &Cli, timeout_sec: u64, lookback_sec: u64) -> anyhow::R
     }
 
     let mut seen = std::collections::HashSet::<EventId>::new();
+    let mut summary = ListenSummary::default();
 
     let deadline = if timeout_sec == 0 {
         None
@@ -2359,6 +2425,7 @@ async fn cmd_listen(cli: &Cli, timeout_sec: u64, lookback_sec: u64) -> anyhow::R
             let Some((ngid, mls_group_id)) = group_subs.get(&subscription_id).cloned() else {
                 continue;
             };
+            let is_incoming = msg.pubkey != keys.public_key();
             let line = json!({
                 "type": "message",
                 "nostr_group_id": ngid,
@@ -2369,11 +2436,22 @@ async fn cmd_listen(cli: &Cli, timeout_sec: u64, lookback_sec: u64) -> anyhow::R
                 "media": message_media_refs(&mdk, &mls_group_id, &msg.tags),
             });
             println!("{}", serde_json::to_string(&line).unwrap());
+            let sender_matches = expected_sender.is_none_or(|sender| msg.pubkey == sender);
+            let group_matches = expected_group_id_hex.is_none_or(|group_id| ngid == group_id);
+            let is_fresh = min_created_at.is_none_or(|min| msg.created_at.as_secs() >= min);
+            summary.saw_matching_message |=
+                is_incoming && sender_matches && group_matches && is_fresh;
         }
     }
 
     client.unsubscribe_all().await;
     client.shutdown().await;
+    Ok(summary)
+}
+
+/// This is the one subcommand that *does* stay running — it's an event tail.
+async fn cmd_listen(cli: &Cli, timeout_sec: u64, lookback_sec: u64) -> anyhow::Result<()> {
+    let _ = listen_for_incoming(cli, timeout_sec, lookback_sec, None, None, None).await?;
     Ok(())
 }
 
@@ -2400,6 +2478,7 @@ async fn cmd_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     struct AgentHttpParse {
         api_base_url: String,
@@ -2552,5 +2631,27 @@ mod tests {
         let (agent_id, state) = parse_agent_fields(&payload).expect("extract fields");
         assert_eq!(agent_id, "npub1test");
         assert_eq!(state, "creating");
+    }
+
+    #[test]
+    fn finish_chat_send_reports_no_reply_timeout() {
+        let err = finish_chat_send(ChatSendOutcome::NoReplyWithinTimeout, 12)
+            .expect_err("no reply must be an error");
+        assert!(err.to_string().contains("no_reply_within_timeout"));
+        assert!(err.to_string().contains("12s"));
+    }
+
+    #[test]
+    fn agent_chat_help_mentions_no_reply_timeout() {
+        let mut command = Cli::command();
+        let agent = command
+            .find_subcommand_mut("agent")
+            .expect("agent subcommand");
+        let chat = agent.find_subcommand_mut("chat").expect("chat subcommand");
+        let mut help = Vec::new();
+        chat.write_long_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("utf8 help");
+        assert!(help.contains("no_reply_within_timeout"));
+        assert!(help.contains("--listen-timeout"));
     }
 }
