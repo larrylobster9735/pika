@@ -29,18 +29,32 @@ git rebase origin/master
 ```
 If there are conflicts, fix them, `git rebase --continue`, commit, and push.
 
-2. **Full local build check (Rust + iOS + Android):**
+2. **Choose the smallest validation lane that matches the touched surface:**
 ```bash
-nix develop -c just qa
+git diff --name-only origin/master...HEAD
 ```
-This runs `fmt`, `clippy`, `test`, `android-assemble`, and `ios-build-sim` inside the nix shell (required for Android SDK and iOS tooling). All five must pass.
 
-3. **Fix any issues** found in build/test/fmt. Commit and force-push the rebased branch:
+- **Rust/shared scope**: if the PR touches `Cargo.toml`, `Cargo.lock`, `crates/**`, UniFFI/bindings generation, or anything else that changes shared Rust artifacts, run:
+  ```bash
+  nix develop -c just qa
+  ```
+- **Swift-only iOS scope**: if the PR is iOS/Swift-only, run:
+  ```bash
+  just ios-build-swift-sim
+  ```
+  For UI behavior changes, also prefer `just run-swift --sim` and manual QA.
+- **Android-only scope**: run:
+  ```bash
+  just android-assemble
+  ```
+- **Docs/skills/workflow-only scope**: no product build is required unless the changed workflow itself needs validation.
+
+3. **Fix any issues** found in the selected validation lane. Commit and force-push the rebased branch:
 ```bash
 git push --force-with-lease
 ```
 
-Only proceed to the main loop once the local build is green.
+Only proceed to the main loop once the required validation lane(s) are green.
 
 ---
 
@@ -117,14 +131,18 @@ gh run view <run_id> --log-failed 2>/dev/null | tail -200
 **Delegate review handling to a subagent** using the Agent tool so the main context stays clean:
 
 ```text
-Agent(subagent_type="general-purpose", prompt="Run /pr-review $PR — fetch all review comments, prioritize human > Devin > CodeRabbit, address actionable feedback, and reply to addressed comments. For comments you disagree with, reply explaining why and sign it 'claude'. Return a summary of what was fixed, what was skipped, and what needs the user's decision.")
+Agent(subagent_type="general-purpose", prompt="Fetch all PR feedback for $PR: PR comments, inline review comments, and review verdicts. Prioritize human reviewers first, then Devin, then CodeRabbit. Skip resolved threads, status-only bot comments, and comments on code that no longer exists. Address actionable feedback, batch fixes when sensible, reply to addressed comments, and for disagreements reply with rationale signed 'claude'. Return a summary of what was fixed, what was skipped with rationale, and what needs the user's decision.")
 ```
 
-This keeps the potentially large comment-fetching and code-reading work in an isolated context. The subagent handles human > Devin > CodeRabbit priority ordering and batches fixes.
+Priority rules for the subagent:
+- **Human reviewers**: always address; ask the user if the intent is unclear.
+- **Devin** (`devin-ai[bot]` / `devin-ai-integration[bot]`): address unless it conflicts with human feedback.
+- **CodeRabbit** (`coderabbitai[bot]`): address real bugs and clear improvements; skip churny nitpicks.
 
 ## Step 5: Commit and push
 
 ```bash
+# If Rust/shared code changed:
 cargo fmt -p pikachat -p pika_core 2>/dev/null || true
 git add <specific files>
 git commit -m "fix: <description>
@@ -139,13 +157,7 @@ Then go back to Step 1.
 
 ## Final Validation
 
-If any code changes were made during the loop, re-run the full build before reporting success:
-
-```bash
-nix develop -c just qa
-```
-
-This re-validates Rust (fmt, clippy, test) + Android (assembleDebug) + iOS (simulator build). If anything fails, fix it, commit, push, and do one more loop iteration.
+If any code changes were made during the loop, re-run the same validation lane chosen in pre-flight before reporting success. Use `nix develop -c just qa` only for Rust/shared scope. For Swift-only PRs, re-run `just ios-build-swift-sim`. For Android-only PRs, re-run `just android-assemble`.
 
 For visual verification of UI changes, record per-platform E2E test videos using the `/e2e-video` skill and upload them to blossom for the PR description.
 
@@ -155,7 +167,7 @@ For visual verification of UI changes, record per-platform E2E test videos using
 
 **Exit successfully when:**
 - All CI checks pass AND no unaddressed review comments remain
-- Local build/test/fmt all pass
+- Required validation lane(s) pass
 - PR is merged or closed
 
 **Exit with escalation to user when:**
