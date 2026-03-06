@@ -47,6 +47,7 @@ struct ChatView: View {
     @State private var voiceRecorder: VoiceRecorder
     @State private var showMicPermissionDenied = false
     @State private var isInputFocused = false
+    @State private var transcriptBottomInset: CGFloat = 0
 
     init(
         chatId: String,
@@ -105,19 +106,15 @@ struct ChatView: View {
 
     @ViewBuilder
     private func loadedChat(_ chat: ChatViewState) -> some View {
-        let viewportMetrics = MessageCollectionLayout.viewportMetrics()
         ZStack {
             chatBackground
                 .ignoresSafeArea()
 
-            messageList(
-                chat,
-                viewportMetrics: viewportMetrics
-            )
+            messageList(chat)
             .ignoresSafeArea(edges: [.top, .bottom])
             .overlay(alignment: .bottomTrailing) {
                 scrollToBottomButton(
-                    bottomPadding: viewportMetrics.jumpButtonBottomOffset
+                    bottomPadding: transcriptBottomInset + MessageCollectionLayout.jumpButtonSpacing
                 )
             }
         }
@@ -321,10 +318,7 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private func messageList(
-        _ chat: ChatViewState,
-        viewportMetrics: MessageCollectionViewportMetrics
-    ) -> some View {
+    private func messageList(_ chat: ChatViewState) -> some View {
         let messagesById = Dictionary(uniqueKeysWithValues: chat.messages.map { ($0.id, $0) })
         MessageCollectionList(
             rows: timelineRows(chat),
@@ -366,6 +360,7 @@ struct ChatView: View {
                     callback(chatId, oldestId, 30)
                 }
             },
+            bottomViewportInset: $transcriptBottomInset,
             followsBottom: $followsBottom,
             activeReactionMessageId: activeReactionMessageId,
             scrollRequest: scrollRequest

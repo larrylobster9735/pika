@@ -1,9 +1,5 @@
 import UIKit
 
-struct MessageCollectionViewportMetrics: Equatable {
-    let jumpButtonBottomOffset: CGFloat
-}
-
 enum MessageCollectionRowID {
     static let typingIndicator = "typing-indicator"
 }
@@ -15,13 +11,7 @@ enum MessageCollectionUpdateKind: Equatable {
 }
 
 enum MessageCollectionLayout {
-    static func viewportMetrics(
-        jumpButtonSpacing: CGFloat = 12
-    ) -> MessageCollectionViewportMetrics {
-        return MessageCollectionViewportMetrics(
-            jumpButtonBottomOffset: jumpButtonSpacing
-        )
-    }
+    static let jumpButtonSpacing: CGFloat = 12
 
     static func effectiveContentInset(
         boundsHeight: CGFloat,

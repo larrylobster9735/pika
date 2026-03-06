@@ -2,12 +2,8 @@ import XCTest
 @testable import Pika
 
 final class MessageCollectionLayoutTests: XCTestCase {
-    func testViewportMetricsShareChromeGeometryAcrossListAndJumpButton() {
-        let metrics = MessageCollectionLayout.viewportMetrics(
-            jumpButtonSpacing: 12
-        )
-
-        XCTAssertEqual(metrics.jumpButtonBottomOffset, 12)
+    func testJumpButtonSpacingMatchesDefaultChromeGap() {
+        XCTAssertEqual(MessageCollectionLayout.jumpButtonSpacing, 12)
     }
 
     func testEffectiveContentInsetBottomAlignsShortChats() {

@@ -34,6 +34,7 @@ struct MessageCollectionList<AccessoryContent: View>: UIViewControllerRepresenta
     var onRetryMessage: ((String) -> Void)?
     var onLoadOlderMessages: (() -> Void)?
 
+    @Binding var bottomViewportInset: CGFloat
     @Binding var followsBottom: Bool
     var activeReactionMessageId: String?
     var scrollRequest: MessageCollectionScrollRequest?
@@ -413,6 +414,7 @@ struct MessageCollectionList<AccessoryContent: View>: UIViewControllerRepresenta
         private func applyEffectiveInsetsIfNeeded() -> Bool {
             guard let collectionView, let viewController else { return false }
             collectionView.layoutIfNeeded()
+            syncBottomViewportInset(viewController.bottomViewportInset)
 
             let effectiveInset = MessageCollectionLayout.effectiveContentInset(
                 boundsHeight: collectionView.bounds.height,
@@ -422,13 +424,16 @@ struct MessageCollectionList<AccessoryContent: View>: UIViewControllerRepresenta
             guard effectiveInset != lastAppliedEffectiveInset else { return false }
             lastAppliedEffectiveInset = effectiveInset
             collectionView.contentInset = effectiveInset
-            collectionView.verticalScrollIndicatorInsets = UIEdgeInsets(
-                top: effectiveInset.top,
-                left: 0,
-                bottom: effectiveInset.bottom,
-                right: 0
-            )
+            collectionView.verticalScrollIndicatorInsets = .zero
             return true
+        }
+
+        private func syncBottomViewportInset(_ inset: CGFloat) {
+            guard abs(inset - parent.bottomViewportInset) > 0.5 else { return }
+            DispatchQueue.main.async {
+                guard abs(inset - self.parent.bottomViewportInset) > 0.5 else { return }
+                self.parent.bottomViewportInset = inset
+            }
         }
 
         private func indexPathSort(_ lhs: IndexPath, _ rhs: IndexPath) -> Bool {
