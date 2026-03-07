@@ -62,9 +62,9 @@ The workflow (`.github/workflows/ios-testflight.yml`) runs on:
 - `workflow_dispatch` for manual builds from the selected ref
 
 1. Checks out code on a `macos-26` runner
-2. Installs Nix and enters the dev shell
-3. Runs `just ios-xcframework ios-xcodeproj` to build the Rust core for device (`aarch64-apple-ios` only — no simulator slice needed) and generate the Xcode project
-4. On release-tag builds, verifies the pushed tag equals `pika/v$(cat VERSION)`
+2. On release-tag builds, verifies the pushed tag equals `pika/v$(./scripts/version-read --name)`
+3. Installs Nix and enters the dev shell
+4. Runs `just ios-xcframework ios-xcodeproj` to build the Rust core for device (`aarch64-apple-ios` only — no simulator slice needed) and generate the Xcode project
 5. Stamps a UTC timestamp (`YYYYMMDDHHMMSS`) as the build number
 6. Archives with `xcodebuild archive` using automatic signing
 7. Exports the IPA using `app-store-connect` method
