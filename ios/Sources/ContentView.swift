@@ -124,7 +124,6 @@ struct ContentView: View {
             }
         }
     }
-
     @ViewBuilder
     private var updateBanner: some View {
         Link(destination: URL(string: "https://apps.apple.com/app/id6741372509")!) {

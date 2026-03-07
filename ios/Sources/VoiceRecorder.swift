@@ -20,6 +20,7 @@ final class VoiceRecorder {
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SFSpeechRecognitionTask?
     private var lastDispatchedTranscript: String = ""
+    private var isUsingSimulatorFallback = false
 
     // Latest RMS power from the tap callback, read on main actor by the timer.
     private nonisolated(unsafe) var latestPower: Float = 0
@@ -30,6 +31,15 @@ final class VoiceRecorder {
 
     func startRecording() {
         guard !isRecording else { return }
+
+        #if targetEnvironment(simulator)
+        isUsingSimulatorFallback = true
+        isRecording = true
+        isPaused = false
+        lastDispatchedTranscript = ""
+        dispatchAction(.voiceRecordingStart)
+        return
+        #endif
 
         // Activate audio session BEFORE creating the engine / querying the
         // input format. After a previous stopEngine() deactivates the session,
@@ -102,6 +112,11 @@ final class VoiceRecorder {
 
     func stopRecording() async -> URL? {
         guard isRecording else { return nil }
+        if isUsingSimulatorFallback {
+            dispatchAction(.voiceRecordingStop)
+            resetState()
+            return nil
+        }
         dispatchAction(.voiceRecordingStop)
         stopEngine()
 
@@ -125,6 +140,11 @@ final class VoiceRecorder {
 
     func cancelRecording() {
         guard isRecording else { return }
+        if isUsingSimulatorFallback {
+            dispatchAction(.voiceRecordingCancel)
+            resetState()
+            return
+        }
         dispatchAction(.voiceRecordingCancel)
         stopEngine()
         if let cafURL = tempCAFURL {
@@ -135,6 +155,11 @@ final class VoiceRecorder {
 
     func pauseRecording() {
         guard isRecording, !isPaused else { return }
+        if isUsingSimulatorFallback {
+            isPaused = true
+            dispatchAction(.voiceRecordingPause)
+            return
+        }
         audioEngine?.pause()
         isPaused = true
         dispatchAction(.voiceRecordingPause)
@@ -142,6 +167,11 @@ final class VoiceRecorder {
 
     func resumeRecording() {
         guard isRecording, isPaused else { return }
+        if isUsingSimulatorFallback {
+            isPaused = false
+            dispatchAction(.voiceRecordingResume)
+            return
+        }
         try? audioEngine?.start()
         isPaused = false
         dispatchAction(.voiceRecordingResume)
@@ -220,6 +250,7 @@ final class VoiceRecorder {
     private func resetState() {
         isRecording = false
         isPaused = false
+        isUsingSimulatorFallback = false
         tempCAFURL = nil
         lastDispatchedTranscript = ""
         latestPower = 0

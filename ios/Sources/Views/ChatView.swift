@@ -3,8 +3,11 @@ import MarkdownUI
 import PhotosUI
 import AVFAudio
 import UniformTypeIdentifiers
+import os
 
 struct ChatView: View {
+    private static let logger = Logger(subsystem: "org.pikachat.pika", category: "ChatView")
+
     let chatId: String
     let state: ChatScreenState
     let voiceRecording: VoiceRecordingState?
@@ -30,8 +33,7 @@ struct ChatView: View {
     @State private var stagedMedia: [StagedMediaItem] = []
     @State private var showFileImporter = false
     @State private var messageText = ""
-    @State private var isAtBottom = true
-    @State private var shouldStickToBottom = true
+    @State private var followsBottom = true
     @State private var activeReactionMessageId: String?
     @State private var contextMenuMessage: ChatMessage?
     @State private var contextMenuAnchorFrame: CGRect = .zero
@@ -44,12 +46,9 @@ struct ChatView: View {
     @State private var fullscreenImageAttachment: ChatMediaAttachment?
     @State private var fullscreenImageAttachments: [ChatMediaAttachment] = []
     @State private var showPollComposer = false
-    @State private var scrollToBottomTrigger = 0
     @State private var voiceRecorder: VoiceRecorder
     @State private var showMicPermissionDenied = false
-    @FocusState private var isInputFocused: Bool
-
-    private let scrollButtonBottomPadding: CGFloat = 12
+    @State private var isInputFocused = false
 
     init(
         chatId: String,
@@ -108,25 +107,38 @@ struct ChatView: View {
 
     @ViewBuilder
     private func loadedChat(_ chat: ChatViewState) -> some View {
-        VStack(spacing: 8) {
-            if let liveCall = callFor(chat), liveCall.isLive {
-                ActiveCallPill(
-                    call: liveCall,
-                    peerName: chatTitle(chat),
-                    onTap: {
-                        onOpenCallScreen()
-                    }
-                )
-                .padding(.horizontal, 12)
-                .padding(.top, 2)
-            }
+        ZStack {
+            chatBackground
+                .ignoresSafeArea()
+
             messageList(chat)
+                .ignoresSafeArea(edges: [.top, .bottom])
         }
-        .modifier(FloatingInputBarModifier(content: { messageInputBar(chat: chat) }))
+        .safeAreaInset(edge: .top, spacing: 0) {
+            topOverlay(chat)
+        }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: false
+        ) { result in
+            handleFileImport(result)
+        }
+        .alert("Microphone Access Denied", isPresented: $showMicPermissionDenied) {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Enable microphone access in Settings to send voice messages.")
+        }
         .blur(radius: contextMenuMessage == nil ? 0 : 24)
         .allowsHitTesting(contextMenuMessage == nil)
         .navigationTitle(chat.isGroup ? chatTitle(chat) : "")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
             if chat.isGroup {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -304,11 +316,13 @@ struct ChatView: View {
     @ViewBuilder
     private func messageList(_ chat: ChatViewState) -> some View {
         let messagesById = Dictionary(uniqueKeysWithValues: chat.messages.map { ($0.id, $0) })
-        InvertedMessageList(
+        MessageCollectionList(
             rows: timelineRows(chat),
             chat: chat,
             messagesById: messagesById,
             isGroup: chat.isGroup,
+            accessoryContent: messageInputBar(chat: chat),
+            isInputFocused: isInputFocused,
             onSendMessage: onSendMessage,
             onTapSender: onTapSender,
             onReact: onReact,
@@ -342,42 +356,9 @@ struct ChatView: View {
                     callback(chatId, oldestId, 30)
                 }
             },
-            isAtBottom: $isAtBottom,
-            shouldStickToBottom: $shouldStickToBottom,
-            activeReactionMessageId: activeReactionMessageId,
-            scrollToBottomTrigger: scrollToBottomTrigger
+            followsBottom: $followsBottom,
+            activeReactionMessageId: activeReactionMessageId
         )
-        .onChangeCompat(of: chat.messages.last?.id) { newMessageId in
-            guard shouldStickToBottom else { return }
-            scrollToBottomTrigger += 1
-        }
-        .onChangeCompat(of: chat.chatId) {
-            shouldStickToBottom = true
-            scrollToBottomTrigger += 1
-        }
-        .onChangeCompat(of: isInputFocused) { focused in
-            guard focused else { return }
-            guard shouldStickToBottom else { return }
-            scrollToBottomTrigger += 1
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if !isAtBottom {
-                Button {
-                    shouldStickToBottom = true
-                    scrollToBottomTrigger += 1
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.footnote.weight(.semibold))
-                        .padding(10)
-                }
-                .foregroundStyle(.primary)
-                .background(.ultraThinMaterial, in: Circle())
-                .overlay(Circle().strokeBorder(.quaternary, lineWidth: 0.5))
-                .padding(.trailing, 16)
-                .padding(.bottom, scrollButtonBottomPadding)
-                .accessibilityLabel("Scroll to bottom")
-            }
-        }
     }
 
     private var loadingView: some View {
@@ -386,6 +367,28 @@ struct ChatView: View {
             Text("Loading chat...")
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var chatBackground: some View {
+        Color(uiColor: .systemBackground)
+    }
+
+    @ViewBuilder
+    private func topOverlay(_ chat: ChatViewState) -> some View {
+        VStack(spacing: 0) {
+            if let liveCall = callFor(chat), liveCall.isLive {
+                ActiveCallPill(
+                    call: liveCall,
+                    peerName: chatTitle(chat),
+                    onTap: {
+                        onOpenCallScreen()
+                    }
+                )
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private func chatTitle(_ chat: ChatViewState) -> String {
@@ -493,7 +496,7 @@ struct ChatView: View {
         }
     }
 
-    enum ChatTimelineRow: Identifiable {
+    enum ChatTimelineRow: Identifiable, Equatable {
         case messageGroup(GroupedChatMessage)
         case unreadDivider
         case callEvent(CallTimelineEvent)
@@ -669,13 +672,17 @@ struct ChatView: View {
                     messageText: $messageText,
                     selectedPhotoItems: $selectedPhotoItems,
                     stagedMedia: $stagedMedia,
-                    showFileImporter: $showFileImporter,
-                    showPollComposer: $showPollComposer,
                     showAttachButton: onSendMedia != nil,
                     showMicButton: onSendMedia != nil,
                     isInputFocused: $isInputFocused,
                     onSend: { sendMessage() },
                     onStartVoiceRecording: { startVoiceRecording() },
+                    onChooseFile: {
+                        showFileImporter = true
+                    },
+                    onCreatePoll: {
+                        showPollComposer = true
+                    },
                     onImagePaste: onSendMedia == nil ? nil : { data, mimeType in
                         let ext = mimeType == "image/gif" ? "gif" : "png"
                         let filename = "sticker.\(ext)"
@@ -744,44 +751,9 @@ struct ChatView: View {
                         }
                     }
                 }
-                .fileImporter(
-                    isPresented: $showFileImporter,
-                    allowedContentTypes: [.item],
-                    allowsMultipleSelection: false
-                ) { result in
-                    switch result {
-                    case .success(let urls):
-                        guard let url = urls.first else { return }
-                        let didStartAccess = url.startAccessingSecurityScopedResource()
-                        defer { if didStartAccess { url.stopAccessingSecurityScopedResource() } }
-
-                        guard let data = try? Data(contentsOf: url) else { return }
-
-                        let filename = url.lastPathComponent
-
-                        let caption = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !caption.isEmpty { messageText = "" }
-
-                        // mime_type empty — Rust infers from filename extension
-                        onSendMedia?(chatId, data, "", filename, caption)
-
-                    case .failure(let error):
-                        print("File import error: \(error.localizedDescription)")
-                    }
-                }
             }
         }
         .animation(.easeInOut(duration: 0.2), value: activeVoiceRecording?.phase)
-        .alert("Microphone Access Denied", isPresented: $showMicPermissionDenied) {
-            Button("Open Settings") {
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    UIApplication.shared.open(url)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Enable microphone access in Settings to send voice messages.")
-        }
     }
 
     private func sendVoiceRecording(using recording: VoiceRecordingState) {
@@ -825,6 +797,41 @@ struct ChatView: View {
             } else {
                 showMicPermissionDenied = true
             }
+        }
+    }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let filename = url.lastPathComponent
+            let originalDraft = messageText
+            let caption = originalDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let didStartAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didStartAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+
+                do {
+                    let data = try Data(contentsOf: url)
+                    DispatchQueue.main.async {
+                        if !caption.isEmpty, messageText == originalDraft {
+                            messageText = ""
+                        }
+
+                        // mime_type empty — Rust infers from filename extension
+                        onSendMedia?(chatId, data, "", filename, caption)
+                    }
+                } catch {
+                    Self.logger.error("File import read failed: \(error.localizedDescription)")
+                }
+            }
+
+        case .failure(let error):
+            Self.logger.error("File import failed: \(error.localizedDescription)")
         }
     }
 }
@@ -1088,6 +1095,7 @@ private struct EmojiPickerSheet: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func emojiSection(title: String, emojis: [String]) -> some View {
@@ -1124,18 +1132,6 @@ struct UnreadDividerRow: View {
             Divider()
         }
         .padding(.vertical, 8)
-    }
-}
-
-
-
-private struct FloatingInputBarModifier<Bar: View>: ViewModifier {
-    @ViewBuilder var content: Bar
-
-    func body(content view: Content) -> some View {
-        view.safeAreaInset(edge: .bottom, spacing: 0) {
-            content
-        }
     }
 }
 

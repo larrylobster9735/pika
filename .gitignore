@@ -21,8 +21,10 @@ android/local.properties
 # iOS
 ios/.build/
 ios/build/
+ios/build-fresh*/
 ios/build-device/
 ios/build-appstore/
+ios/build-logs/
 ios/Frameworks/
 ios/**/xcuserdata/
 ios/Pika.xcodeproj/project.pbxproj
@@ -67,6 +69,7 @@ secrets/.zapstore-sign-with.*
 screen_recordings/
 cmd/pika-relay/data/
 bots/__pycache__/
+tools/__pycache__/
 tools/agent-pty/__pycache__/
 
 # Avoid accidentally staging enormous vendored build output.

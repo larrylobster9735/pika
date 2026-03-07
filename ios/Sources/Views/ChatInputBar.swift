@@ -7,13 +7,13 @@ struct ChatInputBar: View {
     @Binding var messageText: String
     @Binding var selectedPhotoItems: [PhotosPickerItem]
     @Binding var stagedMedia: [StagedMediaItem]
-    @Binding var showFileImporter: Bool
-    @Binding var showPollComposer: Bool
     let showAttachButton: Bool
     let showMicButton: Bool
-    @FocusState.Binding var isInputFocused: Bool
+    @Binding var isInputFocused: Bool
     let onSend: () -> Void
     let onStartVoiceRecording: () -> Void
+    let onChooseFile: () -> Void
+    let onCreatePoll: () -> Void
     var onImagePaste: ((Data, String) -> Void)? = nil
 
     @State private var showPhotoPicker = false
@@ -47,13 +47,13 @@ struct ChatInputBar: View {
                         }
 
                         Button {
-                            showFileImporter = true
+                            onChooseFile()
                         } label: {
                             Label("File", systemImage: "doc")
                         }
 
                         Button {
-                            showPollComposer = true
+                            onCreatePoll()
                         } label: {
                             Label("Poll", systemImage: "chart.bar")
                         }
@@ -112,10 +112,12 @@ struct ChatInputBar: View {
                         .transition(.scale.combined(with: .opacity))
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .animation(.easeInOut(duration: 0.15), value: messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && stagedMedia.isEmpty)
                 .modifier(GlassInputModifier())
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.vertical, 12)
     }
@@ -169,7 +171,7 @@ private struct StagedMediaThumbnail: View {
 /// and forwards image data via `onImagePaste`.
 struct StickerAwareTextView: UIViewRepresentable {
     @Binding var text: String
-    var isFocused: FocusState<Bool>.Binding
+    @Binding var isFocused: Bool
     var maxHeight: CGFloat = 150
     var onSend: (() -> Void)?
     var onImagePaste: ((Data, String) -> Void)?
@@ -212,6 +214,18 @@ struct StickerAwareTextView: UIViewRepresentable {
             onImagePaste?(data, mime)
         }
         uiView.onReturnKey = { onSend?() }
+
+        if isFocused && !uiView.isFirstResponder {
+            DispatchQueue.main.async {
+                guard self.isFocused, !uiView.isFirstResponder else { return }
+                uiView.becomeFirstResponder()
+            }
+        } else if !isFocused && uiView.isFirstResponder {
+            DispatchQueue.main.async {
+                guard !self.isFocused, uiView.isFirstResponder else { return }
+                uiView.resignFirstResponder()
+            }
+        }
     }
 
     class Coordinator: NSObject, UITextViewDelegate, UITextPasteDelegate {
@@ -312,11 +326,11 @@ struct StickerAwareTextView: UIViewRepresentable {
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
-            parent.isFocused.wrappedValue = true
+            parent.isFocused = true
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
-            parent.isFocused.wrappedValue = false
+            parent.isFocused = false
         }
     }
 }
@@ -440,9 +454,7 @@ private struct ChatInputBarPreview: View {
     @State var messageText = ""
     @State var selectedPhotoItems: [PhotosPickerItem] = []
     @State var stagedMedia: [StagedMediaItem] = []
-    @State var showFileImporter = false
-    @State var showPollComposer = false
-    @FocusState var isInputFocused: Bool
+    @State var isInputFocused = false
 
     let showAttach: Bool
     let showMic: Bool
@@ -452,13 +464,13 @@ private struct ChatInputBarPreview: View {
             messageText: $messageText,
             selectedPhotoItems: $selectedPhotoItems,
             stagedMedia: $stagedMedia,
-            showFileImporter: $showFileImporter,
-            showPollComposer: $showPollComposer,
             showAttachButton: showAttach,
             showMicButton: showMic,
             isInputFocused: $isInputFocused,
             onSend: {},
-            onStartVoiceRecording: {}
+            onStartVoiceRecording: {},
+            onChooseFile: {},
+            onCreatePoll: {}
         )
     }
 }
