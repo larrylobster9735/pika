@@ -1037,7 +1037,7 @@ async fn cmd_invite(cli: &Cli, peer_str: &str, group_name: &str) -> anyhow::Resu
         PublicKey::parse(peer_str.trim()).with_context(|| format!("parse peer key: {peer_str}"))?;
 
     // Fetch peer key package from key-package relays.
-    let peer_kp = relay_util::fetch_latest_key_package(
+    let peer_kp = relay_util::fetch_latest_key_package_for_mdk(
         &client,
         &peer_pubkey,
         &kp_relays,
@@ -1327,7 +1327,7 @@ async fn cmd_send(
                 // Auto-create a DM group.
                 let c = client_all(cli, &keys).await?;
                 let kp_relays = relay_util::parse_relay_urls(&resolve_kp_relays(cli))?;
-                let peer_kp = match relay_util::fetch_latest_key_package(
+                let peer_kp = match relay_util::fetch_latest_key_package_for_mdk(
                     &c,
                     &peer_pubkey,
                     &kp_relays,
@@ -1339,7 +1339,7 @@ async fn cmd_send(
                     Err(primary_err) => {
                         // If kp relays are defaults, retry on active message relays.
                         if cli.kp_relay.is_empty() && kp_relays != relays {
-                            relay_util::fetch_latest_key_package(
+                            relay_util::fetch_latest_key_package_for_mdk(
                                 &c,
                                 &peer_pubkey,
                                 &relays,
@@ -1358,7 +1358,6 @@ async fn cmd_send(
                         }
                     }
                 };
-
                 let config = NostrGroupConfigData::new(
                     "DM".to_string(),
                     String::new(),
@@ -1529,7 +1528,7 @@ async fn cmd_send_hypernote(
             } else {
                 let c = client_all(cli, &keys).await?;
                 let kp_relays = relay_util::parse_relay_urls(&resolve_kp_relays(cli))?;
-                let peer_kp = match relay_util::fetch_latest_key_package(
+                let peer_kp = match relay_util::fetch_latest_key_package_for_mdk(
                     &c,
                     &peer_pubkey,
                     &kp_relays,
@@ -1540,7 +1539,7 @@ async fn cmd_send_hypernote(
                     Ok(kp) => kp,
                     Err(primary_err) => {
                         if cli.kp_relay.is_empty() && kp_relays != relays {
-                            relay_util::fetch_latest_key_package(
+                            relay_util::fetch_latest_key_package_for_mdk(
                                 &c,
                                 &peer_pubkey,
                                 &relays,
