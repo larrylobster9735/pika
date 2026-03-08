@@ -25,7 +25,8 @@ use pika_marmot_runtime::message::{
     classify_message as classify_shared_message,
 };
 use pika_marmot_runtime::welcome::{
-    AcceptedWelcome, accept_welcome_and_catch_up, take_pending_welcome,
+    AcceptedWelcome, CreatedGroup, accept_welcome_and_catch_up, create_group_and_publish_welcomes,
+    take_pending_welcome,
 };
 use pika_media::codec_opus::{OpusCodec, OpusPacket};
 use pika_media::crypto::{FrameInfo, decrypt_frame, encrypt_frame};
@@ -54,6 +55,7 @@ use pika_media::crypto::{FrameKeyMaterial, opaque_participant_label};
 
 const PROTOCOL_VERSION: u32 = 1;
 const ACCEPT_WELCOME_BACKLOG_LIMIT: usize = 200;
+const INIT_GROUP_WELCOME_EXPIRATION_SECS: u64 = 30 * 24 * 60 * 60;
 
 async fn accept_welcome_with_backfill<F, Fut>(
     mdk: &MDK<MdkSqliteStorage>,
@@ -78,6 +80,76 @@ where
         after_accept,
     )
     .await
+}
+
+async fn create_group_and_publish_welcomes_for_init_group<F, Fut>(
+    keys: &Keys,
+    mdk: &MDK<MdkSqliteStorage>,
+    peer_kp: Event,
+    peer_pubkey: PublicKey,
+    config: NostrGroupConfigData,
+    publish_giftwrap: F,
+) -> anyhow::Result<CreatedGroup>
+where
+    F: FnMut(PublicKey, Event) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let expires =
+        Timestamp::from_secs(Timestamp::now().as_secs() + INIT_GROUP_WELCOME_EXPIRATION_SECS);
+    create_group_and_publish_welcomes(
+        keys,
+        mdk,
+        vec![peer_kp],
+        config,
+        &[peer_pubkey],
+        vec![Tag::expiration(expires)],
+        publish_giftwrap,
+    )
+    .await
+    .context("init_group")
+}
+
+async fn create_group_and_publish_welcomes_for_init_group_with_confirm(
+    keys: &Keys,
+    mdk: &MDK<MdkSqliteStorage>,
+    client: &Client,
+    relay_urls: &[RelayUrl],
+    peer_kp: Event,
+    peer_pubkey: PublicKey,
+    config: NostrGroupConfigData,
+) -> anyhow::Result<CreatedGroup> {
+    create_group_and_publish_welcomes_for_init_group(
+        keys,
+        mdk,
+        peer_kp,
+        peer_pubkey,
+        config,
+        |_receiver, giftwrap| async move {
+            publish_and_confirm_multi(client, relay_urls, &giftwrap, "init_group_welcome")
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+fn map_init_group_error(err: &anyhow::Error) -> (&'static str, String) {
+    if err
+        .chain()
+        .any(|cause| cause.to_string().contains("build welcome giftwrap"))
+    {
+        ("gift_wrap_failed", format!("{err:#}"))
+    } else if err
+        .chain()
+        .any(|cause| cause.to_string().contains("publish welcome to"))
+        || err
+            .chain()
+            .any(|cause| cause.to_string().contains("init_group_welcome"))
+    {
+        ("publish_failed", format!("{err:#}"))
+    } else {
+        ("mdk_error", format!("create_group: {err:#}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3794,47 +3866,31 @@ pub async fn daemon_main(
                             vec![keys.public_key(), peer_pubkey],
                         );
 
-                        let group_result = match mdk.create_group(&keys.public_key(), vec![peer_kp], config) {
-                            Ok(r) => r,
+                        let created = match create_group_and_publish_welcomes_for_init_group_with_confirm(
+                            &keys,
+                            &mdk,
+                            &client,
+                            &relay_urls,
+                            peer_kp,
+                            peer_pubkey,
+                            config,
+                        )
+                        .await
+                        {
+                            Ok(created) => created,
                             Err(e) => {
-                                reply_tx.send(out_error(request_id, "mdk_error", format!("create_group: {e:#}"))).ok();
+                                let (code, message) = map_init_group_error(&e);
+                                reply_tx.send(out_error(request_id, code, message)).ok();
                                 continue;
                             }
                         };
 
-                        let nostr_group_id_hex = hex::encode(group_result.group.nostr_group_id);
-                        let mls_group_id_hex = hex::encode(group_result.group.mls_group_id.as_slice());
+                        let nostr_group_id_hex = hex::encode(created.group.nostr_group_id);
+                        let mls_group_id_hex = hex::encode(created.group.mls_group_id.as_slice());
 
                         // Daemon init_group is stricter than app create: it
                         // waits for welcome delivery and subscribes before
                         // reporting success to the host protocol.
-                        let expires = Timestamp::from_secs(Timestamp::now().as_secs() + 30 * 24 * 60 * 60);
-                        let mut publish_failed = false;
-                        for rumor in group_result.welcome_rumors {
-                            let giftwrap = match EventBuilder::gift_wrap(
-                                &keys,
-                                &peer_pubkey,
-                                rumor,
-                                [Tag::expiration(expires)],
-                            )
-                            .await
-                            {
-                                Ok(gw) => gw,
-                                Err(e) => {
-                                    reply_tx.send(out_error(request_id.clone(), "gift_wrap_failed", format!("{e:#}"))).ok();
-                                    publish_failed = true;
-                                    break;
-                                }
-                            };
-                            if let Err(e) = publish_and_confirm_multi(&client, &relay_urls, &giftwrap, "init_group_welcome").await {
-                                reply_tx.send(out_error(request_id.clone(), "publish_failed", format!("{e:#}"))).ok();
-                                publish_failed = true;
-                                break;
-                            }
-                        }
-                        if publish_failed {
-                            continue;
-                        }
 
                         // Subscribe to new group messages.
                         match crate::subscribe_group_msgs(&client, &nostr_group_id_hex).await {
@@ -3851,7 +3907,7 @@ pub async fn daemon_main(
                             "mls_group_id": mls_group_id_hex,
                             "peer_pubkey": peer_pubkey.to_hex(),
                         })))).ok();
-                        let member_count = mdk.get_members(&group_result.group.mls_group_id).map(|m| m.len() as u32).unwrap_or(0);
+                        let member_count = mdk.get_members(&created.group.mls_group_id).map(|m| m.len() as u32).unwrap_or(0);
                         out_tx.send(OutMsg::GroupCreated {
                             nostr_group_id: nostr_group_id_hex,
                             mls_group_id: mls_group_id_hex,
@@ -4446,6 +4502,66 @@ mod tests {
                 .expect("get pending welcomes")
                 .is_empty(),
             "shared daemon helper should clear the pending welcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_group_uses_shared_runtime_helper_and_keeps_expiration_tag() {
+        let inviter_dir = tempfile::tempdir().expect("inviter tempdir");
+        let invitee_dir = tempfile::tempdir().expect("invitee tempdir");
+        let inviter_keys = Keys::generate();
+        let invitee_keys = Keys::generate();
+        let inviter_mdk = crate::open_mdk(inviter_dir.path()).expect("open inviter mdk");
+        let invitee_mdk = crate::open_mdk(invitee_dir.path()).expect("open invitee mdk");
+
+        let invitee_kp = make_key_package_event(&invitee_mdk, &invitee_keys);
+        let config = NostrGroupConfigData::new(
+            "Daemon init_group test".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").expect("relay url")],
+            vec![inviter_keys.public_key(), invitee_keys.public_key()],
+        );
+        let published =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(PublicKey, Event)>::new()));
+        let published_capture = std::sync::Arc::clone(&published);
+
+        let created = create_group_and_publish_welcomes_for_init_group(
+            &inviter_keys,
+            &inviter_mdk,
+            invitee_kp,
+            invitee_keys.public_key(),
+            config,
+            move |receiver, giftwrap| {
+                let published_capture = std::sync::Arc::clone(&published_capture);
+                async move {
+                    published_capture
+                        .lock()
+                        .expect("published lock")
+                        .push((receiver, giftwrap));
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("init group create/publish");
+
+        assert_eq!(created.group.name, "Daemon init_group test");
+        assert_eq!(created.published_welcomes.len(), 1);
+        assert_eq!(
+            created.published_welcomes[0].receiver,
+            invitee_keys.public_key()
+        );
+
+        let published = published.lock().expect("published lock");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, invitee_keys.public_key());
+        assert_eq!(published[0].1.kind, Kind::GiftWrap);
+        assert!(
+            published[0].1.tags.expiration().is_some(),
+            "daemon init_group should keep its expiration-tag policy local"
         );
     }
 
