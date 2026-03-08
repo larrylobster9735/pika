@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::sync::Arc;
 use std::thread;
 
 use anyhow::Context;
 
+use crate::auth::normalize_npub;
 use crate::config::Config;
 use crate::github::GitHubClient;
 use crate::model::{self, GenerationError, PromptInput, PromptPrMetadata};
@@ -27,6 +29,16 @@ pub fn run_generation_pass(store: &Store, config: &Config) -> anyhow::Result<Wor
         return Ok(WorkerPassResult::default());
     }
 
+    let mut configured_npubs = normalized_configured_npubs(
+        &config.effective_bootstrap_admin_npubs(),
+        "bootstrap_admin_npubs",
+    );
+    configured_npubs.extend(normalized_configured_npubs(
+        &config.allowed_npubs,
+        "allowed_npubs",
+    ));
+    let configured_npubs: Vec<String> = configured_npubs.into_iter().collect();
+
     let github = Arc::new(
         GitHubClient::new(env::var(&config.github_token_env).ok())
             .context("initialize GitHub client for worker")?,
@@ -40,7 +52,7 @@ pub fn run_generation_pass(store: &Store, config: &Config) -> anyhow::Result<Wor
         let model = config.model.clone();
         let api_key_env = config.api_key_env.clone();
         let retry_backoff_secs = config.retry_backoff_secs;
-        let allowed_npubs = config.allowed_npubs.clone();
+        let configured_npubs = configured_npubs.clone();
 
         handles.push(thread::spawn(move || {
             process_job(
@@ -50,7 +62,7 @@ pub fn run_generation_pass(store: &Store, config: &Config) -> anyhow::Result<Wor
                 &model,
                 &api_key_env,
                 retry_backoff_secs,
-                &allowed_npubs,
+                &configured_npubs,
             )
         }));
     }
@@ -92,7 +104,7 @@ fn process_job(
     model_name: &str,
     api_key_env: &str,
     retry_backoff_secs: u64,
-    allowed_npubs: &[String],
+    configured_npubs: &[String],
 ) -> anyhow::Result<JobOutcome> {
     let diff = github
         .fetch_pull_diff(&job.repo, job.pr_number)
@@ -175,7 +187,7 @@ fn process_job(
 
     let tutorial_json =
         serde_json::to_string(&gen_output.tutorial).context("serialize tutorial JSON")?;
-    store
+    let activated = store
         .mark_generation_ready(
             job.artifact_id,
             &tutorial_json,
@@ -186,11 +198,27 @@ fn process_job(
         )
         .with_context(|| format!("mark artifact {} ready", job.artifact_id))?;
 
-    if !allowed_npubs.is_empty() {
-        if let Err(err) = store.populate_inbox(job.pr_id, allowed_npubs) {
+    let mut recipients: BTreeSet<String> = configured_npubs.iter().cloned().collect();
+    match store.list_active_chat_allowlist_npubs() {
+        Ok(npubs) => {
+            for npub in npubs {
+                recipients.insert(npub);
+            }
+        }
+        Err(err) => {
             eprintln!(
-                "warning: failed to populate inbox for pr_id {}: {}",
+                "warning: failed to read active chat allowlist for pr_id {}: {}",
                 job.pr_id, err
+            );
+        }
+    }
+
+    if activated && !recipients.is_empty() {
+        let recipients: Vec<String> = recipients.into_iter().collect();
+        if let Err(err) = store.populate_inbox(job.artifact_id, &recipients) {
+            eprintln!(
+                "warning: failed to populate inbox for artifact {}: {}",
+                job.artifact_id, err
             );
         }
     }
@@ -198,9 +226,29 @@ fn process_job(
     Ok(JobOutcome::Ready)
 }
 
+pub fn normalized_configured_npubs(inputs: &[String], context: &str) -> BTreeSet<String> {
+    let mut normalized = BTreeSet::new();
+    for input in inputs {
+        match normalize_npub(input) {
+            Ok(npub) => {
+                normalized.insert(npub);
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: ignoring invalid {} entry {}: {}",
+                    context, input, err
+                );
+            }
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WorkerPassResult;
+    use nostr::key::PublicKey;
+
+    use super::{normalized_configured_npubs, WorkerPassResult};
 
     #[test]
     fn result_defaults_are_zeroed() {
@@ -209,5 +257,14 @@ mod tests {
         assert_eq!(result.ready, 0);
         assert_eq!(result.failed, 0);
         assert_eq!(result.retry_scheduled, 0);
+    }
+
+    #[test]
+    fn configured_npubs_are_normalized_and_deduped() {
+        let npub = "npub1zxu639qym0esxnn7rzrt48wycmfhdu3e5yvzwx7ja3t84zyc2r8qz8cx2y";
+        let hex = PublicKey::parse(npub).expect("parse npub").to_hex();
+        let normalized = normalized_configured_npubs(&[npub.to_string(), hex], "test");
+        assert_eq!(normalized.len(), 1);
+        assert!(normalized.contains(npub));
     }
 }
