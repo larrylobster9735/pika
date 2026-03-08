@@ -6086,6 +6086,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "hypernote-protocol",
  "mdk-core",
  "mdk-sqlite-storage",
  "mdk-storage-traits",
@@ -6095,6 +6096,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

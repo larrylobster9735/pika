@@ -19,6 +19,10 @@ use pika_marmot_runtime::call::{
     parse_call_signal as parse_shared_call_signal,
     validate_relay_auth_token as validate_shared_relay_auth_token,
 };
+use pika_marmot_runtime::message::{
+    CALL_SIGNAL_KIND, MessageClassification, TYPING_INDICATOR_KIND,
+    classify_message as classify_shared_message,
+};
 use pika_media::codec_opus::{OpusCodec, OpusPacket};
 use pika_media::crypto::{FrameInfo, decrypt_frame, encrypt_frame};
 use pika_media::network::NetworkRelay;
@@ -361,7 +365,7 @@ fn default_group_name() -> String {
 const MAX_CHAT_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 
 use pika_marmot_runtime::media::{is_imeta_tag, mime_from_extension};
-use pika_marmot_runtime::relay::fetch_latest_key_package_for_mdk;
+use pika_marmot_runtime::relay::{fetch_latest_key_package_for_mdk, publish_and_confirm};
 
 fn blossom_servers_or_default(values: &[String]) -> Vec<String> {
     pika_relay_profiles::blossom_servers_or_default(values)
@@ -958,7 +962,7 @@ async fn send_call_signal(
         mdk,
         keys,
         nostr_group_id,
-        Kind::Custom(10),
+        CALL_SIGNAL_KIND,
         payload,
         label,
     )
@@ -1986,16 +1990,7 @@ async fn publish_without_confirm_multi(
     event: &Event,
     label: &str,
 ) -> anyhow::Result<()> {
-    let out = client
-        .send_event_to(relays.to_vec(), event)
-        .await
-        .with_context(|| format!("send_event_to failed ({label})"))?;
-    if out.success.is_empty() {
-        return Err(anyhow!(
-            "event publish had no successful relays ({label}): {out:?}"
-        ));
-    }
-    Ok(())
+    publish_and_confirm(client, relays, event, label).await
 }
 
 async fn stdout_writer(mut rx: mpsc::UnboundedReceiver<OutMsg>) -> anyhow::Result<()> {
@@ -2057,10 +2052,10 @@ fn parse_relay_list(relay: &str, relays_override: &[String]) -> anyhow::Result<V
     Ok(out)
 }
 
-const TYPING_INDICATOR_KIND: Kind = Kind::Custom(20_067);
-
-fn is_typing_indicator(msg: &mdk_storage_traits::messages::types::Message) -> bool {
-    msg.kind == TYPING_INDICATOR_KIND && msg.content == "typing"
+fn classify_daemon_message(
+    msg: &mdk_storage_traits::messages::types::Message,
+) -> Option<MessageClassification> {
+    classify_shared_message(msg.kind, &msg.content, msg.tags.iter())
 }
 
 fn event_h_tag_hex(ev: &Event) -> Option<String> {
@@ -2529,7 +2524,9 @@ pub async fn daemon_main(
                                                 if !sender_allowed(&msg.pubkey.to_hex()) {
                                                     continue;
                                                 }
-                                                if is_typing_indicator(&msg) {
+                                                if classify_daemon_message(&msg)
+                                                    == Some(MessageClassification::TypingIndicator)
+                                                {
                                                     continue;
                                                 }
                                                 let media: Vec<MediaAttachmentOut> = {
@@ -4179,7 +4176,9 @@ pub async fn daemon_main(
                                 }
                                 continue;
                             }
-                            if is_typing_indicator(&msg) {
+                            if classify_daemon_message(&msg)
+                                == Some(MessageClassification::TypingIndicator)
+                            {
                                 continue;
                             }
                             let mut media: Vec<MediaAttachmentOut> = Vec::new();
@@ -4239,6 +4238,30 @@ mod tests {
         EventId::from_hex(hex).expect("valid event id")
     }
 
+    fn make_test_message(
+        kind: Kind,
+        content: &str,
+        tags: Tags,
+    ) -> mdk_storage_traits::messages::types::Message {
+        let pubkey = Keys::generate().public_key();
+        let created_at = Timestamp::from(123_u64);
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3]);
+        mdk_storage_traits::messages::types::Message {
+            id: EventId::all_zeros(),
+            mls_group_id: mls_group_id.clone(),
+            pubkey,
+            kind,
+            created_at,
+            processed_at: created_at,
+            content: content.to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(pubkey, created_at, kind, tags, content.to_string()),
+            wrapper_event_id: EventId::all_zeros(),
+            epoch: None,
+            state: message_types::MessageState::Processed,
+        }
+    }
+
     #[test]
     fn find_pending_welcome_index_matches_wrapper_or_welcome_id_only() {
         let items = vec![
@@ -4269,6 +4292,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn daemon_typing_detection_uses_shared_classifier() {
+        let typing = make_test_message(
+            TYPING_INDICATOR_KIND,
+            "typing",
+            vec![Tag::parse(["d", "pika"]).expect("pika tag")]
+                .into_iter()
+                .collect(),
+        );
+        let unmarked = make_test_message(TYPING_INDICATOR_KIND, "typing", Tags::new());
+
+        assert_eq!(
+            classify_daemon_message(&typing),
+            Some(MessageClassification::TypingIndicator)
+        );
+        assert_eq!(classify_daemon_message(&unmarked), None);
     }
 
     #[test]
