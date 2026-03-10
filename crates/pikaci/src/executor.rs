@@ -1220,7 +1220,7 @@ fn ssh_binary() -> String {
         .unwrap_or_else(|_| "/usr/bin/ssh".to_string())
 }
 
-fn ssh_nix_binary() -> String {
+pub(crate) fn ssh_nix_binary() -> String {
     std::env::var(PREPARED_OUTPUT_FULFILLMENT_SSH_NIX_BINARY_ENV)
         .unwrap_or_else(|_| "nix".to_string())
 }
@@ -1256,7 +1256,7 @@ fn ensure_remote_microvm_directories(
     )
 }
 
-fn sync_snapshot_to_remote(
+pub(crate) fn sync_snapshot_to_remote(
     local_snapshot_dir: &Path,
     remote_snapshot_dir: &Path,
     remote_host: &str,
