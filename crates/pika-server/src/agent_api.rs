@@ -1187,6 +1187,12 @@ pub(crate) async fn recover_agent_for_owner(
         Some(vm_id) => format!("Recover requested for Managed OpenClaw on VM {vm_id}."),
         None => "Recover requested for Managed OpenClaw without a recoverable VM.".to_string(),
     };
+    if is_inflight_provision_row(&active) {
+        return Ok(ManagedEnvironmentAction {
+            row: active,
+            startup_phase: AgentStartupPhase::ProvisioningVm,
+        });
+    }
     record_managed_environment_event(
         &mut conn,
         owner_npub,
@@ -1338,9 +1344,20 @@ pub(crate) async fn reset_agent_for_owner(
         })?;
         let existing = load_visible_agent_row(&mut conn, owner_npub)
             .map_err(|err| err.with_request_id(request_id.to_string()))?;
+        if let Some(existing) = existing
+            .as_ref()
+            .filter(|row| is_inflight_provision_row(row))
+        {
+            return Ok(ManagedEnvironmentAction {
+                row: existing.clone(),
+                startup_phase: AgentStartupPhase::ProvisioningVm,
+            });
+        }
         let reset_requested_message = match existing.as_ref() {
-            Some(_) => "Destructive reset requested. The current managed environment will be replaced."
-                .to_string(),
+            Some(_) => {
+                "Destructive reset requested. The current managed environment will be replaced."
+                    .to_string()
+            }
             None => "Destructive reset requested without an existing managed environment. Provisioning a fresh Managed OpenClaw environment."
                 .to_string(),
         };
