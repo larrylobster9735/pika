@@ -759,7 +759,14 @@ impl Store {
         if npubs.is_empty() {
             return Ok(0);
         }
-        self.with_connection(|conn| insert_inbox_rows_for_artifact(conn, artifact_id, npubs))
+        self.with_connection(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .context("start populate inbox transaction")?;
+            let count = insert_inbox_rows_for_artifact(&tx, artifact_id, npubs)?;
+            tx.commit().context("commit populate inbox transaction")?;
+            Ok(count)
+        })
     }
 
     pub fn list_inbox(
@@ -894,6 +901,7 @@ impl Store {
                      FROM artifact_user_states aus
                      JOIN artifact_versions av ON av.id = aus.artifact_id
                      WHERE aus.npub = ?1 AND aus.state = 'inbox' AND av.pr_id = ?2
+                     ORDER BY aus.created_at DESC
                      LIMIT 1",
                     params![npub, pr_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
@@ -912,6 +920,7 @@ impl Store {
                      JOIN artifact_versions av ON av.id = aus.artifact_id
                      WHERE aus.npub = ?1
                        AND aus.state = 'inbox'
+                       AND av.pr_id != ?3
                        AND (
                            aus.created_at < ?2
                            OR (aus.created_at = ?2 AND av.pr_id < ?3)
@@ -931,6 +940,7 @@ impl Store {
                      JOIN artifact_versions av ON av.id = aus.artifact_id
                      WHERE aus.npub = ?1
                        AND aus.state = 'inbox'
+                       AND av.pr_id != ?3
                        AND (
                            aus.created_at > ?2
                            OR (aus.created_at = ?2 AND av.pr_id > ?3)
@@ -945,7 +955,7 @@ impl Store {
 
             let position: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*)
+                    "SELECT COUNT(DISTINCT av.pr_id)
                      FROM artifact_user_states aus
                      JOIN artifact_versions av ON av.id = aus.artifact_id
                      WHERE aus.npub = ?1
@@ -961,9 +971,10 @@ impl Store {
 
             let total: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*)
-                     FROM artifact_user_states
-                     WHERE npub = ?1 AND state = 'inbox'",
+                    "SELECT COUNT(DISTINCT av.pr_id)
+                     FROM artifact_user_states aus
+                     JOIN artifact_versions av ON av.id = aus.artifact_id
+                     WHERE aus.npub = ?1 AND aus.state = 'inbox'",
                     params![npub],
                     |row| row.get(0),
                 )
@@ -2316,6 +2327,75 @@ mod tests {
 
         // Other user still has their items
         assert_eq!(store.inbox_count("npub2other").unwrap(), 2);
+    }
+
+    #[test]
+    fn review_context_never_returns_current_pr_as_neighbor() {
+        // Regression: if a PR has two inbox-state artifact entries (race between
+        // populate_inbox and backfill), the neighbor query must never return the
+        // current pr_id as next/prev.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+
+        let input = PrUpsertInput {
+            repo: "sledtools/pika".to_string(),
+            pr_number: 42,
+            title: "Duplicate inbox entry".to_string(),
+            url: "https://github.com/sledtools/pika/pull/42".to_string(),
+            state: "open".to_string(),
+            head_sha: "sha-42".to_string(),
+            base_ref: "master".to_string(),
+            author_login: Some("alice".to_string()),
+            updated_at: "2026-03-01T00:00:00Z".to_string(),
+            merged_at: None,
+        };
+        store.upsert_pull_request(&input).unwrap();
+        let pr_id = store.list_feed_items().unwrap()[0].pr_id;
+        let artifact_id_1 = mark_latest_artifact_ready(&store, pr_id, "sha-42");
+
+        let npub = "npub1dup";
+
+        // Populate normally — creates one inbox entry for artifact_id_1
+        store
+            .populate_inbox(artifact_id_1, &[npub.to_string()])
+            .unwrap();
+
+        // Simulate a second artifact for the same PR that also ended up with
+        // state='inbox' (e.g. race between populate and backfill).
+        store
+            .with_connection(|conn| {
+                // Create a second artifact version
+                conn.execute(
+                    "INSERT INTO artifact_versions(pr_id, version, status, is_current, source_head_sha)
+                     VALUES (?1, 2, 'ready', 0, 'sha-42-v2')",
+                    params![pr_id],
+                )?;
+                let artifact_id_2 = conn.last_insert_rowid();
+                // Force a second inbox entry with a later timestamp
+                conn.execute(
+                    "INSERT INTO artifact_user_states(npub, artifact_id, state, reason, created_at, updated_at)
+                     VALUES (?1, ?2, 'inbox', 'generation_ready', datetime('now', '+1 second'), datetime('now', '+1 second'))",
+                    params![npub, artifact_id_2],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Now the same PR has two inbox entries. The review context must not
+        // return pr_id as next or prev.
+        let ctx = store
+            .inbox_review_context(npub, pr_id)
+            .unwrap()
+            .expect("review context should exist");
+
+        assert_ne!(ctx.next, Some(pr_id), "next must not be the current PR");
+        assert_ne!(ctx.prev, Some(pr_id), "prev must not be the current PR");
+        assert_eq!(ctx.next, None);
+        assert_eq!(ctx.prev, None);
+        // Position and total should count distinct PRs, not duplicate entries
+        assert_eq!(ctx.position, 1);
+        assert_eq!(ctx.total, 1);
     }
 
     #[test]
