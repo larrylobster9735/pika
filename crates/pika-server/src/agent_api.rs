@@ -429,12 +429,8 @@ fn managed_environment_status_copy(
         (Some(_), Some(AgentStartupPhase::Ready)) => {
             "Managed OpenClaw is running and ready.".to_string()
         }
-        (Some(row), Some(AgentStartupPhase::Failed)) if row.vm_id.is_some() => {
-            "Managed OpenClaw needs recovery. Recover first tries to bring the VM back and preserve the durable home; if that VM is gone, Recover provisions a fresh environment instead."
-                .to_string()
-        }
         (Some(_), Some(AgentStartupPhase::Failed)) => {
-            "Managed OpenClaw needs recovery. No recoverable VM is available, so Recover provisions a fresh environment."
+            "Managed OpenClaw needs recovery. Recover preserves the durable home when the VM can still be recovered; destructive reset starts fresh."
                 .to_string()
         }
         (Some(_), None) => "Managed OpenClaw status is unavailable.".to_string(),
@@ -1208,15 +1204,12 @@ pub(crate) async fn recover_agent_for_owner(
             AgentApiError::from_code(AgentApiErrorCode::AgentNotFound).with_request_id(request_id)
         );
     };
-    let recover_requested_message = match active.vm_id.as_deref() {
-        Some(vm_id) => format!("Recover requested for Managed OpenClaw on VM {vm_id}."),
-        None => "Recover requested for Managed OpenClaw without a recoverable VM.".to_string(),
-    };
-    if is_inflight_provision_row(&active) {
-        return Ok(ManagedEnvironmentAction {
-            row: active,
-            startup_phase: AgentStartupPhase::ProvisioningVm,
-        });
+    if active.vm_id.is_none() {
+        prepare_agent_for_reprovision(&mut conn, &active)
+            .map_err(|err| err.with_request_id(request_id.to_string()))?;
+        drop(conn);
+        return provision_or_existing_managed_environment(state, owner_npub, request_id, requested)
+            .await;
     }
     record_managed_environment_event(
         &mut conn,
@@ -1703,10 +1696,7 @@ mod tests {
 
     fn init_test_db_pool() -> Option<Pool<ConnectionManager<PgConnection>>> {
         dotenv::dotenv().ok();
-        let Some(url) = std::env::var("DATABASE_URL").ok() else {
-            eprintln!("SKIP: DATABASE_URL must be set for agent_api db test pool");
-            return None;
-        };
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         if let Err(err) = PgConnection::establish(&url) {
             eprintln!("SKIP: postgres unavailable for agent_api db test pool: {err}");
             return None;
