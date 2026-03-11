@@ -226,6 +226,9 @@ fn startup_phase_label(phase: Option<pika_agent_control_plane::AgentStartupPhase
         Some(pika_agent_control_plane::AgentStartupPhase::WaitingForServiceReady) => {
             "waiting_for_service_ready"
         }
+        Some(pika_agent_control_plane::AgentStartupPhase::WaitingForKeypackagePublish) => {
+            "waiting_for_keypackage_publish"
+        }
         Some(pika_agent_control_plane::AgentStartupPhase::Ready) => "ready",
         Some(pika_agent_control_plane::AgentStartupPhase::Failed) => "failed",
     }
@@ -1924,7 +1927,9 @@ mod tests {
             .expect("dashboard response");
         let body = response_body_string(response).await;
         assert!(body.contains("needs recovery"));
-        assert!(body.contains("falls back to provisioning a fresh environment"));
+        assert!(body.contains(
+            "will provision a fresh Managed OpenClaw environment instead of restoring prior durable state because no recoverable VM is available."
+        ));
         assert!(!body.contains("running and ready"));
         let events = recent_activity(&db_pool, npub);
         assert_eq!(events.len(), 1);
@@ -1953,7 +1958,9 @@ mod tests {
             .expect("dashboard response");
         let body = response_body_string(response).await;
         assert!(body.contains("No recoverable VM is available"));
-        assert!(body.contains("Recover provisions a fresh environment"));
+        assert!(body.contains(
+            "will provision a fresh Managed OpenClaw environment instead of restoring prior durable state because no recoverable VM is available."
+        ));
         assert!(body.contains("Provision Fresh Managed Environment"));
         assert!(body.contains("instead of restoring prior durable state"));
         assert!(body.contains("does not restore missing durable state"));

@@ -27,7 +27,7 @@ pub const DEFAULT_SPAWNER_URL: &str = "http://127.0.0.1:8080";
 
 pub const DEFAULT_ACP_EXEC_COMMAND: &str = "npx -y pi-acp";
 pub const DEFAULT_ACP_CWD: &str = "/root/pika-agent/acp";
-pub const DEFAULT_OPENCLAW_EXEC_COMMAND: &str = "npx -y openclaw";
+pub const DEFAULT_OPENCLAW_EXEC_COMMAND: &str = "/opt/runtime-artifacts/openclaw/bin/openclaw";
 pub const DEFAULT_OPENCLAW_GATEWAY_PORT: u16 = 18789;
 pub const DEFAULT_DAEMON_STATE_DIR: &str = "/root/pika-agent/state";
 pub const DEFAULT_OPENCLAW_STATE_DIR: &str = "/root/pika-agent/openclaw";
@@ -189,6 +189,39 @@ impl MicrovmSpawnerClient {
             );
         }
         resp.json().await.context("decode recover vm response")
+    }
+
+    pub async fn restore_vm(&self, vm_id: &str) -> anyhow::Result<VmResponse> {
+        self.restore_vm_with_request_id(vm_id, None).await
+    }
+
+    pub async fn restore_vm_with_request_id(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<VmResponse> {
+        let url = format!("{}/vms/{vm_id}/restore", self.base_url);
+        // Durable-home restores can legitimately run for several minutes.
+        let resp = with_request_id(self.client.post(&url), request_id)
+            .send()
+            .await
+            .context("send restore vm request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let upstream_request_id = response_request_id(resp.headers());
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "{}",
+                upstream_error_message(
+                    "restore vm",
+                    Some(vm_id),
+                    status,
+                    upstream_request_id.as_deref(),
+                    &text
+                )
+            );
+        }
+        resp.json().await.context("decode restore vm response")
     }
 
     pub async fn get_vm(&self, vm_id: &str) -> anyhow::Result<VmResponse> {
@@ -438,7 +471,7 @@ pub fn build_create_vm_request(
             command: AUTOSTART_COMMAND.to_string(),
             env,
             files,
-            startup_plan: Some(startup_plan),
+            startup_plan,
         },
     }
 }
@@ -720,6 +753,12 @@ fi
 if [[ "$bin" != "pikachat" ]]; then
   export PATH="$(dirname "$bin"):$PATH"
 fi
+if [[ -n "${{PIKA_PI_CMD:-}}" ]]; then
+  pi_exec="${{PIKA_PI_CMD%% *}}"
+  if [[ -n "$pi_exec" && -x "$pi_exec" ]]; then
+    export PATH="$(dirname "$pi_exec"):$PATH"
+  fi
+fi
 
 write_ready_marker() {{
   local probe="$1"
@@ -747,6 +786,58 @@ write_failed_marker() {{
 }}
 EOF
   rm -f "$ready_path"
+}}
+
+publish_daemon_keypackage() {{
+  case "$service_kind" in
+    pikachat_daemon|openclaw_gateway)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  local publish_args=(--remote --state-dir "$daemon_state_dir")
+  publish_args+=("${{relay_args[@]}}")
+  if "$bin" "${{publish_args[@]}}" publish-kp >/dev/null; then
+    return 0
+  fi
+
+  echo "[microvm-agent] service ready but keypackage publish not confirmed yet; retrying" >&2
+  return 1
+}}
+
+keypackage_publish_timeout_failure_reason() {{
+  case "$service_kind" in
+    pikachat_daemon)
+      printf '%s\n' "timeout_waiting_for_daemon_keypackage_publish"
+      ;;
+    openclaw_gateway)
+      printf '%s\n' "timeout_waiting_for_openclaw_keypackage_publish"
+      ;;
+    *)
+      printf '%s\n' "timeout_waiting_for_keypackage_publish"
+      ;;
+  esac
+}}
+
+service_readiness_probe_succeeds() {{
+  local readiness_kind="$1"
+  local readiness_path="$2"
+  local readiness_pattern="$3"
+  local readiness_url="$4"
+
+  case "$readiness_kind" in
+    log_contains)
+      [[ -f "$readiness_path" ]] && grep -q -- "$readiness_pattern" "$readiness_path"
+      ;;
+    http_get_ok)
+      curl -fsS --max-time 2 "$readiness_url" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }}
 
 wait_for_service_ready() {{
@@ -783,24 +874,68 @@ wait_for_service_ready() {{
       wait "$service_pid"
       return $?
     fi
-    case "$readiness_kind" in
-      log_contains)
-        if [[ -f "$readiness_path" ]] && grep -q -- "$readiness_pattern" "$readiness_path"; then
-          write_ready_marker "$ready_probe"
-          return 0
-        fi
-        ;;
-      http_get_ok)
-        if curl -fsS --max-time 2 "$readiness_url" >/dev/null 2>&1; then
-          write_ready_marker "$ready_probe"
-          return 0
-        fi
-        ;;
-    esac
+    if service_readiness_probe_succeeds \
+      "$readiness_kind" \
+      "$readiness_path" \
+      "$readiness_pattern" \
+      "$readiness_url"; then
+      printf '%s\n' "$ready_probe"
+      return 0
+    fi
     sleep 1
   done
 
   write_failed_marker "$timeout_failure_reason"
+  kill "$service_pid" 2>/dev/null || true
+  wait "$service_pid" || true
+  return 1
+}}
+
+wait_for_keypackage_publish() {{
+  local service_pid="$1"
+  local ready_probe="$2"
+  local timeout_sec="${{PIKA_AGENT_READY_TIMEOUT_SECS:-120}}"
+  local deadline=$((SECONDS + timeout_sec))
+  local publish_failure_reason
+  local readiness_kind
+  local readiness_path=""
+  local readiness_pattern=""
+  local readiness_url=""
+  publish_failure_reason="$(keypackage_publish_timeout_failure_reason)"
+  readiness_kind="$(plan_value '.readiness_check.kind')"
+
+  case "$readiness_kind" in
+    log_contains)
+      readiness_path="$(workspace_path "$(plan_value '.readiness_check.path')")"
+      readiness_pattern="$(plan_value '.readiness_check.pattern')"
+      ;;
+    http_get_ok)
+      readiness_url="$(plan_value '.readiness_check.url')"
+      ;;
+    *)
+      echo "[microvm-agent] unsupported readiness check kind: $readiness_kind" >&2
+      exit 1
+      ;;
+  esac
+
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$service_pid" 2>/dev/null; then
+      wait "$service_pid"
+      return $?
+    fi
+    if service_readiness_probe_succeeds \
+      "$readiness_kind" \
+      "$readiness_path" \
+      "$readiness_pattern" \
+      "$readiness_url" && \
+      publish_daemon_keypackage; then
+      write_ready_marker "$ready_probe"
+      return 0
+    fi
+    sleep 1
+  done
+
+  write_failed_marker "$publish_failure_reason"
   kill "$service_pid" 2>/dev/null || true
   wait "$service_pid" || true
   return 1
@@ -852,18 +987,36 @@ start_service() {{
       openclaw_exec="$(plan_value '.service.exec_command')"
       openclaw_state_dir="$(plan_value '.service.state_dir')"
       openclaw_config_path="$(workspace_path "$(plan_value '.service.config_path')")"
+      openclaw_package_root="${{PIKA_OPENCLAW_PACKAGE_ROOT:-$(dirname "$(dirname "$openclaw_exec")")/lib/openclaw}}"
       gateway_port="$(plan_value '.service.gateway_port | tostring')"
       if [[ -z "$openclaw_exec" ]]; then
         echo "[microvm-agent] OpenClaw gateway requires a non-empty exec command" >&2
+        exit 1
+      fi
+      if [[ "$openclaw_exec" == *[[:space:]]* ]]; then
+        echo "[microvm-agent] OpenClaw gateway exec must be a binary path: $openclaw_exec" >&2
+        exit 1
+      fi
+      if [[ ! -x "$openclaw_exec" ]]; then
+        echo "[microvm-agent] OpenClaw gateway executable not found: $openclaw_exec" >&2
         exit 1
       fi
       if [[ ! -f "$openclaw_config_path" ]]; then
         echo "[microvm-agent] missing OpenClaw config at $openclaw_config_path" >&2
         exit 1
       fi
+      if [[ ! -f "$openclaw_package_root/package.json" ]]; then
+        echo "[microvm-agent] OpenClaw package root not found: $openclaw_package_root" >&2
+        exit 1
+      fi
       mkdir -p "$openclaw_state_dir"
+      mkdir -p "$openclaw_state_dir/node_modules"
+      rm -rf "$openclaw_state_dir/node_modules/openclaw"
+      ln -s "$openclaw_package_root" "$openclaw_state_dir/node_modules/openclaw"
       export OPENCLAW_STATE_DIR="$openclaw_state_dir"
       export OPENCLAW_CONFIG_PATH="$openclaw_config_path"
+      export PIKACHAT_DAEMON_CMD="$bin"
+      export PIKACHAT_SIDECAR_CMD="$bin"
       export OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1
       export OPENCLAW_SKIP_GMAIL_WATCHER=1
       export OPENCLAW_SKIP_CANVAS_HOST=1
@@ -871,7 +1024,7 @@ start_service() {{
       export PIKA_OPENCLAW_GATEWAY_PORT="$gateway_port"
       : "${{PIKA_VM_IP:?missing PIKA_VM_IP}}"
       echo "[microvm-agent] starting OpenClaw gateway via $openclaw_exec" >&2
-      bash -lc "$openclaw_exec gateway --allow-unconfigured" &
+      "$openclaw_exec" gateway --allow-unconfigured &
       agent_pid=$!
       start_openclaw_private_proxy "$PIKA_VM_IP" "$gateway_port"
       ;;
@@ -883,7 +1036,10 @@ start_service() {{
 }}
 
 start_service
-if ! wait_for_service_ready "$agent_pid"; then
+if ! ready_probe="$(wait_for_service_ready "$agent_pid")"; then
+  exit 1
+fi
+if ! wait_for_keypackage_publish "$agent_pid" "$ready_probe"; then
   exit 1
 fi
 wait "$agent_pid"
@@ -1053,8 +1209,501 @@ mod tests {
     use pika_test_utils::spawn_one_shot_server;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::Duration as StdDuration;
+    use std::time::Instant;
+
+    #[derive(Copy, Clone)]
+    enum KeypackageReadyScenario {
+        Pi,
+        Openclaw,
+    }
+
+    #[derive(Copy, Clone)]
+    enum KeypackagePublishOutcome {
+        SucceedsAfterRetry,
+        SucceedsAfterReadinessRecovery,
+        TimesOut { expected_reason: &'static str },
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write script");
+        let mut perms = fs::metadata(path).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod script");
+    }
+
+    fn poll_until(timeout: StdDuration, mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(StdDuration::from_millis(50));
+        }
+        assert!(predicate(), "condition not met within {:?}", timeout);
+    }
+
+    fn read_counter(path: &Path) -> u32 {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+
+    fn root_relative(path: &Path) -> String {
+        path.strip_prefix("/")
+            .expect("absolute path")
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn run_keypackage_ready_gating_scenario(
+        scenario: KeypackageReadyScenario,
+        outcome: KeypackagePublishOutcome,
+    ) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin_dir = root.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let workspace_dir = root.path().join("workspace/pika-agent");
+        let daemon_state_dir = root.path().join("runtime/state");
+        let acp_cwd = root.path().join("runtime/acp");
+        let openclaw_state_dir = root.path().join("runtime/openclaw");
+        let openclaw_package_root = root.path().join("runtime/openclaw-package");
+        let openclaw_gateway_port = TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind ephemeral openclaw test port")
+            .local_addr()
+            .expect("read openclaw test port")
+            .port();
+        fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+        fs::create_dir_all(&daemon_state_dir).expect("create daemon state dir");
+        fs::create_dir_all(&acp_cwd).expect("create acp cwd");
+        fs::create_dir_all(&openclaw_state_dir).expect("create openclaw state dir");
+        fs::create_dir_all(&openclaw_package_root).expect("create openclaw package root");
+
+        let startup_plan_path = workspace_dir.join("startup-plan.json");
+        let ready_marker_path = workspace_dir.join("service-ready.json");
+        let failed_marker_path = workspace_dir.join("service-failed.json");
+        let identity_seed_path = workspace_dir.join("state/identity.json");
+        let ready_log_path = workspace_dir.join("agent.log");
+        let openclaw_config_path = workspace_dir.join("openclaw/openclaw.json");
+        let openclaw_extension_root = workspace_dir.join("openclaw/extensions/pikachat-openclaw");
+        let publish_count_path = root.path().join("publish-count.txt");
+        let publish_log_path = root.path().join("publish.log");
+        let curl_count_path = root.path().join("curl-count.txt");
+        let fake_openclaw_path = bin_dir.join("openclaw-fake");
+
+        fs::create_dir_all(identity_seed_path.parent().expect("identity parent"))
+            .expect("create identity dir");
+        fs::create_dir_all(
+            openclaw_config_path
+                .parent()
+                .expect("openclaw config parent"),
+        )
+        .expect("create openclaw config dir");
+        fs::create_dir_all(&openclaw_extension_root).expect("create openclaw extension dir");
+        fs::write(&startup_plan_path, "{}\n").expect("write startup plan");
+        fs::write(
+            &identity_seed_path,
+            "{\n  \"secret_key_hex\": \"00\",\n  \"public_key_hex\": \"11\"\n}\n",
+        )
+        .expect("write identity seed");
+        fs::write(&openclaw_config_path, "{\n  \"gateway\": {}\n}\n")
+            .expect("write openclaw config");
+        fs::write(
+            openclaw_package_root.join("package.json"),
+            "{\n  \"name\": \"openclaw\",\n  \"exports\": {}\n}\n",
+        )
+        .expect("write openclaw package metadata");
+
+        let jq_path = bin_dir.join("jq");
+        write_executable(
+            &jq_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-er" || "${1:-}" == "-e" ]]; then
+  shift
+fi
+query="${1:-}"
+case "$query" in
+  '.agent_kind') printf '%s\n' "${TEST_JQ_AGENT_KIND}" ;;
+  '.service_kind') printf '%s\n' "${TEST_JQ_SERVICE_KIND}" ;;
+  '.backend_mode') printf '%s\n' "${TEST_JQ_BACKEND_MODE}" ;;
+  '.daemon_state_dir') printf '%s\n' "${TEST_JQ_DAEMON_STATE_DIR}" ;;
+  '.artifacts.ready_marker_path') printf '%s\n' "${TEST_JQ_READY_MARKER_PATH}" ;;
+  '.artifacts.failed_marker_path') printf '%s\n' "${TEST_JQ_FAILED_MARKER_PATH}" ;;
+  '.artifacts.identity_seed_path') printf '%s\n' "${TEST_JQ_IDENTITY_SEED_PATH}" ;;
+  '.exit_failure_reason') printf '%s\n' "${TEST_JQ_EXIT_FAILURE_REASON}" ;;
+  '.readiness_check.kind') printf '%s\n' "${TEST_JQ_READINESS_KIND}" ;;
+  '.readiness_check.ready_probe') printf '%s\n' "${TEST_JQ_READY_PROBE}" ;;
+  '.readiness_check.timeout_failure_reason') printf '%s\n' "${TEST_JQ_TIMEOUT_FAILURE_REASON}" ;;
+  '.readiness_check.path') printf '%s\n' "${TEST_JQ_READINESS_PATH}" ;;
+  '.readiness_check.pattern') printf '%s\n' "${TEST_JQ_READINESS_PATTERN}" ;;
+  '.readiness_check.url') printf '%s\n' "${TEST_JQ_READINESS_URL}" ;;
+  '.service.acp_backend.exec_command') printf '%s\n' "${TEST_JQ_ACP_EXEC_COMMAND}" ;;
+  '.service.acp_backend.cwd') printf '%s\n' "${TEST_JQ_ACP_CWD}" ;;
+  '.service.exec_command') printf '%s\n' "${TEST_JQ_SERVICE_EXEC_COMMAND}" ;;
+  '.service.state_dir') printf '%s\n' "${TEST_JQ_SERVICE_STATE_DIR}" ;;
+  '.service.config_path') printf '%s\n' "${TEST_JQ_SERVICE_CONFIG_PATH}" ;;
+  '.service.gateway_port | tostring') printf '%s\n' "${TEST_JQ_GATEWAY_PORT}" ;;
+  '.service.acp_backend == null')
+    [[ "${TEST_JQ_SERVICE_ACP_PRESENT:-0}" == "0" ]]
+    ;;
+  '.service.acp_backend != null')
+    [[ "${TEST_JQ_SERVICE_ACP_PRESENT:-0}" == "1" ]]
+    ;;
+  *)
+    echo "unsupported jq query: $query" >&2
+    exit 1
+    ;;
+esac
+"#,
+        );
+
+        let pikachat_path = bin_dir.join("pikachat");
+        write_executable(
+            &pikachat_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"
+  if [[ "$cmd" == "daemon" ]]; then
+  state_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state-dir)
+        state_dir="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  mkdir -p "$state_dir"
+  printf '%s\n' '{"type":"ready","pubkey":"test","npub":"npub1test"}' >> "${PIKA_TEST_READY_LOG_PATH}"
+  trap 'exit 0' TERM INT
+  while :; do
+    sleep 1
+  done
+elif [[ "$cmd" == "--remote" ]]; then
+  shift
+  state_dir=""
+  relays=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state-dir)
+        state_dir="$2"
+        shift 2
+        ;;
+      --relay)
+        relays+=("$2")
+        shift 2
+        ;;
+      publish-kp)
+        break
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  count=0
+  if [[ -f "${PIKA_TEST_PUBLISH_COUNT_FILE}" ]]; then
+    count="$(cat "${PIKA_TEST_PUBLISH_COUNT_FILE}")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "${PIKA_TEST_PUBLISH_COUNT_FILE}"
+  printf 'state_dir=%s relays=%s\n' "$state_dir" "${relays[*]:-}" >> "${PIKA_TEST_PUBLISH_LOG_FILE}"
+  if [[ "${PIKA_TEST_PUBLISH_ALWAYS_FAIL:-0}" == "1" ]]; then
+    exit 1
+  fi
+  succeed_after="${PIKA_TEST_PUBLISH_SUCCEED_AFTER:-2}"
+  if [[ "$count" -lt "$succeed_after" ]]; then
+    exit 1
+  fi
+  printf '%s\n' '{"event_id":"kp-test","kind":443}'
+else
+  echo "unsupported fake pikachat invocation: $*" >&2
+  exit 1
+fi
+"#,
+        );
+
+        let curl_path = bin_dir.join("curl");
+        write_executable(
+            &curl_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${*}" >> "${PIKA_TEST_CURL_LOG_FILE}"
+count=0
+if [[ -f "${PIKA_TEST_CURL_COUNT_FILE}" ]]; then
+  count="$(cat "${PIKA_TEST_CURL_COUNT_FILE}")"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "${PIKA_TEST_CURL_COUNT_FILE}"
+IFS=',' read -r -a statuses <<< "${PIKA_TEST_CURL_RESULTS:-}"
+if [[ "${#statuses[@]}" -gt 0 ]]; then
+  index=$((count - 1))
+  if (( index >= ${#statuses[@]} )); then
+    index=$((${#statuses[@]} - 1))
+  fi
+  if [[ "${statuses[$index]}" != "0" ]]; then
+    exit 0
+  fi
+  exit 1
+fi
+exit 0
+"#,
+        );
+
+        write_executable(
+            &fake_openclaw_path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' TERM INT
+while :; do
+  sleep 1
+done
+"#,
+        );
+
+        let mut script = microvm_autostart_script();
+        script = script.replace(
+            &format!("STARTUP_PLAN_PATH=\"/{STARTUP_PLAN_PATH}\""),
+            &format!("STARTUP_PLAN_PATH=\"{}\"", startup_plan_path.display()),
+        );
+        script = script.replace(
+            &format!("OPENCLAW_EXTENSION_ROOT=\"/{OPENCLAW_EXTENSION_ROOT}\""),
+            &format!(
+                "OPENCLAW_EXTENSION_ROOT=\"{}\"",
+                openclaw_extension_root.display()
+            ),
+        );
+        let script_path = root.path().join("start-agent.sh");
+        write_executable(&script_path, &script);
+
+        let mut command = Command::new("bash");
+        command
+            .arg(&script_path)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("PIKA_PIKACHAT_BIN", &pikachat_path)
+            .env(
+                "PIKA_OWNER_PUBKEY",
+                "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f",
+            )
+            .env(
+                "PIKA_RELAY_URLS",
+                "wss://relay-one.example.com,wss://relay-two.example.com",
+            )
+            // The OpenClaw startup path now always boots the private loopback proxy,
+            // so the self-contained test harness must provide a guest IP.
+            .env("PIKA_VM_IP", "127.0.0.1")
+            .env("PIKA_TEST_READY_LOG_PATH", &ready_log_path)
+            .env("PIKA_TEST_PUBLISH_COUNT_FILE", &publish_count_path)
+            .env("PIKA_TEST_PUBLISH_LOG_FILE", &publish_log_path)
+            .env("PIKA_TEST_CURL_LOG_FILE", root.path().join("curl.log"))
+            .env("PIKA_TEST_CURL_COUNT_FILE", &curl_count_path)
+            .env(
+                "TEST_JQ_READY_MARKER_PATH",
+                root_relative(&ready_marker_path),
+            )
+            .env(
+                "TEST_JQ_FAILED_MARKER_PATH",
+                root_relative(&failed_marker_path),
+            )
+            .env(
+                "TEST_JQ_IDENTITY_SEED_PATH",
+                root_relative(&identity_seed_path),
+            )
+            .env("TEST_JQ_DAEMON_STATE_DIR", daemon_state_dir.as_os_str())
+            .env("TEST_JQ_EXIT_FAILURE_REASON", "service_exited")
+            .env(
+                "TEST_JQ_TIMEOUT_FAILURE_REASON",
+                "timeout_waiting_for_service",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match outcome {
+            KeypackagePublishOutcome::SucceedsAfterRetry => {
+                command.env("PIKA_TEST_PUBLISH_SUCCEED_AFTER", "2");
+            }
+            KeypackagePublishOutcome::SucceedsAfterReadinessRecovery => {
+                command
+                    .env("PIKA_TEST_PUBLISH_SUCCEED_AFTER", "1")
+                    .env("PIKA_TEST_CURL_RESULTS", "1,0,1");
+            }
+            KeypackagePublishOutcome::TimesOut { .. } => {
+                command
+                    .env("PIKA_TEST_PUBLISH_ALWAYS_FAIL", "1")
+                    .env("PIKA_AGENT_READY_TIMEOUT_SECS", "2");
+            }
+        }
+
+        match scenario {
+            KeypackageReadyScenario::Pi => {
+                command
+                    .env("TEST_JQ_AGENT_KIND", "pi")
+                    .env("TEST_JQ_SERVICE_KIND", "pikachat_daemon")
+                    .env("TEST_JQ_BACKEND_MODE", "acp")
+                    .env("TEST_JQ_READY_PROBE", "daemon_ready_event")
+                    .env("TEST_JQ_READINESS_KIND", "log_contains")
+                    .env("TEST_JQ_READINESS_PATH", root_relative(&ready_log_path))
+                    .env("TEST_JQ_READINESS_PATTERN", "\"type\":\"ready\"")
+                    .env("TEST_JQ_READINESS_URL", "")
+                    .env("TEST_JQ_SERVICE_ACP_PRESENT", "1")
+                    .env("TEST_JQ_ACP_EXEC_COMMAND", "npx -y pi-acp")
+                    .env("TEST_JQ_ACP_CWD", acp_cwd.as_os_str())
+                    .env("TEST_JQ_SERVICE_EXEC_COMMAND", "")
+                    .env("TEST_JQ_SERVICE_STATE_DIR", "")
+                    .env("TEST_JQ_SERVICE_CONFIG_PATH", "")
+                    .env("TEST_JQ_GATEWAY_PORT", "");
+            }
+            KeypackageReadyScenario::Openclaw => {
+                command
+                    .env("TEST_JQ_AGENT_KIND", "openclaw")
+                    .env("TEST_JQ_SERVICE_KIND", "openclaw_gateway")
+                    .env("TEST_JQ_BACKEND_MODE", "native")
+                    .env("TEST_JQ_READY_PROBE", "openclaw_gateway_health")
+                    .env("TEST_JQ_READINESS_KIND", "http_get_ok")
+                    .env("TEST_JQ_READINESS_PATH", "")
+                    .env("TEST_JQ_READINESS_PATTERN", "")
+                    .env(
+                        "TEST_JQ_READINESS_URL",
+                        format!("http://127.0.0.1:{openclaw_gateway_port}/health"),
+                    )
+                    .env("TEST_JQ_SERVICE_ACP_PRESENT", "0")
+                    .env("TEST_JQ_ACP_EXEC_COMMAND", "")
+                    .env("TEST_JQ_ACP_CWD", "")
+                    .env(
+                        "TEST_JQ_SERVICE_EXEC_COMMAND",
+                        fake_openclaw_path.as_os_str(),
+                    )
+                    .env(
+                        "PIKA_OPENCLAW_PACKAGE_ROOT",
+                        openclaw_package_root.as_os_str(),
+                    )
+                    .env("TEST_JQ_SERVICE_STATE_DIR", openclaw_state_dir.as_os_str())
+                    .env(
+                        "TEST_JQ_SERVICE_CONFIG_PATH",
+                        root_relative(&openclaw_config_path),
+                    )
+                    .env("TEST_JQ_GATEWAY_PORT", openclaw_gateway_port.to_string());
+            }
+        }
+
+        let mut child = command.spawn().expect("spawn autostart script");
+
+        match outcome {
+            KeypackagePublishOutcome::SucceedsAfterRetry => {
+                poll_until(StdDuration::from_secs(5), || {
+                    read_counter(&publish_count_path) >= 1
+                });
+                assert!(
+                    !ready_marker_path.exists(),
+                    "ready marker must not exist after a failed first keypackage publish attempt"
+                );
+                poll_until(StdDuration::from_secs(5), || {
+                    read_counter(&publish_count_path) >= 2 && ready_marker_path.exists()
+                });
+
+                let publish_log = fs::read_to_string(&publish_log_path).expect("read publish log");
+                assert!(
+                    publish_log.contains("state_dir="),
+                    "publish log should capture the remote state-dir invocation"
+                );
+                assert!(
+                    publish_log.contains("wss://relay-one.example.com wss://relay-two.example.com"),
+                    "publish log should include the full relay list"
+                );
+
+                Command::new("kill")
+                    .arg("-TERM")
+                    .arg(child.id().to_string())
+                    .status()
+                    .expect("terminate autostart script");
+                let _ = child.wait().expect("wait for autostart script shutdown");
+            }
+            KeypackagePublishOutcome::SucceedsAfterReadinessRecovery => {
+                poll_until(StdDuration::from_secs(5), || {
+                    read_counter(&curl_count_path) >= 2
+                });
+                assert_eq!(
+                    read_counter(&publish_count_path),
+                    0,
+                    "keypackage publish should wait for readiness to recover before retrying"
+                );
+                assert!(
+                    !ready_marker_path.exists(),
+                    "ready marker must not exist while readiness has regressed"
+                );
+
+                poll_until(StdDuration::from_secs(5), || {
+                    read_counter(&publish_count_path) >= 1 && ready_marker_path.exists()
+                });
+
+                let publish_log = fs::read_to_string(&publish_log_path).expect("read publish log");
+                assert!(
+                    publish_log.contains("state_dir="),
+                    "publish log should capture the remote state-dir invocation"
+                );
+
+                Command::new("kill")
+                    .arg("-TERM")
+                    .arg(child.id().to_string())
+                    .status()
+                    .expect("terminate autostart script");
+                let _ = child.wait().expect("wait for autostart script shutdown");
+            }
+            KeypackagePublishOutcome::TimesOut { expected_reason } => {
+                poll_until(StdDuration::from_secs(5), || {
+                    read_counter(&publish_count_path) >= 1
+                });
+                assert!(
+                    !ready_marker_path.exists(),
+                    "ready marker must not exist after a failed first keypackage publish attempt"
+                );
+                poll_until(StdDuration::from_secs(5), || failed_marker_path.exists());
+                assert!(
+                    !ready_marker_path.exists(),
+                    "ready marker must stay absent when keypackage publish never succeeds"
+                );
+                let failed_marker =
+                    fs::read_to_string(&failed_marker_path).expect("read failed marker");
+                assert!(
+                    failed_marker.contains(expected_reason),
+                    "failed marker should report the dedicated keypackage publish timeout reason"
+                );
+                let status = child.wait().expect("wait for autostart script failure");
+                assert!(
+                    !status.success(),
+                    "autostart script should exit non-zero when keypackage publication times out"
+                );
+            }
+        }
+    }
+
+    fn test_guest_startup_plan() -> GuestStartupPlan {
+        guest_startup_plan(&ResolvedMicrovmParams {
+            spawner_url: DEFAULT_SPAWNER_URL.to_string(),
+            kind: ResolvedMicrovmAgentKind::Pi,
+            backend: ResolvedMicrovmAgentBackend::Acp {
+                exec_command: DEFAULT_ACP_EXEC_COMMAND.to_string(),
+                cwd: DEFAULT_ACP_CWD.to_string(),
+            },
+        })
+    }
 
     #[test]
     fn resolve_params_applies_defaults_and_overrides() {
@@ -1170,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn autostart_script_uses_root_backed_state_dir() {
+    fn autostart_script_uses_deterministic_openclaw_binary_path() {
         let script = microvm_autostart_script();
         assert!(
             script.contains("daemon_state_dir"),
@@ -1190,6 +1839,25 @@ mod tests {
         assert!(script.contains("case \"$readiness_kind\""));
         assert!(script.contains("curl -fsS --max-time 2 \"$readiness_url\""));
         assert!(script.contains("openclaw_gateway)"));
+        assert!(script.contains("PIKA_PI_CMD"));
+        assert!(script.contains("pi_exec=\"${PIKA_PI_CMD%% *}\""));
+        assert!(script.contains("export PATH=\"$(dirname \"$pi_exec\"):$PATH\""));
+        assert!(script.contains("openclaw_exec=\"$(plan_value '.service.exec_command')\""));
+        assert!(!script.contains("PIKA_OPENCLAW_CMD"));
+        assert!(script.contains("openclaw_package_root=\"${PIKA_OPENCLAW_PACKAGE_ROOT:-$(dirname \"$(dirname \"$openclaw_exec\")\")/lib/openclaw}\""));
+        assert!(script.contains("OpenClaw package root not found"));
+        assert!(script.contains("mkdir -p \"$openclaw_state_dir/node_modules\""));
+        assert!(script.contains("rm -rf \"$openclaw_state_dir/node_modules/openclaw\""));
+        assert!(script.contains(
+            "ln -s \"$openclaw_package_root\" \"$openclaw_state_dir/node_modules/openclaw\""
+        ));
+        assert!(script.contains("export PIKACHAT_DAEMON_CMD=\"$bin\""));
+        assert!(script.contains("export PIKACHAT_SIDECAR_CMD=\"$bin\""));
+        assert!(script.contains("OpenClaw gateway exec must be a binary path"));
+        assert!(script.contains("\"$openclaw_exec\" gateway --allow-unconfigured"));
+        assert!(!script.contains("bash -lc \"$openclaw_exec gateway --allow-unconfigured\""));
+        assert!(!script.contains("npm_cache_dir="));
+        assert!(!script.contains("NPM_CONFIG_CACHE"));
         assert!(script.contains("plan_value '.service.acp_backend.exec_command'"));
         assert!(
             script.contains("invalid startup plan: backend_mode=acp but ACP payload is missing")
@@ -1200,6 +1868,94 @@ mod tests {
         assert!(
             !script.contains("marmotd"),
             "autostart script must only resolve pikachat daemon binary"
+        );
+    }
+
+    #[test]
+    fn autostart_script_publishes_keypackage_before_marking_ready() {
+        let script = microvm_autostart_script();
+        assert!(
+            script.contains("publish_daemon_keypackage"),
+            "autostart script must publish a keypackage before reporting ready"
+        );
+        assert!(
+            script.contains("publish_args=(--remote --state-dir \"$daemon_state_dir\")"),
+            "autostart script must publish through the daemon socket"
+        );
+        assert!(
+            script.contains("publish_args+=(\"${relay_args[@]}\")"),
+            "autostart script must forward the full relay list when publishing the keypackage"
+        );
+        assert!(
+            script.contains("\"${publish_args[@]}\" publish-kp >/dev/null"),
+            "autostart script must invoke remote publish-kp before ready"
+        );
+        assert!(
+            script.contains("if ! ready_probe=\"$(wait_for_service_ready \"$agent_pid\")\"; then"),
+            "autostart script must wait for service readiness before publishing the keypackage"
+        );
+        assert!(
+            script
+                .contains("if ! wait_for_keypackage_publish \"$agent_pid\" \"$ready_probe\"; then"),
+            "autostart script must treat keypackage publication as a distinct startup phase"
+        );
+        assert!(
+            script.contains(
+                "service_readiness_probe_succeeds \\\n      \"$readiness_kind\" \\\n      \"$readiness_path\" \\\n      \"$readiness_pattern\" \\\n      \"$readiness_url\" && \\\n      publish_daemon_keypackage"
+            ),
+            "autostart script must require the readiness probe to still pass before final ready"
+        );
+        assert!(
+            script.contains("timeout_waiting_for_openclaw_keypackage_publish"),
+            "autostart script must report a dedicated OpenClaw keypackage publish timeout"
+        );
+        assert!(
+            script.contains("timeout_waiting_for_daemon_keypackage_publish"),
+            "autostart script must report a dedicated daemon keypackage publish timeout"
+        );
+    }
+
+    #[test]
+    fn pi_autostart_waits_for_keypackage_publish_before_ready_marker() {
+        run_keypackage_ready_gating_scenario(
+            KeypackageReadyScenario::Pi,
+            KeypackagePublishOutcome::SucceedsAfterRetry,
+        );
+    }
+
+    #[test]
+    fn openclaw_autostart_waits_for_keypackage_publish_before_ready_marker() {
+        run_keypackage_ready_gating_scenario(
+            KeypackageReadyScenario::Openclaw,
+            KeypackagePublishOutcome::SucceedsAfterRetry,
+        );
+    }
+
+    #[test]
+    fn openclaw_autostart_rechecks_health_before_marking_ready() {
+        run_keypackage_ready_gating_scenario(
+            KeypackageReadyScenario::Openclaw,
+            KeypackagePublishOutcome::SucceedsAfterReadinessRecovery,
+        );
+    }
+
+    #[test]
+    fn pi_autostart_reports_keypackage_publish_timeout_separately_from_service_timeout() {
+        run_keypackage_ready_gating_scenario(
+            KeypackageReadyScenario::Pi,
+            KeypackagePublishOutcome::TimesOut {
+                expected_reason: "timeout_waiting_for_daemon_keypackage_publish",
+            },
+        );
+    }
+
+    #[test]
+    fn openclaw_autostart_reports_keypackage_publish_timeout_separately_from_service_timeout() {
+        run_keypackage_ready_gating_scenario(
+            KeypackageReadyScenario::Openclaw,
+            KeypackagePublishOutcome::TimesOut {
+                expected_reason: "timeout_waiting_for_openclaw_keypackage_publish",
+            },
         );
     }
 
@@ -1249,7 +2005,7 @@ mod tests {
                 },
             },
         );
-        let startup_plan = req.guest_autostart.startup_plan.expect("startup plan");
+        let startup_plan = req.guest_autostart.startup_plan;
         assert_eq!(startup_plan.service_kind, GuestServiceKind::PikachatDaemon);
         assert_eq!(startup_plan.backend_mode, GuestServiceBackendMode::Acp);
         assert_eq!(
@@ -1287,16 +2043,12 @@ mod tests {
                 backend: ResolvedMicrovmAgentBackend::Native,
             },
         );
-        let startup_plan = req
-            .guest_autostart
-            .startup_plan
-            .clone()
-            .expect("startup plan");
+        let startup_plan = req.guest_autostart.startup_plan.clone();
         assert_eq!(startup_plan.backend_mode, GuestServiceBackendMode::Native);
         assert_eq!(
             startup_plan.service,
             GuestServiceLaunch::OpenclawGateway {
-                exec_command: resolved_openclaw_exec_command(),
+                exec_command: DEFAULT_OPENCLAW_EXEC_COMMAND.to_string(),
                 state_dir: DEFAULT_OPENCLAW_STATE_DIR.to_string(),
                 config_path: OPENCLAW_CONFIG_PATH.to_string(),
                 gateway_port: DEFAULT_OPENCLAW_GATEWAY_PORT,
@@ -1312,6 +2064,10 @@ mod tests {
         assert_eq!(
             value["guest_autostart"]["startup_plan"]["service_kind"],
             "openclaw_gateway"
+        );
+        assert_eq!(
+            value["guest_autostart"]["startup_plan"]["service"]["exec_command"],
+            DEFAULT_OPENCLAW_EXEC_COMMAND
         );
         let openclaw_config = value["guest_autostart"]["files"][OPENCLAW_CONFIG_PATH]
             .as_str()
@@ -1356,16 +2112,12 @@ mod tests {
                 },
             },
         );
-        let startup_plan = req
-            .guest_autostart
-            .startup_plan
-            .clone()
-            .expect("startup plan");
+        let startup_plan = req.guest_autostart.startup_plan.clone();
         assert_eq!(startup_plan.backend_mode, GuestServiceBackendMode::Acp);
         assert_eq!(
             startup_plan.service,
             GuestServiceLaunch::OpenclawGateway {
-                exec_command: resolved_openclaw_exec_command(),
+                exec_command: DEFAULT_OPENCLAW_EXEC_COMMAND.to_string(),
                 state_dir: DEFAULT_OPENCLAW_STATE_DIR.to_string(),
                 config_path: OPENCLAW_CONFIG_PATH.to_string(),
                 gateway_port: DEFAULT_OPENCLAW_GATEWAY_PORT,
@@ -1379,6 +2131,10 @@ mod tests {
         );
 
         let value = serde_json::to_value(req).expect("serialize create vm request");
+        assert_eq!(
+            value["guest_autostart"]["startup_plan"]["service"]["exec_command"],
+            DEFAULT_OPENCLAW_EXEC_COMMAND
+        );
         let openclaw_config = value["guest_autostart"]["files"][OPENCLAW_CONFIG_PATH]
             .as_str()
             .expect("openclaw config");
@@ -1455,7 +2211,7 @@ mod tests {
                 command: "/workspace/pika-agent/start-agent.sh".to_string(),
                 env: BTreeMap::from([("PIKA_OWNER_PUBKEY".to_string(), "pubkey123".to_string())]),
                 files: BTreeMap::new(),
-                startup_plan: None,
+                startup_plan: test_guest_startup_plan(),
             },
         };
 
@@ -1536,6 +2292,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_vm_contract_request_shape() {
+        let (base_url, rx) =
+            spawn_one_shot_server("200 OK", r#"{"id":"vm-restore-1","status":"starting"}"#);
+        let client = MicrovmSpawnerClient::new(base_url);
+
+        let restored = client
+            .restore_vm_with_request_id("vm-restore-1", Some("req-restore-123"))
+            .await
+            .expect("restore vm succeeds");
+        assert_eq!(restored.id, "vm-restore-1");
+        assert_eq!(restored.status, "starting");
+
+        let captured = rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/vms/vm-restore-1/restore");
+        assert_eq!(
+            captured.headers.get(REQUEST_ID_HEADER).map(String::as_str),
+            Some("req-restore-123")
+        );
+        assert!(captured.body.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_vm_contract_response_carries_guest_ready() {
         let (base_url, rx) = spawn_one_shot_server(
             "200 OK",
@@ -1549,6 +2330,7 @@ mod tests {
             .expect("get vm succeeds");
         assert_eq!(vm.id, "vm-123");
         assert_eq!(vm.status, "running");
+        assert!(!vm.startup_probe_satisfied);
         assert!(vm.guest_ready);
 
         let captured = rx
@@ -1599,7 +2381,7 @@ mod tests {
                 command: "/workspace/pika-agent/start-agent.sh".to_string(),
                 env: BTreeMap::new(),
                 files: BTreeMap::new(),
-                startup_plan: None,
+                startup_plan: test_guest_startup_plan(),
             },
         };
 
@@ -1642,6 +2424,22 @@ mod tests {
         assert!(msg.contains("failed to recover vm vm-bad"));
         assert!(msg.contains("503 Service Unavailable"));
         assert!(msg.contains("vm reboot failed"));
+    }
+
+    #[tokio::test]
+    async fn restore_vm_surfaces_error_body() {
+        let (base_url, _rx) =
+            spawn_one_shot_server("500 Internal Server Error", "restic restore failed");
+        let client = MicrovmSpawnerClient::new(base_url);
+
+        let err = client
+            .restore_vm("vm-bad")
+            .await
+            .expect_err("expected restore_vm failure");
+        let msg = err.to_string();
+        assert!(msg.contains("failed to restore vm vm-bad"));
+        assert!(msg.contains("500 Internal Server Error"));
+        assert!(msg.contains("restic restore failed"));
     }
 
     #[test]
