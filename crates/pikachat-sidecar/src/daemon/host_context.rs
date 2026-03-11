@@ -270,7 +270,7 @@ impl<'a> DaemonHostContext<'a> {
         PendingOutgoingCall,
         pika_marmot_runtime::call_runtime::PreparedCallSignal,
     )> {
-        self.runtime()
+        self.commands()
             .prepare_outgoing_call_invite(nostr_group_id, peer_pubkey_hex, call_id, session)
             .map_err(anyhow::Error::msg)
     }
@@ -282,7 +282,7 @@ impl<'a> DaemonHostContext<'a> {
         let mls_group_id = self
             .resolve_group(&invite.target_id)
             .map_err(|e| format!("resolve call group failed: {e:#}"))?;
-        self.runtime().prepare_accept_incoming_call(
+        self.commands().prepare_accept_incoming_call(
             invite,
             GroupCallContext {
                 mls_group_id: &mls_group_id,
@@ -296,7 +296,7 @@ impl<'a> DaemonHostContext<'a> {
         call_id: &str,
         reason: &str,
     ) -> Result<pika_marmot_runtime::call_runtime::PreparedCallSignal, String> {
-        self.runtime().prepare_reject_call_signal(call_id, reason)
+        self.commands().prepare_reject_call_signal(call_id, reason)
     }
 
     pub(super) fn prepare_end_call_signal(
@@ -304,7 +304,7 @@ impl<'a> DaemonHostContext<'a> {
         call_id: &str,
         reason: &str,
     ) -> Result<pika_marmot_runtime::call_runtime::PreparedCallSignal, String> {
-        self.runtime().prepare_end_call_signal(call_id, reason)
+        self.commands().prepare_end_call_signal(call_id, reason)
     }
 
     pub(super) fn process_classified_inbound_group_message(
