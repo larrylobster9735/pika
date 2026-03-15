@@ -121,7 +121,10 @@ fn group_profile_visible_to_other_member() {
 }
 
 #[test]
-fn new_member_receives_rebroadcasted_group_profiles() {
+fn rebroadcasted_group_profiles_reach_late_joiner_member_state() {
+    // `pikahut` now owns the fuller user-facing contract for "late joiner opens the group and
+    // sees existing member profile names". This test stays as the narrower semantic owner for the
+    // relay-backed rebroadcast mechanics that eventually populate late-joiner member state.
     let infra = support::TestInfra::start_relay();
 
     let dir_a = tempdir().unwrap();
@@ -179,23 +182,6 @@ fn new_member_receives_rebroadcasted_group_profiles() {
         chat_id: chat_id.clone(),
         name: "Builder Bob".to_owned(),
         about: String::new(),
-    });
-
-    // Wait for profiles to propagate between Alice and Bob.
-    alice.dispatch(AppAction::OpenChat {
-        chat_id: chat_id.clone(),
-    });
-    wait_until("alice sees bob group name", Duration::from_secs(30), || {
-        alice
-            .state()
-            .current_chat
-            .as_ref()
-            .map(|c| {
-                c.members
-                    .iter()
-                    .any(|m| m.name.as_deref() == Some("Builder Bob"))
-            })
-            .unwrap_or(false)
     });
 
     // Alice adds Charlie to the group.

@@ -379,6 +379,20 @@ fn dm_creation_and_first_message_delivery_boundary() -> Result<()> {
 }
 
 #[test]
+#[ignore = "deterministic messaging/profile selector"]
+fn late_joiner_group_profile_rebroadcast_boundary() -> Result<()> {
+    // Keep the narrower rebroadcast/member-state semantics in `rust/tests/e2e_group_profiles.rs`;
+    // this selector owns the readable user-facing contract that a late joiner opens the group and
+    // sees the member profile names that were already established under local fixtures.
+    let mut context = TestContext::builder("late-joiner-group-profile-rebroadcast")
+        .artifact_policy(ArtifactPolicy::PreserveOnFailure)
+        .build()?;
+    support::run_late_joiner_group_profile_rebroadcast(&context)?;
+    context.mark_success();
+    Ok(())
+}
+
+#[test]
 #[ignore = "deterministic post-rebase regression selector"]
 fn post_rebase_invalid_event_rejection_boundary() -> Result<()> {
     // Keep the narrow invalid-invite semantics owned by `rust/tests/e2e_messaging.rs`; this
