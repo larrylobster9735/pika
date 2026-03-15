@@ -11,7 +11,7 @@ set -euo pipefail
 #   PIKA_IOS_DEVICE_UDID=<udid> ./tools/run-ios --device
 #
 # Notes:
-# - Must run inside `nix develop` (or via direnv) so the Rust toolchain has iOS targets.
+# - Must run inside `nix develop .#apple-host` (or via direnv) so the Rust toolchain has iOS targets.
 # - Requires a full Xcode install under /Applications for `xcrun`, `simctl`, `devicectl`.
 #
 # Optional relay overrides:
@@ -31,11 +31,11 @@ source "$ROOT/tools/lib/relay-defaults.sh"
 # shellcheck disable=SC1091
 source "$ROOT/tools/lib/channel-config.sh"
 
-# If the user isn't in the devShell, re-exec under Nix for a consistent toolchain.
+# If the user isn't in the Apple-host dev shell, re-exec under Nix for a consistent toolchain.
 if [ -z "${IN_NIX_SHELL:-}" ] && [ "${PIKA_RUN_IOS_NO_NIX:-0}" != "1" ]; then
   qargs=()
   for a in "$@"; do qargs+=("$(printf '%q' "$a")"); done
-  exec nix develop -c bash -lc "cd \"$ROOT\"; ./tools/run-ios ${qargs[*]}"
+  exec nix develop .#apple-host -c bash -lc "cd \"$ROOT\"; ./tools/run-ios ${qargs[*]}"
 fi
 
 IOS_CHANNEL="${PIKA_CHANNEL:-}"

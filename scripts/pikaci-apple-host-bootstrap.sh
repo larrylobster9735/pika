@@ -7,7 +7,7 @@ Usage: pikaci-apple-host-bootstrap.sh [--check-only] [--repo PATH]
 
 Provision or validate the local Apple host baseline needed for this repo:
   - install upstream multi-user Nix if missing
-  - enter `nix develop .#default`
+  - enter `nix develop .#apple-host`
   - verify core tool availability from the dev shell
   - verify the repo-pinned Xcode 26.2 path
   - optionally run `xcodes install 26.2`
@@ -128,6 +128,8 @@ current_xcode_app() {
 
 ensure_xcode() {
   local xcode_app=""
+  local desired_dev_dir=""
+  local current_dev_dir=""
   if xcode_app="$(current_xcode_app)"; then
     say "found repo-pinned Xcode at $xcode_app"
   else
@@ -138,7 +140,7 @@ ensure_xcode() {
 
     if [[ ! -t 0 ]]; then
       echo "error: Xcode ${xcode_version} is missing and interactive install is required" >&2
-      echo "run locally: nix develop .#default -c xcodes install ${xcode_version}" >&2
+      echo "run locally: nix develop .#apple-host -c xcodes install ${xcode_version}" >&2
       exit 1
     fi
 
@@ -153,7 +155,7 @@ ensure_xcode() {
     (
       cd "$repo_root"
       nix --extra-experimental-features 'nix-command flakes' \
-        develop .#default \
+        develop .#apple-host \
         -c xcodes install "$xcode_version"
     )
 
@@ -164,8 +166,19 @@ ensure_xcode() {
     fi
   fi
 
-  say "switching xcode-select to $xcode_app"
-  sudo xcode-select --switch "$xcode_app/Contents/Developer"
+  desired_dev_dir="$xcode_app/Contents/Developer"
+  current_dev_dir="$(xcode-select -p 2>/dev/null || true)"
+  if [[ "$current_dev_dir" == "$desired_dev_dir" ]]; then
+    say "xcode-select already points at $desired_dev_dir"
+  elif [[ "$check_only" -eq 1 ]]; then
+    echo "error: xcode-select does not point at $desired_dev_dir" >&2
+    echo "current: ${current_dev_dir:-<unset>}" >&2
+    exit 1
+  else
+    say "switching xcode-select to $xcode_app"
+    sudo xcode-select --switch "$desired_dev_dir"
+  fi
+
   xcode-select -p
   xcodebuild -version
 }
@@ -175,7 +188,7 @@ run_dev_shell_preflight() {
   (
     cd "$repo_root"
     nix --extra-experimental-features 'nix-command flakes' \
-      develop .#default \
+      develop .#apple-host \
       -c bash -lc '
         set -euo pipefail
         echo "cargo=$(command -v cargo)"
@@ -197,7 +210,7 @@ run_simulator_preflight() {
   (
     cd "$repo_root"
     nix --extra-experimental-features 'nix-command flakes' \
-      develop .#default \
+      develop .#apple-host \
       -c bash -lc '
         set -euo pipefail
         ./tools/ios-sim-ensure
