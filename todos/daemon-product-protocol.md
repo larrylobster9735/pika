@@ -57,6 +57,7 @@ The current native daemon protocol already supports real production commands for
 - group membership add
 - group membership remove
 - leave group
+- group profile metadata update (`name` / `about`)
 - message send
 - media send
 - typing send
@@ -66,8 +67,14 @@ The current native daemon protocol already supports real production commands for
 The current native daemon protocol does **not** expose real production commands for:
 
 - other membership/group evolution operations
-- group profile updates
+- group profile image upload
 - explicit group-update eventing
+
+Current `update_group_profile` scope is intentionally metadata-only:
+
+- it can set `name` / `about`
+- it preserves any existing `picture` from the latest self-authored group profile metadata
+- it does not let callers set or clear `picture` yet
 
 The shared runtime already has most of the underlying membership machinery:
 
@@ -198,7 +205,7 @@ What should remain daemon-local:
 
 After the membership/group-management MVP, the next most likely protocol candidates are:
 
-1. `update_group_profile`
+1. group profile image upload if a product shell actually needs it
 2. admin-role changes if product needs them
 3. richer group-update observability if product consumers need push state
 
