@@ -58,8 +58,9 @@ use crate::acp::{AcpBackendConfig, AcpBackendManager, AcpTurnCompletion};
 use crate::call_audio::OpusToAudioPipeline;
 use crate::call_tts::synthesize_tts_pcm;
 use crate::protocol::{
-    AddMembersResultOut, DaemonCmd, GroupMemberOut, GroupProfileOut, InCmd, LeaveGroupResultOut,
-    ListMembersResultOut, MediaAttachmentOut, OutMsg, RemoveMembersResultOut, out_error, out_ok,
+    AddMembersResultOut, DaemonCmd, GroupMemberOut, GroupProfileOut, GroupUpdateKindOut,
+    GroupUpdatedOut, InCmd, LeaveGroupResultOut, ListMembersResultOut, MediaAttachmentOut, OutMsg,
+    RemoveMembersResultOut, out_error, out_ok,
 };
 use host_context::{DaemonHostContext, DaemonPrepareError};
 
@@ -75,6 +76,16 @@ const ACCEPT_WELCOME_BACKLOG_LIMIT: usize = 200;
 const INIT_GROUP_WELCOME_EXPIRATION_SECS: u64 = 30 * 24 * 60 * 60;
 const DAEMON_WELCOME_SUBSCRIPTION_LIMIT: usize = 200;
 const MAX_GROUP_PROFILE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+type ProtocolEventSinks = Arc<Mutex<Vec<mpsc::UnboundedSender<OutMsg>>>>;
+
+struct GroupUpdatedEmission<'a> {
+    host: &'a DaemonHostContext<'a>,
+    local_pubkey: &'a PublicKey,
+    kind: GroupUpdateKindOut,
+    nostr_group_id: &'a str,
+    context: &'static str,
+}
 
 fn daemon_open_request(
     subscribed_group_ids: Vec<String>,
@@ -122,6 +133,64 @@ fn daemon_welcome_inbox_intent(
         lookback: Some(Duration::from_secs(giftwrap_lookback_sec)),
         limit: Some(DAEMON_WELCOME_SUBSCRIPTION_LIMIT),
     }
+}
+
+fn broadcast_protocol_event(
+    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    event_sinks: &ProtocolEventSinks,
+    event: OutMsg,
+) {
+    let _ = out_tx.send(event.clone());
+    let mut sinks = event_sinks.lock().expect("protocol event sinks lock");
+    sinks.retain(|sink| sink.send(event.clone()).is_ok());
+}
+
+fn emit_group_updated_snapshot(
+    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    event_sinks: &ProtocolEventSinks,
+    emission: GroupUpdatedEmission<'_>,
+) -> bool {
+    match build_group_updated_snapshot(
+        emission.host,
+        emission.local_pubkey,
+        emission.kind,
+        emission.nostr_group_id,
+    ) {
+        Ok(update) => {
+            broadcast_protocol_event(out_tx, event_sinks, OutMsg::GroupUpdated { update });
+            true
+        }
+        Err(err) => {
+            warn!(
+                "[pikachat] build group_updated event after {} failed: {err:#}",
+                emission.context
+            );
+            false
+        }
+    }
+}
+
+fn emit_group_updated_if_ok(
+    reply: &OutMsg,
+    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    event_sinks: &ProtocolEventSinks,
+    emission: GroupUpdatedEmission<'_>,
+) -> bool {
+    matches!(reply, OutMsg::Ok { .. }) && emit_group_updated_snapshot(out_tx, event_sinks, emission)
+}
+
+fn emit_left_group_updated(
+    out_tx: &mpsc::UnboundedSender<OutMsg>,
+    event_sinks: &ProtocolEventSinks,
+    nostr_group_id: &str,
+) {
+    broadcast_protocol_event(
+        out_tx,
+        event_sinks,
+        OutMsg::GroupUpdated {
+            update: build_left_group_updated(nostr_group_id),
+        },
+    );
 }
 
 fn daemon_base_session_sync_plan(
@@ -686,15 +755,7 @@ fn handle_list_members_request(
         Err(err) => return out_error(request_id, "bad_group_id", format!("{err:#}")),
     };
 
-    let mut members: Vec<GroupMemberOut> = snapshot
-        .member_snapshots
-        .into_iter()
-        .map(|member| GroupMemberOut {
-            pubkey: member.pubkey.to_hex(),
-            is_admin: member.is_admin,
-        })
-        .collect();
-    members.sort_by(|left, right| left.pubkey.cmp(&right.pubkey));
+    let members = group_member_outputs(snapshot.member_snapshots);
 
     let result = ListMembersResultOut {
         nostr_group_id: snapshot.nostr_group_id_hex,
@@ -705,6 +766,20 @@ fn handle_list_members_request(
         request_id,
         Some(serde_json::to_value(result).expect("serialize list_members result")),
     )
+}
+
+fn group_member_outputs(
+    member_snapshots: Vec<pika_marmot_runtime::conversation::RuntimeJoinedGroupMemberSnapshot>,
+) -> Vec<GroupMemberOut> {
+    let mut members: Vec<GroupMemberOut> = member_snapshots
+        .into_iter()
+        .map(|member| GroupMemberOut {
+            pubkey: member.pubkey.to_hex(),
+            is_admin: member.is_admin,
+        })
+        .collect();
+    members.sort_by(|left, right| left.pubkey.cmp(&right.pubkey));
+    members
 }
 
 async fn handle_remove_members_request_with<Publish, PublishFut>(
@@ -1002,6 +1077,37 @@ fn get_group_profile_result(
         about,
         picture_url,
     })
+}
+
+fn build_group_updated_snapshot(
+    host: &DaemonHostContext<'_>,
+    local_pubkey: &PublicKey,
+    kind: GroupUpdateKindOut,
+    nostr_group_id: &str,
+) -> Result<GroupUpdatedOut, anyhow::Error> {
+    let snapshot = host.lookup_joined_group_snapshot(nostr_group_id)?;
+    let member_count = snapshot.member_count();
+    let members = group_member_outputs(snapshot.member_snapshots);
+    let profile = get_group_profile_result(host, local_pubkey, nostr_group_id)
+        .map_err(|err| anyhow!("build group profile for group_updated: {}", err.message))?;
+
+    Ok(GroupUpdatedOut {
+        kind,
+        nostr_group_id: snapshot.nostr_group_id_hex,
+        member_count: Some(member_count),
+        members,
+        profile: Some(profile),
+    })
+}
+
+fn build_left_group_updated(nostr_group_id: &str) -> GroupUpdatedOut {
+    GroupUpdatedOut {
+        kind: GroupUpdateKindOut::Left,
+        nostr_group_id: nostr_group_id.to_string(),
+        member_count: None,
+        members: Vec::new(),
+        profile: None,
+    }
 }
 
 fn decode_group_profile_image(
@@ -3220,6 +3326,8 @@ pub async fn daemon_main(
         });
     }
 
+    let protocol_event_sinks: ProtocolEventSinks = Arc::new(Mutex::new(Vec::new()));
+
     // Unix domain socket for --remote CLI connections
     let sock_path = crate::resolve_daemon_socket_path(state_dir);
     // Clean up stale socket
@@ -3230,6 +3338,7 @@ pub async fn daemon_main(
 
     // Spawn socket acceptor
     let cmd_tx_for_sock = cmd_tx_for_auto.clone();
+    let protocol_event_sinks_for_sock = Arc::clone(&protocol_event_sinks);
     tokio::spawn(async move {
         loop {
             let (stream, _) = match unix_listener.accept().await {
@@ -3240,10 +3349,15 @@ pub async fn daemon_main(
                 }
             };
             let cmd_tx = cmd_tx_for_sock.clone();
+            let protocol_event_sinks = Arc::clone(&protocol_event_sinks_for_sock);
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = tokio::io::BufReader::new(reader).lines();
                 let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<OutMsg>();
+                protocol_event_sinks
+                    .lock()
+                    .expect("protocol event sinks lock")
+                    .push(resp_tx.clone());
 
                 // Writer task: send responses back to the client
                 let write_handle = tokio::spawn(async move {
@@ -3572,6 +3686,18 @@ pub async fn daemon_main(
                             &peer_pubkeys,
                         )
                         .await;
+                        let _ = emit_group_updated_if_ok(
+                            &reply,
+                            &out_tx,
+                            &protocol_event_sinks,
+                            GroupUpdatedEmission {
+                                host: &host,
+                                local_pubkey: &keys.public_key(),
+                                kind: GroupUpdateKindOut::MembersAdded,
+                                nostr_group_id: &nostr_group_id,
+                                context: "add_members",
+                            },
+                        );
                         let _ = reply_tx.send(reply);
                     }
                     InCmd::ListMembers {
@@ -3599,6 +3725,18 @@ pub async fn daemon_main(
                             &peer_pubkeys,
                         )
                         .await;
+                        let _ = emit_group_updated_if_ok(
+                            &reply,
+                            &out_tx,
+                            &protocol_event_sinks,
+                            GroupUpdatedEmission {
+                                host: &host,
+                                local_pubkey: &keys.public_key(),
+                                kind: GroupUpdateKindOut::MembersRemoved,
+                                nostr_group_id: &nostr_group_id,
+                                context: "remove_members",
+                            },
+                        );
                         let _ = reply_tx.send(reply);
                     }
                     InCmd::LeaveGroup {
@@ -3615,9 +3753,13 @@ pub async fn daemon_main(
                             &nostr_group_id,
                         )
                         .await;
-                        if matches!(reply, OutMsg::Ok { .. }) {
+                        let left_group = matches!(reply, OutMsg::Ok { .. });
+                        if left_group {
                             unsubscribe_group_subscriptions(&client, &mut group_subs, &nostr_group_id)
                                 .await;
+                        }
+                        if left_group {
+                            emit_left_group_updated(&out_tx, &protocol_event_sinks, &nostr_group_id);
                         }
                         let _ = reply_tx.send(reply);
                     }
@@ -3638,6 +3780,18 @@ pub async fn daemon_main(
                             &about,
                         )
                         .await;
+                        let _ = emit_group_updated_if_ok(
+                            &reply,
+                            &out_tx,
+                            &protocol_event_sinks,
+                            GroupUpdatedEmission {
+                                host: &host,
+                                local_pubkey: &keys.public_key(),
+                                kind: GroupUpdateKindOut::ProfileUpdated,
+                                nostr_group_id: &nostr_group_id,
+                                context: "update_group_profile",
+                            },
+                        );
                         let _ = reply_tx.send(reply);
                     }
                     InCmd::GetGroupProfile {
@@ -3672,6 +3826,18 @@ pub async fn daemon_main(
                             &mime_type,
                         )
                         .await;
+                        let _ = emit_group_updated_if_ok(
+                            &reply,
+                            &out_tx,
+                            &protocol_event_sinks,
+                            GroupUpdatedEmission {
+                                host: &host,
+                                local_pubkey: &keys.public_key(),
+                                kind: GroupUpdateKindOut::ProfileUpdated,
+                                nostr_group_id: &nostr_group_id,
+                                context: "upload_group_profile_image",
+                            },
+                        );
                         let _ = reply_tx.send(reply);
                     }
                     InCmd::GetMessages { request_id, nostr_group_id, limit } => {
@@ -4855,6 +5021,17 @@ pub async fn daemon_main(
                             }
                         }
 
+                        let _ = emit_group_updated_snapshot(
+                            &out_tx,
+                            &protocol_event_sinks,
+                            GroupUpdatedEmission {
+                                host: &host,
+                                local_pubkey: &keys.public_key(),
+                                kind: GroupUpdateKindOut::Created,
+                                nostr_group_id: &nostr_group_id_hex,
+                                context: "init_group",
+                            },
+                        );
                         reply_tx.send(out_ok(request_id, Some(json!({
                             "nostr_group_id": nostr_group_id_hex,
                             "mls_group_id": mls_group_id_hex,
@@ -5445,6 +5622,13 @@ mod tests {
         relay_urls: &'a [RelayUrl],
     ) -> DaemonHostContext<'a> {
         DaemonHostContext::new(client, relay_urls, mdk, keys, keys.public_key().to_hex())
+    }
+
+    fn expect_group_updated(event: OutMsg) -> GroupUpdatedOut {
+        let OutMsg::GroupUpdated { update } = event else {
+            panic!("expected group_updated event");
+        };
+        update
     }
 
     fn make_test_message(
@@ -6237,6 +6421,91 @@ mod tests {
         assert!(message.contains(&missing_pubkey.to_hex()));
     }
 
+    #[tokio::test]
+    async fn daemon_add_members_group_updated_event_uses_shared_snapshots() {
+        let inviter_dir = tempfile::tempdir().expect("inviter tempdir");
+        let invitee_dir = tempfile::tempdir().expect("invitee tempdir");
+        let peer_dir = tempfile::tempdir().expect("peer tempdir");
+        let inviter_keys = Keys::generate();
+        let invitee_keys = Keys::generate();
+        let peer_keys = Keys::generate();
+        let inviter_mdk = crate::open_mdk(inviter_dir.path()).expect("open inviter mdk");
+        let invitee_mdk = crate::open_mdk(invitee_dir.path()).expect("open invitee mdk");
+        let peer_mdk = crate::open_mdk(peer_dir.path()).expect("open peer mdk");
+
+        let invitee_kp = make_key_package_event(&invitee_mdk, &invitee_keys);
+        let peer_kp = make_key_package_event(&peer_mdk, &peer_keys);
+        let config = NostrGroupConfigData::new(
+            "Daemon add-members event".to_string(),
+            "Shared event snapshot".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").expect("relay url")],
+            vec![inviter_keys.public_key(), invitee_keys.public_key()],
+        );
+        let created = inviter_mdk
+            .create_group(&inviter_keys.public_key(), vec![invitee_kp], config)
+            .expect("create group");
+        inviter_mdk
+            .merge_pending_commit(&created.group.mls_group_id)
+            .expect("merge initial commit");
+
+        let signer: Arc<dyn NostrSigner> = Arc::new(inviter_keys.clone());
+        let client = Client::new(signer);
+        let relay_urls = vec![RelayUrl::parse("wss://test.relay").expect("relay url")];
+        let host = test_host(&inviter_mdk, &inviter_keys, &client, &relay_urls);
+        let nostr_group_id_hex = hex::encode(created.group.nostr_group_id);
+
+        let reply = handle_add_members_request_with(
+            Some("req-add-event".to_string()),
+            &host,
+            &inviter_keys,
+            &nostr_group_id_hex,
+            &[peer_keys.public_key().to_hex()],
+            move |_| {
+                let peer_kp = peer_kp.clone();
+                async move { Ok(peer_kp) }
+            },
+            |event, label| {
+                let mdk = &inviter_mdk;
+                async move {
+                    if label == "add_members" {
+                        mdk.process_message(&event)
+                            .expect("process add_members event");
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(reply, OutMsg::Ok { .. }));
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let event_sinks: ProtocolEventSinks = Arc::new(Mutex::new(Vec::new()));
+        assert!(emit_group_updated_if_ok(
+            &reply,
+            &out_tx,
+            &event_sinks,
+            GroupUpdatedEmission {
+                host: &host,
+                local_pubkey: &inviter_keys.public_key(),
+                kind: GroupUpdateKindOut::MembersAdded,
+                nostr_group_id: &nostr_group_id_hex,
+                context: "add_members",
+            },
+        ));
+        let update = expect_group_updated(out_rx.try_recv().expect("group_updated event"));
+        assert_eq!(update.kind, GroupUpdateKindOut::MembersAdded);
+        assert_eq!(update.nostr_group_id, nostr_group_id_hex);
+        assert_eq!(update.member_count, Some(3));
+        assert_eq!(update.members.len(), 3);
+        assert_eq!(
+            update.profile.expect("profile").name,
+            "Daemon add-members event"
+        );
+    }
+
     #[test]
     fn daemon_list_members_request_returns_shared_snapshot_members() {
         let inviter_dir = tempfile::tempdir().expect("inviter tempdir");
@@ -6419,6 +6688,79 @@ mod tests {
         assert_eq!(request_id.as_deref(), Some("req-remove-bad"));
         assert_eq!(code, "bad_pubkey");
         assert!(message.contains("invalid peer_pubkey"));
+    }
+
+    #[tokio::test]
+    async fn daemon_remove_members_group_updated_event_uses_shared_snapshots() {
+        let inviter_dir = tempfile::tempdir().expect("inviter tempdir");
+        let invitee_dir = tempfile::tempdir().expect("invitee tempdir");
+        let inviter_keys = Keys::generate();
+        let invitee_keys = Keys::generate();
+        let inviter_mdk = crate::open_mdk(inviter_dir.path()).expect("open inviter mdk");
+        let invitee_mdk = crate::open_mdk(invitee_dir.path()).expect("open invitee mdk");
+
+        let invitee_kp = make_key_package_event(&invitee_mdk, &invitee_keys);
+        let config = NostrGroupConfigData::new(
+            "Daemon remove-members event".to_string(),
+            "Shared event snapshot".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").expect("relay url")],
+            vec![inviter_keys.public_key(), invitee_keys.public_key()],
+        );
+        let created = inviter_mdk
+            .create_group(&inviter_keys.public_key(), vec![invitee_kp], config)
+            .expect("create group");
+        inviter_mdk
+            .merge_pending_commit(&created.group.mls_group_id)
+            .expect("merge initial commit");
+
+        let signer: Arc<dyn NostrSigner> = Arc::new(inviter_keys.clone());
+        let client = Client::new(signer);
+        let relay_urls = vec![RelayUrl::parse("wss://test.relay").expect("relay url")];
+        let host = test_host(&inviter_mdk, &inviter_keys, &client, &relay_urls);
+        let nostr_group_id_hex = hex::encode(created.group.nostr_group_id);
+
+        let reply = handle_remove_members_request_with(
+            Some("req-remove-event".to_string()),
+            &host,
+            &nostr_group_id_hex,
+            &[invitee_keys.public_key().to_hex()],
+            |event, _label| {
+                let mdk = &inviter_mdk;
+                async move {
+                    mdk.process_message(&event)
+                        .expect("process remove_members event");
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(reply, OutMsg::Ok { .. }));
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let event_sinks: ProtocolEventSinks = Arc::new(Mutex::new(Vec::new()));
+        assert!(emit_group_updated_if_ok(
+            &reply,
+            &out_tx,
+            &event_sinks,
+            GroupUpdatedEmission {
+                host: &host,
+                local_pubkey: &inviter_keys.public_key(),
+                kind: GroupUpdateKindOut::MembersRemoved,
+                nostr_group_id: &nostr_group_id_hex,
+                context: "remove_members",
+            },
+        ));
+        let update = expect_group_updated(out_rx.try_recv().expect("group_updated event"));
+        assert_eq!(update.kind, GroupUpdateKindOut::MembersRemoved);
+        assert_eq!(update.member_count, Some(1));
+        assert_eq!(update.members.len(), 1);
+        assert_eq!(
+            update.profile.expect("profile").name,
+            "Daemon remove-members event"
+        );
     }
 
     #[tokio::test]
@@ -6639,6 +6981,128 @@ mod tests {
         assert_eq!(request_id.as_deref(), Some("req-profile-empty"));
         assert_eq!(code, "bad_request");
         assert!(message.contains("name or about"));
+    }
+
+    #[tokio::test]
+    async fn daemon_update_group_profile_group_updated_event_uses_shared_profile_snapshot() {
+        let inviter_dir = tempfile::tempdir().expect("inviter tempdir");
+        let invitee_dir = tempfile::tempdir().expect("invitee tempdir");
+        let inviter_keys = Keys::generate();
+        let invitee_keys = Keys::generate();
+        let inviter_mdk = crate::open_mdk(inviter_dir.path()).expect("open inviter mdk");
+        let invitee_mdk = crate::open_mdk(invitee_dir.path()).expect("open invitee mdk");
+
+        let invitee_kp = make_key_package_event(&invitee_mdk, &invitee_keys);
+        let config = NostrGroupConfigData::new(
+            "Daemon profile event".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").expect("relay url")],
+            vec![inviter_keys.public_key(), invitee_keys.public_key()],
+        );
+        let created = inviter_mdk
+            .create_group(&inviter_keys.public_key(), vec![invitee_kp], config)
+            .expect("create group");
+        inviter_mdk
+            .merge_pending_commit(&created.group.mls_group_id)
+            .expect("merge initial commit");
+
+        let existing_profile = UnsignedEvent::new(
+            inviter_keys.public_key(),
+            Timestamp::from(10_u64),
+            Kind::Metadata,
+            Tags::new(),
+            r#"{"display_name":"Old Name","picture":"https://example.com/group.jpg"}"#,
+        );
+        let existing_wrapper = inviter_mdk
+            .create_message(&created.group.mls_group_id, existing_profile)
+            .expect("create existing group profile");
+        inviter_mdk
+            .process_message(&existing_wrapper)
+            .expect("process existing group profile");
+
+        let signer: Arc<dyn NostrSigner> = Arc::new(inviter_keys.clone());
+        let client = Client::new(signer);
+        let relay_urls = vec![RelayUrl::parse("wss://test.relay").expect("relay url")];
+        let host = test_host(&inviter_mdk, &inviter_keys, &client, &relay_urls);
+        let nostr_group_id_hex = hex::encode(created.group.nostr_group_id);
+
+        let reply = handle_update_group_profile_request_with(
+            Some("req-profile-event".to_string()),
+            &host,
+            &inviter_keys.public_key(),
+            &nostr_group_id_hex,
+            "Updated Name",
+            "Updated About",
+            |prepared| {
+                let mdk = &inviter_mdk;
+                async move {
+                    mdk.process_message(&prepared.wrapper)
+                        .expect("process updated profile");
+                    Ok(EventId::all_zeros())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(reply, OutMsg::Ok { .. }));
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let event_sinks: ProtocolEventSinks = Arc::new(Mutex::new(Vec::new()));
+        assert!(emit_group_updated_if_ok(
+            &reply,
+            &out_tx,
+            &event_sinks,
+            GroupUpdatedEmission {
+                host: &host,
+                local_pubkey: &inviter_keys.public_key(),
+                kind: GroupUpdateKindOut::ProfileUpdated,
+                nostr_group_id: &nostr_group_id_hex,
+                context: "update_group_profile",
+            },
+        ));
+        let update = expect_group_updated(out_rx.try_recv().expect("group_updated event"));
+        assert_eq!(update.kind, GroupUpdateKindOut::ProfileUpdated);
+        assert_eq!(update.member_count, Some(2));
+        assert_eq!(update.members.len(), 2);
+        let profile = update.profile.expect("profile");
+        assert_eq!(profile.name, "Updated Name");
+        assert_eq!(profile.about, "Updated About");
+        assert_eq!(
+            profile.picture_url.as_deref(),
+            Some("https://example.com/group.jpg")
+        );
+    }
+
+    #[test]
+    fn group_updated_events_fan_out_to_protocol_sinks() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let event_sinks: ProtocolEventSinks = Arc::new(Mutex::new(vec![sink_tx]));
+        let event = OutMsg::GroupUpdated {
+            update: GroupUpdatedOut {
+                kind: GroupUpdateKindOut::MembersAdded,
+                nostr_group_id: "aa".to_string(),
+                member_count: Some(2),
+                members: vec![GroupMemberOut {
+                    pubkey: "owner".to_string(),
+                    is_admin: true,
+                }],
+                profile: None,
+            },
+        };
+
+        broadcast_protocol_event(&out_tx, &event_sinks, event);
+
+        let out_event = out_rx.try_recv().expect("stdout event");
+        let sink_event = sink_rx.try_recv().expect("socket event");
+        let out_update = expect_group_updated(out_event);
+        let sink_update = expect_group_updated(sink_event);
+        assert_eq!(out_update.kind, GroupUpdateKindOut::MembersAdded);
+        assert_eq!(sink_update.kind, GroupUpdateKindOut::MembersAdded);
+        assert_eq!(out_update.nostr_group_id, "aa");
+        assert_eq!(sink_update.nostr_group_id, "aa");
     }
 
     #[test]
