@@ -184,6 +184,24 @@ fn rebroadcasted_group_profiles_reach_late_joiner_member_state() {
         about: String::new(),
     });
 
+    // Keep the reciprocal existing-member propagation semantics owned here even though `pikahut`
+    // now owns a higher-level late-joiner visibility contract nearby.
+    alice.dispatch(AppAction::OpenChat {
+        chat_id: chat_id.clone(),
+    });
+    wait_until("alice sees bob group name", Duration::from_secs(30), || {
+        alice
+            .state()
+            .current_chat
+            .as_ref()
+            .map(|c| {
+                c.members
+                    .iter()
+                    .any(|m| m.name.as_deref() == Some("Builder Bob"))
+            })
+            .unwrap_or(false)
+    });
+
     // Alice adds Charlie to the group.
     // Retry since Charlie's key package may not be published yet.
     let start = std::time::Instant::now();

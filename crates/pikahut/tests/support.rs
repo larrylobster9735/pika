@@ -347,9 +347,9 @@ pub fn run_dm_creation_and_first_message_delivery(context: &TestContext) -> Resu
     })
 }
 
-// CI-facing readable group-profile contract: a member who joins after profiles were already set
-// still opens the group and sees those member names once the relay-backed rebroadcast completes.
-pub fn run_late_joiner_group_profile_rebroadcast(context: &TestContext) -> Result<()> {
+// CI-facing readable group-profile contract: after a late joiner gets the group shell, an
+// explicit member profile refresh makes those names visible in the group they open.
+pub fn run_late_joiner_group_profile_visibility_after_refresh(context: &TestContext) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     with_relay_fixture(context, |fixture| {
@@ -442,9 +442,9 @@ pub fn run_late_joiner_group_profile_rebroadcast(context: &TestContext) -> Resul
 
         std::thread::sleep(Duration::from_secs(2));
 
-        // Production rebroadcast happens on commit; in this relay-backed deterministic harness we
-        // re-save after Charlie subscribes so the selector keeps owning the user-facing late-joiner
-        // visibility contract instead of test subscription timing.
+        // This selector owns the readable "late joiner sees member names after post-join refresh"
+        // contract. It is not yet a true proof that already-established pre-join names rebroadcast
+        // without an explicit refresh in this deterministic harness.
         alice.dispatch(AppAction::SaveGroupProfile {
             chat_id: chat_id.clone(),
             name: "Admin Alice".to_owned(),
