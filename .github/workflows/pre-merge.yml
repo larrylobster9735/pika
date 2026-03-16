@@ -1548,6 +1548,9 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    concurrency:
+      group: apple-host-bundle-${{ vars.PIKACI_APPLE_SSH_HOST || 'default' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 

@@ -20,6 +20,8 @@ Options:
                          Default: $PIKACI_APPLE_REMOTE_ROOT or .cache/pikaci-apple
   --artifact-dir DIR     Local artifact dir. Default: .pikaci/apple-remote/<run-id>
   --keep-runs N          Keep at most N remote run dirs. Default: $PIKACI_APPLE_KEEP_RUNS or 3
+  --lock-timeout-sec N   Wait up to N seconds for the remote host lock before failing.
+                         Default: $PIKACI_APPLE_LOCK_TIMEOUT_SEC or 0
   --github-output PATH   Append run outputs for GitHub Actions.
   -h, --help             Show this help.
 EOF
@@ -57,6 +59,7 @@ ssh_binary="${PIKACI_APPLE_SSH_BINARY:-ssh}"
 remote_root="${PIKACI_APPLE_REMOTE_ROOT:-.cache/pikaci-apple}"
 artifact_dir=""
 keep_runs="${PIKACI_APPLE_KEEP_RUNS:-3}"
+lock_timeout_sec="${PIKACI_APPLE_LOCK_TIMEOUT_SEC:-0}"
 github_output=""
 
 while [[ $# -gt 0 ]]; do
@@ -93,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       keep_runs="${2:?missing value for --keep-runs}"
       shift 2
       ;;
+    --lock-timeout-sec)
+      lock_timeout_sec="${2:?missing value for --lock-timeout-sec}"
+      shift 2
+      ;;
     --github-output)
       github_output="${2:?missing value for --github-output}"
       shift 2
@@ -119,6 +126,10 @@ if [[ -z "$ssh_user" ]]; then
 fi
 if ! [[ "$keep_runs" =~ ^[0-9]+$ ]]; then
   echo "error: --keep-runs must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$lock_timeout_sec" =~ ^[0-9]+$ ]]; then
+  echo "error: --lock-timeout-sec must be a non-negative integer" >&2
   exit 2
 fi
 
@@ -173,6 +184,7 @@ SSH_TARGET=${ssh_target}
 REMOTE_ROOT=${resolved_remote_root}
 REMOTE_RUN_DIR=${remote_run_dir}
 KEEP_RUNS=${keep_runs}
+LOCK_TIMEOUT_SEC=${lock_timeout_sec}
 EOF
 
 "$ssh_binary" "$ssh_target" "mkdir -p $(shell_quote "$remote_run_dir")"
@@ -180,7 +192,7 @@ cat "$bundle_path" | "$ssh_binary" "$ssh_target" "cat > $(shell_quote "${remote_
 
 set +e
 "$ssh_binary" "$ssh_target" \
-  "bash -s -- $(printf '%q' "$resolved_remote_root") $(printf '%q' "$run_id") $(printf '%q' "$bundle_ref") $(printf '%q' "$keep_runs")" \
+  "bash -s -- $(printf '%q' "$resolved_remote_root") $(printf '%q' "$run_id") $(printf '%q' "$bundle_ref") $(printf '%q' "$keep_runs") $(printf '%q' "$lock_timeout_sec")" \
   2>&1 <<'REMOTE_RUN' | tee "$local_log"
 set -euo pipefail
 
@@ -188,10 +200,12 @@ resolved_remote_root="$1"
 run_id="$2"
 bundle_ref="$3"
 keep_runs="$4"
+lock_timeout_sec="$5"
 run_dir="${resolved_remote_root}/runs/${run_id}"
 bundle_path="${run_dir}/source.bundle"
 mirror_dir="${resolved_remote_root}/repo.git"
 shared_target_dir="${resolved_remote_root}/shared-target"
+lock_file="${resolved_remote_root}/run.lock"
 worktree_ref="refs/pikaci-apple/runs/${run_id}"
 worktree_dir="${run_dir}/worktree"
 artifacts_dir="${run_dir}/artifacts"
@@ -200,6 +214,12 @@ remote_artifact_path="${run_dir}/artifact.tgz"
 
 mkdir -p "$artifacts_dir" "$logs_dir"
 exec > >(tee -a "${logs_dir}/remote.log") 2>&1
+
+exec 9>"$lock_file"
+if ! lockf -s -t "$lock_timeout_sec" 9; then
+  echo "error: Apple host is busy; could not acquire run lock ${lock_file} within ${lock_timeout_sec}s" >&2
+  exit 75
+fi
 
 cleanup() {
   set +e
