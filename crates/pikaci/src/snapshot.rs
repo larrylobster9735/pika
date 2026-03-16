@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 pub enum SnapshotProfile {
     Full,
     StagedLinuxRust,
+    StagedLinuxFollowup,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -243,8 +244,11 @@ fn should_skip(name: &str, root: bool, profile: SnapshotProfile) -> bool {
     matches!(name, ".git" | ".pikaci" | ".direnv")
         || name == "target"
         || (root
-            && profile == SnapshotProfile::StagedLinuxRust
-            && matches!(name, "ios" | "android"))
+            && matches!(
+                (profile, name),
+                (SnapshotProfile::StagedLinuxRust, "ios" | "android")
+                    | (SnapshotProfile::StagedLinuxFollowup, "ios")
+            ))
         || (!root && matches!(name, "node_modules" | ".gradle" | "DerivedData" | "build"))
 }
 
@@ -509,6 +513,25 @@ mod tests {
             "crates",
             true,
             SnapshotProfile::StagedLinuxRust
+        ));
+    }
+
+    #[test]
+    fn staged_linux_followup_snapshot_keeps_android_root() {
+        assert!(should_skip(
+            "ios",
+            true,
+            SnapshotProfile::StagedLinuxFollowup
+        ));
+        assert!(!should_skip(
+            "android",
+            true,
+            SnapshotProfile::StagedLinuxFollowup
+        ));
+        assert!(!should_skip(
+            "docs",
+            true,
+            SnapshotProfile::StagedLinuxFollowup
         ));
     }
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +20,134 @@ use super::common::{pick_free_port, resolve_openclaw_dir, tail_lines};
 use super::types::{OpenclawE2eRequest, ScenarioRunOutput};
 
 const PIKACHAT_BIN_ENV: &str = "PIKAHUT_TEST_PIKACHAT_BIN";
+const OPENCLAW_GATEWAY_BIN_ENV: &str = "PIKAHUT_OPENCLAW_E2E_GATEWAY_BIN";
+const OPENCLAW_EXTENSION_SOURCE_ROOT_ENV: &str = "PIKAHUT_OPENCLAW_EXTENSION_SOURCE_ROOT";
+
+#[derive(Debug)]
+enum OpenclawRuntime {
+    Checkout {
+        openclaw_dir: PathBuf,
+        plugin_source_root: PathBuf,
+    },
+    Packaged {
+        gateway_bin: PathBuf,
+        package_root: PathBuf,
+        plugin_source_root: PathBuf,
+    },
+}
+
+impl OpenclawRuntime {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Checkout { .. } => "checkout",
+            Self::Packaged { .. } => "packaged",
+        }
+    }
+
+    fn plugin_source_root(&self) -> &Path {
+        match self {
+            Self::Checkout {
+                plugin_source_root, ..
+            }
+            | Self::Packaged {
+                plugin_source_root, ..
+            } => plugin_source_root,
+        }
+    }
+
+    fn package_root(&self) -> &Path {
+        match self {
+            Self::Checkout { openclaw_dir, .. } => openclaw_dir,
+            Self::Packaged { package_root, .. } => package_root,
+        }
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn packaged_openclaw_runtime(
+    gateway_bin: &Path,
+    plugin_source_root: &Path,
+) -> Result<OpenclawRuntime> {
+    if !gateway_bin.is_file() {
+        bail!(
+            "packaged OpenClaw gateway binary not found at {} (set {OPENCLAW_GATEWAY_BIN_ENV})",
+            gateway_bin.display()
+        );
+    }
+
+    if !plugin_source_root.join("package.json").is_file() {
+        bail!(
+            "packaged OpenClaw extension source root not found at {} (set {OPENCLAW_EXTENSION_SOURCE_ROOT_ENV})",
+            plugin_source_root.display()
+        );
+    }
+
+    let gateway_root = gateway_bin.parent().and_then(Path::parent).ok_or_else(|| {
+        anyhow!(
+            "unexpected packaged OpenClaw gateway path: {}",
+            gateway_bin.display()
+        )
+    })?;
+    let package_root = gateway_root.join("lib/openclaw");
+    if !package_root.join("package.json").is_file() {
+        bail!(
+            "packaged OpenClaw package root not found at {}",
+            package_root.display()
+        );
+    }
+
+    Ok(OpenclawRuntime::Packaged {
+        gateway_bin: gateway_bin.to_path_buf(),
+        package_root,
+        plugin_source_root: plugin_source_root.to_path_buf(),
+    })
+}
+
+fn resolve_openclaw_runtime(root: &Path, cli_value: Option<PathBuf>) -> Result<OpenclawRuntime> {
+    if let Some(gateway_bin) = env_path(OPENCLAW_GATEWAY_BIN_ENV) {
+        let plugin_source_root = env_path(OPENCLAW_EXTENSION_SOURCE_ROOT_ENV).ok_or_else(|| {
+            anyhow!("missing {OPENCLAW_EXTENSION_SOURCE_ROOT_ENV} for packaged OpenClaw e2e mode")
+        })?;
+        return packaged_openclaw_runtime(&gateway_bin, &plugin_source_root);
+    }
+
+    let openclaw_dir = resolve_openclaw_dir(root, cli_value)?;
+    if !openclaw_dir.join("package.json").is_file() {
+        bail!(
+            "openclaw checkout not found at {} (set --openclaw-dir or OPENCLAW_DIR)",
+            openclaw_dir.display()
+        );
+    }
+
+    Ok(OpenclawRuntime::Checkout {
+        openclaw_dir,
+        plugin_source_root: root.join("pikachat-openclaw/openclaw/extensions/pikachat-openclaw"),
+    })
+}
+
+fn reset_symlink(path: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() || path.is_symlink() {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("read metadata for {}", path.display()))?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
+        } else {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    std::os::unix::fs::symlink(target, path)
+        .with_context(|| format!("symlink {} -> {}", path.display(), target.display()))
+}
 
 #[derive(Debug, Deserialize)]
 struct OpenclawBuildStamp {
@@ -271,26 +399,27 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
             .ok_or_else(|| anyhow!("fixture manifest missing relay_url"))?,
     };
 
-    let openclaw_dir = resolve_openclaw_dir(&root, args.openclaw_dir)?;
-    if !openclaw_dir.join("package.json").is_file() {
-        bail!(
-            "openclaw checkout not found at {} (set --openclaw-dir or OPENCLAW_DIR)",
-            openclaw_dir.display()
-        );
-    }
+    let openclaw_runtime = resolve_openclaw_runtime(&root, args.openclaw_dir)?;
 
     let artifact_dir = context.ensure_artifact_subdir("openclaw-e2e")?;
     let openclaw_state_dir = context.state_dir().join("openclaw/state");
     let openclaw_config_path = context.state_dir().join("openclaw/openclaw.json");
     let sidecar_state_dir = context.state_dir().join("cli/pikachat/default");
-    let plugin_path = root.join("pikachat-openclaw/openclaw/extensions/pikachat-openclaw");
+    let plugin_runtime_path = openclaw_state_dir.join("extensions/pikachat-openclaw");
+    let openclaw_node_modules_dir = openclaw_state_dir.join("node_modules");
 
     fs::create_dir_all(&artifact_dir)?;
     fs::create_dir_all(&openclaw_state_dir)?;
     fs::create_dir_all(&sidecar_state_dir)?;
+    fs::create_dir_all(&openclaw_node_modules_dir)?;
     if let Some(parent) = openclaw_config_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    reset_symlink(
+        &openclaw_node_modules_dir.join("openclaw"),
+        openclaw_runtime.package_root(),
+    )?;
+    reset_symlink(&plugin_runtime_path, openclaw_runtime.plugin_source_root())?;
 
     let runner = CommandRunner::new(&context);
     let mut command_outcomes = Vec::new();
@@ -315,31 +444,33 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
             .to_string()
     };
 
-    if super::common::command_exists("pnpm") {
-        let pnpm_cmd = runner.run(
-            &CommandSpec::new("pnpm")
-                .cwd(&openclaw_dir)
-                .args(["install"])
-                .capture_name("openclaw-pnpm-install"),
-        )?;
-        command_outcomes.push(CommandOutcomeRecord::from_output(
-            "openclaw-pnpm-install",
-            &pnpm_cmd,
-        ));
-    } else {
-        let npx_cmd = runner.run(
-            &CommandSpec::new("npx")
-                .cwd(&openclaw_dir)
-                .args(["--yes", "pnpm@10", "install"])
-                .capture_name("openclaw-npx-pnpm-install"),
-        )?;
-        command_outcomes.push(CommandOutcomeRecord::from_output(
-            "openclaw-npx-pnpm-install",
-            &npx_cmd,
-        ));
-    }
+    if let OpenclawRuntime::Checkout { openclaw_dir, .. } = &openclaw_runtime {
+        if super::common::command_exists("pnpm") {
+            let pnpm_cmd = runner.run(
+                &CommandSpec::new("pnpm")
+                    .cwd(openclaw_dir)
+                    .args(["install"])
+                    .capture_name("openclaw-pnpm-install"),
+            )?;
+            command_outcomes.push(CommandOutcomeRecord::from_output(
+                "openclaw-pnpm-install",
+                &pnpm_cmd,
+            ));
+        } else {
+            let npx_cmd = runner.run(
+                &CommandSpec::new("npx")
+                    .cwd(openclaw_dir)
+                    .args(["--yes", "pnpm@10", "install"])
+                    .capture_name("openclaw-npx-pnpm-install"),
+            )?;
+            command_outcomes.push(CommandOutcomeRecord::from_output(
+                "openclaw-npx-pnpm-install",
+                &npx_cmd,
+            ));
+        }
 
-    ensure_openclaw_runtime_ready(&openclaw_dir, &runner, &mut command_outcomes)?;
+        ensure_openclaw_runtime_ready(openclaw_dir, &runner, &mut command_outcomes)?;
+    }
 
     let gw_port = pick_free_port()?;
     let gw_token = format!(
@@ -360,7 +491,7 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
       "plugins": {
         "enabled": true,
         "allow": ["pikachat-openclaw"],
-        "load": { "paths": [plugin_path] },
+        "load": { "paths": [plugin_runtime_path] },
         "slots": { "memory": "none" },
         "entries": {
           "pikachat-openclaw": {
@@ -395,30 +526,37 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
     let openclaw_config_copy = artifact_dir.join("openclaw.json");
     fs::copy(&openclaw_config_path, &openclaw_config_copy)?;
 
-    let mut gateway = runner.spawn(
-        &CommandSpec::node()
-            .cwd(&openclaw_dir)
-            .env(
-                "OPENCLAW_STATE_DIR",
-                openclaw_state_dir.to_string_lossy().to_string(),
-            )
-            .env(
-                "OPENCLAW_CONFIG_PATH",
-                openclaw_config_path.to_string_lossy().to_string(),
-            )
-            .env("OPENCLAW_GATEWAY_TOKEN", gw_token)
-            .env("OPENCLAW_SKIP_BROWSER_CONTROL_SERVER", "1")
-            .env("OPENCLAW_SKIP_GMAIL_WATCHER", "1")
-            .env("OPENCLAW_SKIP_CANVAS_HOST", "1")
-            .env("OPENCLAW_SKIP_CRON", "1")
-            .env("OPENCLAW_BUILD_VERBOSE", "1")
+    let mut gateway_spec = match &openclaw_runtime {
+        OpenclawRuntime::Checkout { openclaw_dir, .. } => CommandSpec::node()
+            .cwd(openclaw_dir)
             .arg("scripts/run-node.mjs")
-            .arg("gateway")
-            .arg("--port")
-            .arg(gw_port.to_string())
-            .arg("--allow-unconfigured")
             .capture_name("openclaw-gateway"),
-    )?;
+        OpenclawRuntime::Packaged { gateway_bin, .. } => {
+            CommandSpec::new(gateway_bin.to_string_lossy().to_string())
+                .cwd(&openclaw_state_dir)
+                .capture_name("openclaw-gateway")
+        }
+    };
+    gateway_spec = gateway_spec
+        .env(
+            "OPENCLAW_STATE_DIR",
+            openclaw_state_dir.to_string_lossy().to_string(),
+        )
+        .env(
+            "OPENCLAW_CONFIG_PATH",
+            openclaw_config_path.to_string_lossy().to_string(),
+        )
+        .env("OPENCLAW_GATEWAY_TOKEN", gw_token)
+        .env("OPENCLAW_SKIP_BROWSER_CONTROL_SERVER", "1")
+        .env("OPENCLAW_SKIP_GMAIL_WATCHER", "1")
+        .env("OPENCLAW_SKIP_CANVAS_HOST", "1")
+        .env("OPENCLAW_SKIP_CRON", "1")
+        .env("OPENCLAW_BUILD_VERBOSE", "1")
+        .arg("gateway")
+        .arg("--port")
+        .arg(gw_port.to_string())
+        .arg("--allow-unconfigured");
+    let mut gateway = runner.spawn(&gateway_spec)?;
 
     let openclaw_log = gateway.stdout_path.clone();
     let openclaw_err = gateway.stderr_path.clone();
@@ -476,7 +614,14 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
         .with_metadata("relay_url", relay_url)
         .with_metadata("tenant_relay_namespace", tenant_relay_namespace)
         .with_metadata("tenant_moq_namespace", tenant_moq_namespace)
-        .with_metadata("openclaw_dir", openclaw_dir.to_string_lossy().to_string())
+        .with_metadata("openclaw_mode", openclaw_runtime.mode())
+        .with_metadata(
+            "openclaw_runtime_root",
+            openclaw_runtime
+                .package_root()
+                .to_string_lossy()
+                .to_string(),
+        )
         .with_metadata("gateway_port", gw_port.to_string());
     let summary = artifacts::write_standard_summary(
         &context,
@@ -493,7 +638,22 @@ pub async fn run_openclaw_e2e(args: OpenclawE2eRequest) -> Result<ScenarioRunOut
 
 #[cfg(test)]
 mod tests {
-    use super::openclaw_runtime_needs_prebuild;
+    use super::{openclaw_runtime_needs_prebuild, packaged_openclaw_runtime};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = format!(
+            "pikahut-openclaw-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
 
     #[test]
     fn runtime_needs_prebuild_when_dist_entry_is_missing() {
@@ -530,5 +690,37 @@ mod tests {
             dir.path(),
             Some("new-head")
         ));
+    }
+
+    #[test]
+    fn packaged_runtime_derives_openclaw_package_root_from_binary() {
+        let root = temp_path("runtime");
+        let gateway_bin = root.join("bin/openclaw");
+        let package_root = root.join("lib/openclaw");
+        let extension_root = temp_path("extension");
+
+        fs::create_dir_all(gateway_bin.parent().expect("bin dir")).expect("create bin dir");
+        fs::create_dir_all(&package_root).expect("create package root");
+        fs::create_dir_all(&extension_root).expect("create extension root");
+        fs::write(&gateway_bin, "").expect("write gateway bin");
+        fs::write(package_root.join("package.json"), "{}\n").expect("write package.json");
+        fs::write(extension_root.join("package.json"), "{}\n").expect("write extension package");
+
+        let runtime =
+            packaged_openclaw_runtime(&gateway_bin, &extension_root).expect("resolve runtime");
+        match runtime {
+            super::OpenclawRuntime::Packaged {
+                package_root: resolved_root,
+                plugin_source_root,
+                ..
+            } => {
+                assert_eq!(resolved_root, package_root);
+                assert_eq!(plugin_source_root, extension_root);
+            }
+            other => panic!("unexpected runtime: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(extension_root);
     }
 }

@@ -422,6 +422,7 @@ fn target_spec(name: &str) -> anyhow::Result<TargetSpec> {
                 "cli/**",
                 "flake.nix",
                 "flake.lock",
+                "fixtures/**",
                 "nix/**",
                 "justfile",
                 ".github/workflows/pre-merge.yml",
@@ -439,91 +440,68 @@ fn target_spec(name: &str) -> anyhow::Result<TargetSpec> {
                 "crates/pika-test-utils/**",
                 "crates/pika-tls/**",
                 "rust/**",
+                "tests/**",
             ],
             pikachat_rust_jobs(),
         )),
-        "pre-merge-pikachat-openclaw-e2e" => Ok(TargetSpec {
-            id: "pre-merge-pikachat-openclaw-e2e",
-            description: "Run the heavy OpenClaw gateway end-to-end scenario on a host-local Linux runner",
-            filters: &[],
-            jobs: vec![JobSpec {
-                id: "pikachat-openclaw-gateway-e2e",
-                description: "Run the heavy OpenClaw gateway end-to-end scenario on a host-local Linux runner",
-                timeout_secs: 3600,
-                writable_workspace: true,
-                guest_command: GuestCommand::HostShellCommand {
-                    command: "cargo build -p pikachat && export PIKAHUT_TEST_PIKACHAT_BIN=\"$CARGO_TARGET_DIR/debug/pikachat\" && cargo test -p pikahut --test integration_openclaw openclaw_gateway_e2e -- --ignored --nocapture",
-                },
-                staged_linux_rust_lane: None,
-            }],
-        }),
-        "pre-merge-pika-followup" => Ok(TargetSpec {
-            id: "pre-merge-pika-followup",
-            description: "Run the non-Rust follow-up checks for the Pika pre-merge lane on a host-local Linux runner",
-            filters: &[],
-            jobs: vec![
-                JobSpec {
-                    id: "pika-android-test-compile",
-                    description: "Compile Android instrumentation test Kotlin for the Pika app on a host-local Linux runner",
-                    timeout_secs: 3600,
-                    writable_workspace: true,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "cd android && ./gradlew :app:compileDebugAndroidTestKotlin",
-                    },
-                    staged_linux_rust_lane: None,
-                },
-                JobSpec {
-                    id: "pikachat-build",
-                    description: "Build pikachat on a host-local Linux runner",
-                    timeout_secs: 1800,
-                    writable_workspace: true,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "cargo build -p pikachat",
-                    },
-                    staged_linux_rust_lane: None,
-                },
-                JobSpec {
-                    id: "pika-desktop-check",
-                    description: "Run desktop-check on a host-local Linux runner",
-                    timeout_secs: 1800,
-                    writable_workspace: true,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "just desktop-check",
-                    },
-                    staged_linux_rust_lane: None,
-                },
-                JobSpec {
-                    id: "pika-actionlint",
-                    description: "Run actionlint on a host-local Linux runner",
-                    timeout_secs: 600,
-                    writable_workspace: false,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "actionlint",
-                    },
-                    staged_linux_rust_lane: None,
-                },
-                JobSpec {
-                    id: "pika-doc-contracts",
-                    description: "Run docs and justfile contract checks on a host-local Linux runner",
-                    timeout_secs: 900,
-                    writable_workspace: true,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "npx --yes @justinmoon/agent-tools check-docs && npx --yes @justinmoon/agent-tools check-justfile",
-                    },
-                    staged_linux_rust_lane: None,
-                },
-                JobSpec {
-                    id: "pika-rust-deps-hygiene",
-                    description: "Run cargo machete dependency hygiene on a host-local Linux runner",
-                    timeout_secs: 900,
-                    writable_workspace: true,
-                    guest_command: GuestCommand::HostShellCommand {
-                        command: "./scripts/check-cargo-machete",
-                    },
-                    staged_linux_rust_lane: None,
-                },
+        "pre-merge-pikachat-openclaw-e2e" => Ok(staged_linux_target_spec(
+            StagedLinuxRustTarget::PreMergePikachatOpenclawE2e,
+            &[
+                "Cargo.toml",
+                "Cargo.lock",
+                "flake.nix",
+                "flake.lock",
+                "fixtures/**",
+                "nix/**",
+                "justfile",
+                ".github/workflows/pre-merge.yml",
+                "cli/**",
+                "crates/pikaci/**",
+                "crates/pikahut/**",
+                "crates/pikachat-sidecar/**",
+                "crates/pika-marmot-runtime/**",
+                "crates/pika-relay-profiles/**",
+                "crates/pika-media/**",
+                "crates/pika-tls/**",
+                "tests/**",
+                "tools/**",
+                "pikachat-openclaw/**",
+                "scripts/pikaci-staged-linux-remote.sh",
+                "scripts/pika-build-prewarm-workspace-deps.sh",
+                "scripts/pika-build-run-workspace-deps.sh",
+                "scripts/lib/pikaci-tools.sh",
             ],
-        }),
+            pikachat_openclaw_e2e_jobs(),
+        )),
+        "pre-merge-pika-followup" => Ok(staged_linux_target_spec(
+            StagedLinuxRustTarget::PreMergePikaFollowup,
+            &[
+                "Cargo.toml",
+                "Cargo.lock",
+                "flake.nix",
+                "flake.lock",
+                "nix/**",
+                "justfile",
+                "just/**",
+                ".github/actionlint.yaml",
+                ".github/workflows/pre-merge.yml",
+                "android/**",
+                "docs/**",
+                "scripts/**",
+                "cli/**",
+                "crates/pikaci/**",
+                "crates/pika-desktop/**",
+                "crates/pika-media/**",
+                "crates/pika-marmot-runtime/**",
+                "crates/pika-relay-profiles/**",
+                "crates/pika-tls/**",
+                "crates/pikahut/**",
+                "crates/pikachat-sidecar/**",
+                "rust/**",
+                "uniffi-bindgen/**",
+            ],
+            pika_followup_jobs(),
+        )),
         "pre-merge-pikachat-apple-followup" => Ok(TargetSpec {
             id: "pre-merge-pikachat-apple-followup",
             description: "Run the Apple-host pikachat follow-up after the staged Linux Rust lane",
@@ -1173,6 +1151,62 @@ fn pikachat_rust_jobs() -> Vec<JobSpec> {
     ]
 }
 
+fn pika_followup_jobs() -> Vec<JobSpec> {
+    vec![
+        JobSpec {
+            id: "pika-android-test-compile",
+            description: "Compile Android instrumentation test Kotlin for the Pika app in a remote Linux microVM",
+            timeout_secs: 3600,
+            writable_workspace: true,
+            guest_command: GuestCommand::ShellCommand { command: "ignored" },
+            staged_linux_rust_lane: Some(StagedLinuxRustLane::PikaFollowupAndroidTestCompile),
+        },
+        JobSpec {
+            id: "pikachat-build",
+            description: "Validate the pikachat build in a remote Linux microVM",
+            timeout_secs: 1800,
+            writable_workspace: false,
+            guest_command: GuestCommand::ShellCommand { command: "ignored" },
+            staged_linux_rust_lane: Some(StagedLinuxRustLane::PikaFollowupPikachatBuild),
+        },
+        JobSpec {
+            id: "pika-desktop-check",
+            description: "Validate desktop-check in a remote Linux microVM",
+            timeout_secs: 1800,
+            writable_workspace: false,
+            guest_command: GuestCommand::ShellCommand { command: "ignored" },
+            staged_linux_rust_lane: Some(StagedLinuxRustLane::PikaFollowupDesktopCheck),
+        },
+        JobSpec {
+            id: "pika-actionlint",
+            description: "Run actionlint in a remote Linux microVM",
+            timeout_secs: 600,
+            writable_workspace: false,
+            guest_command: GuestCommand::ShellCommand { command: "ignored" },
+            staged_linux_rust_lane: Some(StagedLinuxRustLane::PikaFollowupActionlint),
+        },
+        JobSpec {
+            id: "pika-doc-contracts",
+            description: "Run docs and justfile contract checks in a remote Linux microVM",
+            timeout_secs: 900,
+            writable_workspace: false,
+            guest_command: GuestCommand::ShellCommand { command: "ignored" },
+            staged_linux_rust_lane: Some(StagedLinuxRustLane::PikaFollowupDocContracts),
+        },
+    ]
+}
+
+fn pikachat_openclaw_e2e_jobs() -> Vec<JobSpec> {
+    vec![JobSpec {
+        id: "pikachat-openclaw-gateway-e2e",
+        description: "Run the heavy OpenClaw gateway end-to-end scenario in a remote Linux microVM",
+        timeout_secs: 3600,
+        writable_workspace: false,
+        guest_command: GuestCommand::ShellCommand { command: "ignored" },
+        staged_linux_rust_lane: Some(StagedLinuxRustLane::OpenclawGatewayE2e),
+    }]
+}
+
 fn fixture_rust_jobs() -> Vec<JobSpec> {
     vec![
         JobSpec {
@@ -1626,7 +1660,7 @@ mod tests {
         target_spec_for_rerun,
     };
     use pikaci::{
-        GuestCommand, JobRecord, PreparedOutputConsumerKind, RunRecord, RunStatus, RunnerKind,
+        JobRecord, PreparedOutputConsumerKind, RunRecord, RunStatus, RunnerKind,
         StagedLinuxRustLane, StagedLinuxRustTarget,
     };
 
@@ -1734,45 +1768,36 @@ mod tests {
     }
 
     #[test]
-    fn pre_merge_pikachat_openclaw_e2e_target_uses_host_local_runner() {
+    fn pre_merge_pikachat_openclaw_e2e_target_uses_staged_linux_runner() {
         let target =
             target_spec("pre-merge-pikachat-openclaw-e2e").expect("pikachat openclaw target");
 
         assert_eq!(target.jobs.len(), 1);
-        assert_eq!(target.jobs[0].staged_linux_rust_lane(), None);
-        assert_eq!(target.jobs[0].runner_kind(), RunnerKind::HostLocal);
-        match &target.jobs[0].guest_command {
-            GuestCommand::HostShellCommand { command } => {
-                assert!(command.contains("PIKAHUT_TEST_PIKACHAT_BIN"));
-                assert!(command.contains("$CARGO_TARGET_DIR/debug/pikachat"));
-            }
-            other => panic!("unexpected guest command: {other:?}"),
-        }
+        assert_eq!(
+            target.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::OpenclawGatewayE2e)
+        );
+        assert_eq!(target.jobs[0].runner_kind(), RunnerKind::MicrovmRemote);
     }
 
     #[test]
-    fn pre_merge_pika_followup_target_uses_host_local_runner() {
+    fn pre_merge_pika_followup_target_uses_staged_linux_runner() {
         let target = target_spec("pre-merge-pika-followup").expect("pika followup target");
 
-        assert_eq!(target.jobs.len(), 6);
+        assert_eq!(target.jobs.len(), 5);
         assert!(
             target
                 .jobs
                 .iter()
-                .any(|job| job.id == "pika-rust-deps-hygiene")
+                .all(|job| job.staged_linux_rust_lane().is_some())
         );
         assert!(
             target
                 .jobs
                 .iter()
-                .all(|job| job.staged_linux_rust_lane().is_none())
+                .all(|job| job.runner_kind() == RunnerKind::MicrovmRemote)
         );
-        assert!(
-            target
-                .jobs
-                .iter()
-                .all(|job| job.runner_kind() == RunnerKind::HostLocal)
-        );
+        assert!(target.jobs[0].writable_workspace);
     }
 
     #[test]

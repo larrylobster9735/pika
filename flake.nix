@@ -59,6 +59,23 @@
         overlays = [ (import rust-overlay) ];
         config.allowUnfree = true;
       };
+      ciLinuxAndroidSdk =
+        if builtins.hasAttr "x86_64-linux" android-nixpkgs.sdk then
+          android-nixpkgs.sdk."x86_64-linux" (
+            sdkPkgs:
+            with sdkPkgs;
+            [
+              cmdline-tools-latest
+              build-tools-35-0-0
+              platform-tools
+              platforms-android-35
+              emulator
+              system-images-android-35-google-apis-arm64-v8a
+              ndk-28-2-13676358
+            ]
+          )
+        else
+          null;
       rustWorkspaceSrc = serverPkgs.lib.fileset.toSource {
         root = ./.;
         fileset = serverPkgs.lib.fileset.unions [
@@ -67,8 +84,10 @@
           ./Cargo.lock
           ./config
           ./crates
+          ./fixtures
           ./pikachat-openclaw/openclaw/extensions/pikachat-openclaw
           ./rust
+          ./tests
           ./cli
           ./uniffi-bindgen
         ];
@@ -81,10 +100,33 @@
           ./Cargo.lock
           ./config
           ./crates
+          ./fixtures
           ./pikachat-openclaw/openclaw/extensions/pikachat-openclaw
+          ./rust
+          ./tests
+          ./cli
+          ./uniffi-bindgen
+        ];
+      };
+      ciPikaFollowupWorkspaceSrc = ciLinuxPkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = ciLinuxPkgs.lib.fileset.unions [
+          ./VERSION
+          ./Cargo.toml
+          ./Cargo.lock
+          ./config
+          ./crates
           ./rust
           ./cli
           ./uniffi-bindgen
+          ./android
+          ./docs
+          ./just
+          ./justfile
+          ./nix
+          ./.github/actionlint.yaml
+          ./.github/workflows/pre-merge.yml
+          ./scripts/agent-tools
         ];
       };
       ciPikaCoreRustSrc = ciLinuxPkgs.lib.fileset.toSource {
@@ -812,6 +854,7 @@ EOF
             pkgs = ciLinuxPkgs;
             crane = crane;
             pikaRelayPkg = pikaRelayPkg;
+            openclawGatewayPkg = openclawGatewayPkg;
             outputHashes = {
               "git+https://github.com/futurepaul/hypernote-mdx?rev=9c73231c980a03e6b149f62ccce2e58c9563744f#9c73231c980a03e6b149f62ccce2e58c9563744f" =
                 "sha256-40WIlLAR3MevImSErv9im12ogPd5/oAG6saRiVKpNPY=";
@@ -840,6 +883,13 @@ EOF
           pikachatLane = import ./nix/ci/linux-rust.nix (pikachatStagedLinuxRustArgs // {
             lane = "pikachat";
           });
+          pikaFollowupLane = import ./nix/ci/linux-rust.nix (commonStagedLinuxRustArgs // {
+            src = ciPikaFollowupWorkspaceSrc;
+            cargoLock = ./Cargo.lock;
+            androidSdk = ciLinuxAndroidSdk;
+            androidJdk = ciLinuxPkgs.jdk17_headless;
+            lane = "pika-followup";
+          });
           notificationsLane = import ./nix/ci/linux-rust.nix (reducedStagedLinuxRustArgs // {
             lane = "notifications";
           });
@@ -861,6 +911,8 @@ EOF
           agentContractsWorkspaceBuild = agentContractsLane.workspaceBuild;
           pikachatWorkspaceDeps = pikachatLane.workspaceDeps;
           pikachatWorkspaceBuild = pikachatLane.workspaceBuild;
+          pikaFollowupWorkspaceDeps = pikaFollowupLane.workspaceDeps;
+          pikaFollowupWorkspaceBuild = pikaFollowupLane.workspaceBuild;
           notificationsWorkspaceDeps = notificationsLane.workspaceDeps;
           notificationsWorkspaceBuild = notificationsLane.workspaceBuild;
           fixtureWorkspaceDeps = fixtureLane.workspaceDeps;

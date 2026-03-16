@@ -10,8 +10,10 @@ pika-build.
 
 Targets:
   pre-merge-pika-rust
+  pre-merge-pika-followup
   pre-merge-agent-contracts
   pre-merge-pikachat-rust
+  pre-merge-pikachat-openclaw-e2e
   pre-merge-notifications
   pre-merge-fixture-rust
   pre-merge-rmp

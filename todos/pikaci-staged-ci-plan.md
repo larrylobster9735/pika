@@ -833,6 +833,7 @@ We have at least one important Linux Rust lane where:
     - GitHub now records the fresh `pikaci` `run_id`, overall run status, wall-clock duration, and per-job durations/statuses in the shadow job summary,
     - the shadow job also uploads a compact `pikaci-shadow-<run_id>` artifact bundle containing `run.json`, `plan.json`, `prepared-outputs.json`, and the per-job host/guest logs for debugging,
     - metadata collection now keys off the pre-run baseline `created_at` timestamp rather than excluding only one old run id, so the shadow summary only accepts a run that is actually newer than the job's starting point,
+    - metadata collection now keys off the pre-run baseline `created_at` timestamp rather than excluding only one old run id, so the shadow summary only accepts a run that is actually newer than the job's starting point,
     - and if the advisory job exits before `pikaci` actually starts, the summary now reports that cleanly instead of turning the reporting step into a second failure mode,
     - a fresh local validation rerun (`20260310T223310Z-e53c83eb`) still passed end-to-end in about `212s`, and the generated summary now shows the overall run plus the two per-job durations (`54s` app-flows, `40s` messaging) alongside the uploaded debug bundle name,
   - note that the first local shadow-mode verification rerun (`20260310T220049Z-c2361db8`) still passed end-to-end in about `216s`,
@@ -1391,3 +1392,32 @@ We have at least one important Linux Rust lane where:
         - keep choosing remaining Linux targets that can be reshaped into staged inputs plus remote microVM wrappers,
         - reject guest-network and host-assumption leaks as migration blockers to stage away,
         - and only stop when required Linux lanes no longer execute real workload as `HostLocal` on the GitHub runner.
+    - the next runtime-unification slice attempted both remaining required Linux `HostLocal` lanes and only one remains on the GitHub runner:
+      - `pre-merge-pikachat-openclaw-e2e` now runs under the staged remote `microvm.nix` path on `pika-build`,
+      - `pre-merge-pika-followup` was attempted on the same staged remote path but is still blocked before execute,
+      - required Linux runner-side execution remaining after this slice: only `pre-merge-pika-followup`,
+    - the OpenClaw lane needed staged package-shape fixes, not a new executor:
+      - the first remote rerun (`20260316T005731Z-20e66d25`) proved that copying the full packaged OpenClaw tree into `/tmp` to satisfy plugin ownership checks overflowed guest disk,
+      - the next rerun (`20260316T010451Z-5f9f0ce7`) proved the lighter overlay still lacked the packaged self-reference that the plugin expects, failing with `Cannot find module 'openclaw/plugin-sdk'`,
+      - the landable fix was to keep a tiny writable overlay package root in the guest:
+        - copy the `pikachat-openclaw` extension into a real writable path under `/tmp`,
+        - copy `package.json`,
+        - symlink the packaged `dist/`, `docs/`, built-in extensions, and `node_modules` entries from the staged store output,
+        - and add an explicit `node_modules/openclaw -> ..` self-reference so `openclaw/plugin-sdk` resolves from the copied extension without copying the entire package,
+      - the decisive rerun passed end to end on `pika-build`:
+        - `./scripts/pikaci-staged-linux-remote.sh run pre-merge-pikachat-openclaw-e2e`
+        - run `20260316T011223Z-c756c203`
+        - `workspaceDeps` succeeded remotely on `pika-build`,
+        - `workspaceBuild` succeeded remotely on `pika-build`,
+        - `pikachat-openclaw-gateway-e2e` passed under the remote `microvm.nix` guest in about `30.06s`,
+    - the remaining blocker is now concentrated in `pre-merge-pika-followup`:
+      - the best remote attempt on current tip (`20260316T004233Z-67423e10`) got through staged `workspaceDeps` and then failed in staged `workspaceBuild` on `pika-build`,
+      - the exact failure was Android Gradle plugin resolution in the sandboxed staged build:
+        - `Plugin [id: 'com.android.application', version: '8.5.2', apply: false] was not found`
+      - that is a real staged-input blocker, not a preference for `HostLocal`:
+        - the repo already provides Android SDK/JDK inputs through Nix,
+        - but it does not yet provide a vendored or Nix-managed offline Gradle plugin / Maven dependency closure for the Android build,
+        - and the current Android settings still resolve plugins and dependencies from `google()`, `mavenCentral()`, `gradlePluginPortal()`, and `jitpack`,
+      - path to full Linux runtime unification from here:
+        - either stage a reproducible offline Android Gradle dependency closure for `:app:compileDebugAndroidTestKotlin`,
+        - or narrow the required followup lane contract so it no longer depends on that unstaged online Android build step.
