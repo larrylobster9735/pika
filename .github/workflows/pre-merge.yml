@@ -248,6 +248,12 @@ jobs:
     runs-on: blacksmith-16vcpu-ubuntu-2404
     environment:
       name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
+    outputs:
+      result: ${{ steps.lane.outputs.result }}
+      exit_code: ${{ steps.lane.outputs.exit_code }}
+      run_id: ${{ steps.metadata.outputs.run_id }}
+      run_status: ${{ steps.metadata.outputs.run_status }}
+      run_duration_seconds: ${{ steps.metadata.outputs.run_duration_seconds }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -281,7 +287,76 @@ jobs:
           key: ${{ github.repository }}-${{ github.event_name == 'pull_request_target' && 'pr-head' || 'trusted' }}-gradle-v1-${{ runner.os }}
           path: ~/.gradle
 
-      - run: ./scripts/pikaci-ci-run.sh pre-merge-pika-followup
+      - name: Run host-local pika followup lane
+        id: lane
+        run: |
+          set +e
+          previous_run_id="$(
+            find .pikaci/runs -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null \
+              | LC_ALL=C sort -r \
+              | head -n1 \
+              || true
+          )"
+          previous_run_created_at=""
+          if [ -n "$previous_run_id" ] && [ -f ".pikaci/runs/$previous_run_id/run.json" ]; then
+            previous_run_created_at="$(
+              python3 -c 'import json, pathlib, sys; run = json.loads(pathlib.Path(".pikaci/runs", sys.argv[1], "run.json").read_text()); print(run.get("created_at", ""))' "$previous_run_id"
+            )"
+          fi
+
+          ./scripts/pikaci-ci-run.sh pre-merge-pika-followup
+          exit_code=$?
+
+          if [ "$exit_code" -eq 0 ]; then
+            result=success
+          else
+            result=failure
+            echo "::error::check-pika failed with exit code $exit_code"
+          fi
+
+          {
+            echo "result=$result"
+            echo "exit_code=$exit_code"
+            echo "previous_run_id=$previous_run_id"
+            echo "previous_run_created_at=$previous_run_created_at"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect lane metadata
+        if: always()
+        id: metadata
+        run: |
+          python3 scripts/pikaci-run-summary.py \
+            --target-id pre-merge-pika-followup \
+            --min-created-at-exclusive "${{ steps.lane.outputs.previous_run_created_at }}" \
+            --allow-missing \
+            --github-output "$GITHUB_OUTPUT" \
+            --markdown-out "$RUNNER_TEMP/pikaci-run-summary.md" \
+            --artifact-dir "$RUNNER_TEMP/pikaci-run-artifact"
+
+      - name: Upload lane debug bundle
+        if: always() && steps.metadata.outputs.run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: ${{ runner.temp }}/pikaci-run-artifact
+          if-no-files-found: error
+
+      - name: Summarize lane
+        if: always()
+        run: |
+          {
+            echo "- command: \`./scripts/pikaci-ci-run.sh pre-merge-pika-followup\`"
+            echo "- result: \`${{ steps.lane.outputs.result }}\`"
+            echo "- exit code: \`${{ steps.lane.outputs.exit_code }}\`"
+            echo "- artifact: \`${{ steps.metadata.outputs.artifact_name || 'none' }}\`"
+            echo ""
+            cat "$RUNNER_TEMP/pikaci-run-summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce lane result
+        if: always() && steps.lane.outputs.result != 'success'
+        run: exit 1
 
   check-pika-rust:
     name: check-pika-rust (pikaci)
@@ -906,11 +981,14 @@ jobs:
   summarize-pikaci-linux-lanes:
     if: always() && (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pre-merge'))
     needs:
+      - check-pika
       - check-pika-rust
       - check-notifications
       - check-agent-contracts
       - check-rmp
       - check-pikachat
+      - check-pikachat-openclaw-e2e
+      - check-fixture
     runs-on: ubuntu-latest
     steps:
       - name: Summarize pikaci Linux lanes
@@ -953,6 +1031,13 @@ jobs:
             echo "| lane | workflow job | lane result | pikaci run status | duration | run id |"
             echo "| --- | --- | --- | --- | --- | --- |"
             lane_row \
+              "pre-merge-pika-followup" \
+              "${{ needs.check-pika.result }}" \
+              "${{ needs.check-pika.outputs.result }}" \
+              "${{ needs.check-pika.outputs.run_status }}" \
+              "${{ needs.check-pika.outputs.run_duration_seconds }}" \
+              "${{ needs.check-pika.outputs.run_id }}"
+            lane_row \
               "pre-merge-pika-rust" \
               "${{ needs.check-pika-rust.result }}" \
               "${{ needs.check-pika-rust.outputs.result }}" \
@@ -987,6 +1072,20 @@ jobs:
               "${{ needs.check-pikachat.outputs.run_status }}" \
               "${{ needs.check-pikachat.outputs.run_duration_seconds }}" \
               "${{ needs.check-pikachat.outputs.run_id }}"
+            lane_row \
+              "pre-merge-pikachat-openclaw-e2e" \
+              "${{ needs.check-pikachat-openclaw-e2e.result }}" \
+              "${{ needs.check-pikachat-openclaw-e2e.outputs.result }}" \
+              "${{ needs.check-pikachat-openclaw-e2e.outputs.run_status }}" \
+              "${{ needs.check-pikachat-openclaw-e2e.outputs.run_duration_seconds }}" \
+              "${{ needs.check-pikachat-openclaw-e2e.outputs.run_id }}"
+            lane_row \
+              "pre-merge-fixture-rust" \
+              "${{ needs.check-fixture.result }}" \
+              "${{ needs.check-fixture.outputs.result }}" \
+              "${{ needs.check-fixture.outputs.run_status }}" \
+              "${{ needs.check-fixture.outputs.run_duration_seconds }}" \
+              "${{ needs.check-fixture.outputs.run_id }}"
             echo
             echo "### Linux CI Policy"
             echo
@@ -1002,6 +1101,12 @@ jobs:
     runs-on: blacksmith-16vcpu-ubuntu-2404
     environment:
       name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
+    outputs:
+      result: ${{ steps.lane.outputs.result }}
+      exit_code: ${{ steps.lane.outputs.exit_code }}
+      run_id: ${{ steps.metadata.outputs.run_id }}
+      run_status: ${{ steps.metadata.outputs.run_status }}
+      run_duration_seconds: ${{ steps.metadata.outputs.run_duration_seconds }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1021,30 +1126,97 @@ jobs:
       - uses: nixbuild/nix-quick-install-action@v30
 
       - name: Run OpenClaw E2E lane
+        id: lane
         env:
           PIKA_BUILD_SSH_KEY: ${{ secrets.PIKA_BUILD_SSH_KEY }}
           PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST: ${{ vars.PIKA_BUILD_SSH_HOST }}
         run: |
-          set -euo pipefail
+          set +e
+          exit_code=0
+          previous_run_id="$(
+            find .pikaci/runs -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null \
+              | LC_ALL=C sort -r \
+              | head -n1 \
+              || true
+          )"
+          previous_run_created_at=""
+          if [ -n "$previous_run_id" ] && [ -f ".pikaci/runs/$previous_run_id/run.json" ]; then
+            previous_run_created_at="$(
+              python3 -c 'import json, pathlib, sys; run = json.loads(pathlib.Path(".pikaci/runs", sys.argv[1], "run.json").read_text()); print(run.get("created_at", ""))' "$previous_run_id"
+            )"
+          fi
+
           if [ -z "${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-}" ]; then
             echo "error: set repository variable PIKA_BUILD_SSH_HOST for check-pikachat-openclaw-e2e" >&2
-            exit 2
-          fi
-          if [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
+            exit_code=2
+          elif [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
             echo "error: set repository secret PIKA_BUILD_SSH_KEY for check-pikachat-openclaw-e2e" >&2
-            exit 2
+            exit_code=2
+          else
+            mkdir -p "$HOME/.ssh"
+            chmod 700 "$HOME/.ssh"
+            host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
+            ./scripts/ci-add-known-host.sh "$host"
+
+            eval "$(ssh-agent -s)"
+            trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+            ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+
+            ./scripts/pikaci-staged-linux-remote.sh run pre-merge-pikachat-openclaw-e2e
+            exit_code=$?
           fi
 
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
-          host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
-          ./scripts/ci-add-known-host.sh "$host"
+          if [ "$exit_code" -eq 0 ]; then
+            result=success
+          else
+            result=failure
+            echo "::error::check-pikachat-openclaw-e2e failed with exit code $exit_code"
+          fi
 
-          eval "$(ssh-agent -s)"
-          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-          ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+          {
+            echo "result=$result"
+            echo "exit_code=$exit_code"
+            echo "previous_run_id=$previous_run_id"
+            echo "previous_run_created_at=$previous_run_created_at"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
 
-          ./scripts/pikaci-staged-linux-remote.sh run pre-merge-pikachat-openclaw-e2e
+      - name: Collect lane metadata
+        if: always()
+        id: metadata
+        run: |
+          python3 scripts/pikaci-run-summary.py \
+            --target-id pre-merge-pikachat-openclaw-e2e \
+            --min-created-at-exclusive "${{ steps.lane.outputs.previous_run_created_at }}" \
+            --allow-missing \
+            --github-output "$GITHUB_OUTPUT" \
+            --markdown-out "$RUNNER_TEMP/pikaci-run-summary.md" \
+            --artifact-dir "$RUNNER_TEMP/pikaci-run-artifact"
+
+      - name: Upload lane debug bundle
+        if: always() && steps.metadata.outputs.run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: ${{ runner.temp }}/pikaci-run-artifact
+          if-no-files-found: error
+
+      - name: Summarize lane
+        if: always()
+        run: |
+          {
+            echo "- command: \`./scripts/pikaci-staged-linux-remote.sh run pre-merge-pikachat-openclaw-e2e\`"
+            echo "- result: \`${{ steps.lane.outputs.result }}\`"
+            echo "- exit code: \`${{ steps.lane.outputs.exit_code }}\`"
+            echo "- host: \`${{ vars.PIKA_BUILD_SSH_HOST || 'unset' }}\`"
+            echo "- artifact: \`${{ steps.metadata.outputs.artifact_name || 'none' }}\`"
+            echo ""
+            cat "$RUNNER_TEMP/pikaci-run-summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce lane result
+        if: always() && steps.lane.outputs.result != 'success'
+        run: exit 1
 
   check-fixture:
     name: check-fixture (pikaci)
@@ -1053,6 +1225,12 @@ jobs:
     runs-on: blacksmith-16vcpu-ubuntu-2404
     environment:
       name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
+    outputs:
+      result: ${{ steps.lane.outputs.result }}
+      exit_code: ${{ steps.lane.outputs.exit_code }}
+      run_id: ${{ steps.metadata.outputs.run_id }}
+      run_status: ${{ steps.metadata.outputs.run_status }}
+      run_duration_seconds: ${{ steps.metadata.outputs.run_duration_seconds }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1072,30 +1250,97 @@ jobs:
       - uses: nixbuild/nix-quick-install-action@v30
 
       - name: Run staged remote fixture lane
+        id: lane
         env:
           PIKA_BUILD_SSH_KEY: ${{ secrets.PIKA_BUILD_SSH_KEY }}
           PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST: ${{ vars.PIKA_BUILD_SSH_HOST }}
         run: |
-          set -euo pipefail
+          set +e
+          exit_code=0
+          previous_run_id="$(
+            find .pikaci/runs -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null \
+              | LC_ALL=C sort -r \
+              | head -n1 \
+              || true
+          )"
+          previous_run_created_at=""
+          if [ -n "$previous_run_id" ] && [ -f ".pikaci/runs/$previous_run_id/run.json" ]; then
+            previous_run_created_at="$(
+              python3 -c 'import json, pathlib, sys; run = json.loads(pathlib.Path(".pikaci/runs", sys.argv[1], "run.json").read_text()); print(run.get("created_at", ""))' "$previous_run_id"
+            )"
+          fi
+
           if [ -z "${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-}" ]; then
             echo "error: set repository variable PIKA_BUILD_SSH_HOST for check-fixture" >&2
-            exit 2
-          fi
-          if [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
+            exit_code=2
+          elif [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
             echo "error: set repository secret PIKA_BUILD_SSH_KEY for check-fixture" >&2
-            exit 2
+            exit_code=2
+          else
+            mkdir -p "$HOME/.ssh"
+            chmod 700 "$HOME/.ssh"
+            host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
+            ./scripts/ci-add-known-host.sh "$host"
+
+            eval "$(ssh-agent -s)"
+            trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+            ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+
+            ./scripts/pikaci-staged-linux-remote.sh run pre-merge-fixture-rust
+            exit_code=$?
           fi
 
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
-          host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
-          ./scripts/ci-add-known-host.sh "$host"
+          if [ "$exit_code" -eq 0 ]; then
+            result=success
+          else
+            result=failure
+            echo "::error::check-fixture failed with exit code $exit_code"
+          fi
 
-          eval "$(ssh-agent -s)"
-          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-          ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+          {
+            echo "result=$result"
+            echo "exit_code=$exit_code"
+            echo "previous_run_id=$previous_run_id"
+            echo "previous_run_created_at=$previous_run_created_at"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
 
-          ./scripts/pikaci-staged-linux-remote.sh run pre-merge-fixture-rust
+      - name: Collect lane metadata
+        if: always()
+        id: metadata
+        run: |
+          python3 scripts/pikaci-run-summary.py \
+            --target-id pre-merge-fixture-rust \
+            --min-created-at-exclusive "${{ steps.lane.outputs.previous_run_created_at }}" \
+            --allow-missing \
+            --github-output "$GITHUB_OUTPUT" \
+            --markdown-out "$RUNNER_TEMP/pikaci-run-summary.md" \
+            --artifact-dir "$RUNNER_TEMP/pikaci-run-artifact"
+
+      - name: Upload lane debug bundle
+        if: always() && steps.metadata.outputs.run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: ${{ runner.temp }}/pikaci-run-artifact
+          if-no-files-found: error
+
+      - name: Summarize lane
+        if: always()
+        run: |
+          {
+            echo "- command: \`./scripts/pikaci-staged-linux-remote.sh run pre-merge-fixture-rust\`"
+            echo "- result: \`${{ steps.lane.outputs.result }}\`"
+            echo "- exit code: \`${{ steps.lane.outputs.exit_code }}\`"
+            echo "- host: \`${{ vars.PIKA_BUILD_SSH_HOST || 'unset' }}\`"
+            echo "- artifact: \`${{ steps.metadata.outputs.artifact_name || 'none' }}\`"
+            echo ""
+            cat "$RUNNER_TEMP/pikaci-run-summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce lane result
+        if: always() && steps.lane.outputs.result != 'success'
+        run: exit 1
 
   pre-merge:
     if: always() && (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pre-merge'))
