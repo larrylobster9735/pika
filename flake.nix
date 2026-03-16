@@ -496,8 +496,11 @@
           }
         );
         pikachatOpenclawExtensionPkg = mkPikachatOpenclawExtensionPkg pkgs (mkPikachatOpenclawExtensionSrc pkgs.lib);
-      in {
-        devShells.default = pkgs.mkShell {
+        mkPikaDevShell = { includeAndroid ? hasAndroidSdk, shellName ? "default" }:
+          let
+            withAndroid = includeAndroid && hasAndroidSdk;
+          in
+          pkgs.mkShell {
           buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
           ];
@@ -509,6 +512,7 @@
             pkgs.python3
             pkgs.curl
             pkgs.git
+            pkgs.go
             pkgs.gh
             pkgs.actionlint
             pkgs.coreutils
@@ -538,7 +542,7 @@
             pkgs.alsa-lib
             pkgs.llvmPackages.libclang
           ] ++ linuxGuiRuntimeLibraries
-          ++ pkgs.lib.optionals hasAndroidSdk [
+          ++ pkgs.lib.optionals withAndroid [
             androidSdk
             pkgs.jdk17_headless
             pkgs.cargo-ndk
@@ -548,7 +552,7 @@
           ];
 
           shellHook = ''
-            ${if hasAndroidSdk then ''
+            ${if withAndroid then ''
             export ANDROID_HOME=${androidSdk}/share/android-sdk
             export ANDROID_SDK_ROOT=${androidSdk}/share/android-sdk
             export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
@@ -558,7 +562,13 @@
             export ANDROID_USER_HOME="''${ANDROID_USER_HOME:-''${XDG_STATE_HOME:-$HOME/.local/state}/android}"
             export JAVA_HOME=${pkgs.jdk17_headless}
             export PATH=$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
-            '' else ""}
+            '' else ''
+            unset ANDROID_HOME
+            unset ANDROID_SDK_ROOT
+            unset ANDROID_NDK_HOME
+            unset ADB_MDNS_OPENSCREEN
+            ''}
+            export PIKA_DEV_SHELL="${shellName}"
             export PATH=$PWD/tools:$PATH
 
             if [ "$(uname -s)" = "Linux" ] && [ -n "${linuxGuiRuntimeLibraryPath}" ]; then
@@ -577,7 +587,7 @@
               fi
             fi
 
-            ${if hasAndroidSdk then ''
+            ${if withAndroid then ''
             # Needed for adb when VPN is running
             export ADB_MDNS_OPENSCREEN=0
 
@@ -620,7 +630,7 @@
                 echo "│  iOS builds will not work without it.                   │"
                 echo "└─────────────────────────────────────────────────────────┘"
                 echo ""
-                if [ -t 0 ]; then
+                if [ "''${PIKA_XCODE_INSTALL_PROMPT:-1}" != "0" ] && [ -t 0 ]; then
                   printf "Install Xcode ${xcodeVersion} now? [y/N] "
                   read -r answer
                   if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
@@ -655,7 +665,7 @@
               fi
             fi
 
-            ${if hasAndroidSdk then ''
+            ${if withAndroid then ''
             # Help Gradle find the SDK/NDK without Android Studio.
             mkdir -p android
             cat > android/local.properties <<EOF
@@ -675,7 +685,7 @@ EOF
             echo ""
             echo "Pika dev environment ready"
             echo "  Rust:         $(rustc --version)"
-            ${if hasAndroidSdk then ''
+            ${if withAndroid then ''
             echo "  Android:      $ANDROID_HOME"
             echo "  NDK:          $ANDROID_NDK_HOME"
             '' else ""}
@@ -687,6 +697,10 @@ EOF
             echo ""
           '';
         };
+      in {
+
+        devShells.default = mkPikaDevShell { shellName = "default"; };
+        devShells.apple-host = mkPikaDevShell { includeAndroid = false; shellName = "apple-host"; };
 
         devShells.rmp = pkgs.mkShell {
           buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
