@@ -24,12 +24,15 @@ fn env_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 #[tokio::test]
-#[ignore = "heavy integration lane (OpenClaw checkout + network)"]
+#[ignore = "heavy integration lane (OpenClaw gateway E2E)"]
 async fn openclaw_gateway_e2e() -> Result<()> {
-    if skip_if_missing_requirements(
-        &workspace_root(),
-        &[Requirement::OpenclawCheckout, Requirement::PublicNetwork],
-    ) {
+    let requirements = if env_path("PIKAHUT_OPENCLAW_E2E_GATEWAY_BIN").is_some() {
+        Vec::new()
+    } else {
+        vec![Requirement::OpenclawCheckout, Requirement::PublicNetwork]
+    };
+
+    if skip_if_missing_requirements(&workspace_root(), &requirements) {
         return Ok(());
     }
 

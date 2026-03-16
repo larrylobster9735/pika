@@ -16,8 +16,8 @@ clippy *ARGS:
 pre-commit:
     cargo fmt --all --check
     just --fmt --check --unstable
-    npx --yes @justinmoon/agent-tools check-docs
-    npx --yes @justinmoon/agent-tools check-justfile
+    ./scripts/agent-tools check-docs
+    ./scripts/agent-tools check-justfile
     cargo clippy --all-targets -- -D warnings
 
 # Optional richer local follow-up when you want extra package-specific clippy coverage.

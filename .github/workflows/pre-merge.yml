@@ -61,6 +61,7 @@ jobs:
               - 'cmd/pika-relay/**'
               - 'flake.nix'
               - 'flake.lock'
+              - 'fixtures/**'
               - 'nix/**'
               - 'justfile'
               - 'just/checks.just'
@@ -80,6 +81,7 @@ jobs:
               - 'crates/pika-media/**'
               - 'crates/pika-tls/**'
               - 'rust/**'
+              - 'tests/**'
               - 'scripts/pikaci-ci-run.sh'
               - 'scripts/pikaci-staged-linux-remote.sh'
               - 'scripts/ci-add-known-host.sh'
@@ -89,18 +91,22 @@ jobs:
             pikachat_openclaw_e2e:
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'cmd/pika-relay/**'
               - 'flake.nix'
               - 'flake.lock'
+              - 'fixtures/**'
               - 'nix/**'
               - 'justfile'
               - '.github/workflows/pre-merge.yml'
               - 'cli/**'
+              - 'crates/pikaci/**'
               - 'crates/pikahut/**'
               - 'crates/pikachat-sidecar/**'
               - 'crates/pika-marmot-runtime/**'
               - 'crates/pika-relay-profiles/**'
               - 'crates/pika-media/**'
               - 'crates/pika-tls/**'
+              - 'tests/**'
               - 'tools/**'
               - 'pikachat-openclaw/openclaw/extensions/pikachat-openclaw/**'
               - 'scripts/pikaci-ci-run.sh'
@@ -250,22 +256,29 @@ jobs:
           fi
       - uses: nixbuild/nix-quick-install-action@v30
 
-      - uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-pikaci-cache-v1-${{ runner.os }}
-          path: .pikaci/cache
-      - name: Fix .pikaci ownership
+      - name: Run staged remote pika follow-up lane
+        env:
+          PIKA_BUILD_SSH_KEY: ${{ secrets.PIKA_BUILD_SSH_KEY }}
+          PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST: ${{ vars.PIKA_BUILD_SSH_HOST }}
         run: |
-          if [ -d .pikaci ] && [ "$(stat -c %u .pikaci)" != "$(id -u)" ]; then
-            sudo chown "$(id -u):$(id -g)" .pikaci
+          set -euo pipefail
+          if [ -z "${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-}" ]; then
+            echo "error: set repository variable PIKA_BUILD_SSH_HOST for check-pika-followup" >&2
+            exit 2
           fi
-
-      - uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-gradle-v1-${{ runner.os }}
-          path: ~/.gradle
-
-      - run: ./scripts/pikaci-ci-run.sh pre-merge-pika-followup
+          if [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
+            echo "error: set repository secret PIKA_BUILD_SSH_KEY for check-pika-followup" >&2
+            exit 2
+          fi
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
+          ssh-keyscan -H "$host" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          eval "$(ssh-agent -s)"
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+          ./scripts/pikaci-staged-linux-remote.sh run pre-merge-pika-followup
 
   shadow-pikaci-pre-merge-pika-rust:
     name: check-pika-rust (pikaci)
@@ -938,11 +951,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: openclaw/openclaw
-          path: openclaw
-
       - uses: useblacksmith/stickydisk@v1
         with:
           key: ${{ github.repository }}-nix-v1-${{ runner.os }}
@@ -954,17 +962,29 @@ jobs:
           fi
       - uses: nixbuild/nix-quick-install-action@v30
 
-      - uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-pikaci-cache-v1-${{ runner.os }}
-          path: .pikaci/cache
-      - name: Fix .pikaci ownership
+      - name: Run staged remote OpenClaw E2E lane
+        env:
+          PIKA_BUILD_SSH_KEY: ${{ secrets.PIKA_BUILD_SSH_KEY }}
+          PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST: ${{ vars.PIKA_BUILD_SSH_HOST }}
         run: |
-          if [ -d .pikaci ] && [ "$(stat -c %u .pikaci)" != "$(id -u)" ]; then
-            sudo chown "$(id -u):$(id -g)" .pikaci
+          set -euo pipefail
+          if [ -z "${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-}" ]; then
+            echo "error: set repository variable PIKA_BUILD_SSH_HOST for check-pikachat-openclaw-e2e" >&2
+            exit 2
           fi
-
-      - run: OPENCLAW_DIR=openclaw ./scripts/pikaci-ci-run.sh pre-merge-pikachat-openclaw-e2e
+          if [ -z "${PIKA_BUILD_SSH_KEY:-}" ]; then
+            echo "error: set repository secret PIKA_BUILD_SSH_KEY for check-pikachat-openclaw-e2e" >&2
+            exit 2
+          fi
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          host="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST#*@}"
+          ssh-keyscan -H "$host" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          eval "$(ssh-agent -s)"
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          ssh-add - <<<"$PIKA_BUILD_SSH_KEY"
+          ./scripts/pikaci-staged-linux-remote.sh run pre-merge-pikachat-openclaw-e2e
 
   check-fixture:
     name: check-fixture (pikaci)

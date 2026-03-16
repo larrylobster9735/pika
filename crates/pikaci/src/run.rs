@@ -29,7 +29,7 @@ use crate::model::{
     PreparedOutputHandoff, PreparedOutputHandoffProtocol, PreparedOutputInvocationMode,
     PreparedOutputLauncherTransportMode, PreparedOutputRemoteExposureRequest,
     PreparedOutputResidency, PreparedOutputsRecord, RealizedPreparedOutputRecord, RunPlanRecord,
-    RunRecord, RunStatus, RunnerKind, StagedLinuxRustLane,
+    RunRecord, RunStatus, RunnerKind, StagedLinuxRustLane, StagedLinuxRustTarget,
 };
 use crate::snapshot::{
     SnapshotProfile, compute_source_fingerprint_with_profile, create_snapshot_with_profile,
@@ -125,7 +125,15 @@ pub fn run_jobs_with_metadata(
 }
 
 fn snapshot_profile_for_jobs(jobs: &[JobSpec]) -> SnapshotProfile {
-    if jobs
+    if jobs.iter().any(|job| {
+        matches!(
+            job.staged_linux_rust_lane()
+                .map(StagedLinuxRustLane::target),
+            Some(StagedLinuxRustTarget::PreMergePikaFollowup)
+        )
+    }) {
+        SnapshotProfile::StagedLinuxFollowup
+    } else if jobs
         .iter()
         .any(|job| job.staged_linux_rust_lane().is_some())
     {

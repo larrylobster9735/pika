@@ -1,4 +1,15 @@
-{ pkgs, crane, src, cargoLock, outputHashes, pikaRelayPkg ? null, lane ? "pika-core" }:
+{
+  pkgs,
+  crane,
+  src,
+  cargoLock,
+  outputHashes,
+  pikaRelayPkg ? null,
+  openclawGatewayPkg ? null,
+  androidSdk ? null,
+  androidJdk ? null,
+  lane ? "pika-core",
+}:
 let
   craneLib = (crane.mkLib pkgs).overrideToolchain (
     pkgs.rust-bin.stable.latest.default.override {
@@ -13,6 +24,8 @@ let
       "pika-linux-rust-agent-contracts-workspace"
     else if lane == "pikachat" then
       "pika-linux-rust-pikachat-workspace"
+    else if lane == "pika-followup" then
+      "pika-linux-rust-pika-followup-workspace"
     else if lane == "notifications" then
       "pika-linux-rust-notifications-workspace"
     else if lane == "fixture" then
@@ -37,10 +50,10 @@ let
       pkgs.alsa-lib
       pkgs.openssl
       pkgs.postgresql
-    ] ++ pkgs.lib.optionals (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "fixture") [
+    ] ++ pkgs.lib.optionals (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "pika-followup" || lane == "fixture") [
       pkgs.llvmPackages.libclang
       pkgs.linuxHeaders
-    ] ++ pkgs.lib.optionals (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "fixture") [
+    ] ++ pkgs.lib.optionals (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "pika-followup" || lane == "fixture") [
       pkgs.xorg.libX11
       pkgs.xorg.libXcursor
       pkgs.xorg.libXi
@@ -51,7 +64,7 @@ let
       pkgs.mesa
       pkgs.vulkan-loader
     ];
-  } // pkgs.lib.optionalAttrs (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "fixture") {
+  } // pkgs.lib.optionalAttrs (lane == "pika-core" || lane == "agent-contracts" || lane == "pikachat" || lane == "pika-followup" || lane == "fixture") {
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = builtins.concatStringsSep " " [
       "-I${pkgs.linuxHeaders}/include"
@@ -108,6 +121,9 @@ let
         chmod -R u+w "$out"
         mkdir -p "$out/crates/pikahut/tests"
         cat >"$out/crates/pikahut/tests/integration_deterministic.rs" <<'EOF'
+        fn main() {}
+        EOF
+        cat >"$out/crates/pikahut/tests/integration_openclaw.rs" <<'EOF'
         fn main() {}
         EOF
         mkdir -p "$out/rust/tests"
@@ -396,6 +412,127 @@ let
           printf '%s\n' "ok: pikahut clippy validated during staged workspace build" \
             >"$PIKACI_PIKAHUT_CLIPPY_OK"
         ''
+      else if lane == "pika-followup" then
+        ''
+          export PIKACI_FOLLOWUP_PIKA_ANDROID_TEST_COMPILE_OK="$TMPDIR/pika-followup-pika-android-test-compile.ok"
+          export PIKACI_FOLLOWUP_PIKACHAT_BUILD_OK="$TMPDIR/pika-followup-pikachat-build.ok"
+          export PIKACI_FOLLOWUP_PIKA_DESKTOP_CHECK_OK="$TMPDIR/pika-followup-pika-desktop-check.ok"
+          export PIKACI_FOLLOWUP_ACTIONLINT_OK="$TMPDIR/pika-followup-actionlint.ok"
+          export PIKACI_FOLLOWUP_DOC_CONTRACTS_OK="$TMPDIR/pika-followup-doc-contracts.ok"
+          cargoJobs="''${CARGO_BUILD_JOBS:-''${NIX_BUILD_CORES:-}}"
+          case "$cargoJobs" in
+            ""|0)
+              cargoJobs="$(${pkgs.coreutils}/bin/nproc)"
+              ;;
+          esac
+          echo "[pikaci] building pika follow-up lane with cargo jobs=$cargoJobs" >&2
+
+          cargo build --locked -j "$cargoJobs" -p pikachat >/dev/null
+          printf '%s\n' "ok: pikachat build validated during staged workspace build" \
+            >"$PIKACI_FOLLOWUP_PIKACHAT_BUILD_OK"
+
+          cargo check --locked -j "$cargoJobs" -p pika-desktop >/dev/null
+          printf '%s\n' "ok: pika-desktop check validated during staged workspace build" \
+            >"$PIKACI_FOLLOWUP_PIKA_DESKTOP_CHECK_OK"
+
+          if [ "''${PIKACI_FOLLOWUP_VALIDATE_NON_CARGO:-0}" = "1" ]; then
+            echo "[pikaci] validating pika follow-up actionlint" >&2
+            if ${pkgs.actionlint}/bin/actionlint \
+              -config-file .github/actionlint.yaml \
+              .github/workflows/pre-merge.yml; then
+              :
+            else
+              status=$?
+              echo "[pikaci] pika follow-up actionlint failed with status $status" >&2
+              exit "$status"
+            fi
+            printf '%s\n' "ok: actionlint validated during staged workspace build" \
+              >"$PIKACI_FOLLOWUP_ACTIONLINT_OK"
+
+            echo "[pikaci] validating pika follow-up docs contract" >&2
+            if ${pkgs.python3}/bin/python3 ${../../scripts/agent-tools} check-docs; then
+              :
+            else
+              status=$?
+              echo "[pikaci] pika follow-up docs contract failed with status $status" >&2
+              exit "$status"
+            fi
+            echo "[pikaci] validating pika follow-up justfile contract" >&2
+            if ${pkgs.python3}/bin/python3 ${../../scripts/agent-tools} check-justfile; then
+              :
+            else
+              status=$?
+              echo "[pikaci] pika follow-up justfile contract failed with status $status" >&2
+              exit "$status"
+            fi
+            printf '%s\n' "ok: docs and justfile contracts validated during staged workspace build" \
+              >"$PIKACI_FOLLOWUP_DOC_CONTRACTS_OK"
+          fi
+
+          if [ "''${PIKACI_FOLLOWUP_STAGE_OUTPUTS:-0}" = "1" ]; then
+            if [ -z '${if androidSdk != null then "${androidSdk}/share/android-sdk" else ""}' ]; then
+              echo "[pikaci] missing androidSdk for staged pika follow-up Android compile" >&2
+              exit 1
+            fi
+            if [ -z '${if androidJdk != null then "${androidJdk}" else ""}' ]; then
+              echo "[pikaci] missing androidJdk for staged pika follow-up Android compile" >&2
+              exit 1
+            fi
+            (
+              cd android
+              export ANDROID_HOME='${if androidSdk != null then "${androidSdk}/share/android-sdk" else ""}'
+              export ANDROID_SDK_ROOT="$ANDROID_HOME"
+              export JAVA_HOME='${if androidJdk != null then "${androidJdk}" else ""}'
+              export PATH="$JAVA_HOME/bin:$PATH"
+              export GRADLE_USER_HOME="$TMPDIR/pikaci-gradle-home"
+              mkdir -p "$GRADLE_USER_HOME"
+              printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+              ${pkgs.gradle}/bin/gradle --no-daemon :app:compileDebugAndroidTestKotlin >/dev/null
+            )
+            printf '%s\n' "ok: pika Android instrumentation test compile validated during staged workspace build" \
+              >"$PIKACI_FOLLOWUP_PIKA_ANDROID_TEST_COMPILE_OK"
+
+            mkdir -p "$out/bin" "$out/share/pikaci"
+            cp "$PIKACI_FOLLOWUP_PIKA_ANDROID_TEST_COMPILE_OK" \
+              "$out/share/pikaci/pika-followup-pika-android-test-compile.ok"
+            cp "$PIKACI_FOLLOWUP_PIKACHAT_BUILD_OK" \
+              "$out/share/pikaci/pika-followup-pikachat-build.ok"
+            cp "$PIKACI_FOLLOWUP_PIKA_DESKTOP_CHECK_OK" \
+              "$out/share/pikaci/pika-followup-pika-desktop-check.ok"
+            cp "$PIKACI_FOLLOWUP_ACTIONLINT_OK" \
+              "$out/share/pikaci/pika-followup-actionlint.ok"
+            cp "$PIKACI_FOLLOWUP_DOC_CONTRACTS_OK" \
+              "$out/share/pikaci/pika-followup-doc-contracts.ok"
+
+            write_wrapper() {
+              local path="$1"
+              shift
+              printf '%s\n' "$@" >"$path"
+              chmod +x "$path"
+            }
+
+            write_wrapper "$out/bin/run-pika-android-test-compile" \
+              "#!${pkgs.bash}/bin/bash" \
+              "set -euo pipefail" \
+              "cat \"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)/share/pikaci/pika-followup-pika-android-test-compile.ok\""
+            write_wrapper "$out/bin/run-pika-followup-pikachat-build" \
+              "#!${pkgs.bash}/bin/bash" \
+              "set -euo pipefail" \
+              "cat \"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)/share/pikaci/pika-followup-pikachat-build.ok\""
+            write_wrapper "$out/bin/run-pika-desktop-check" \
+              "#!${pkgs.bash}/bin/bash" \
+              "set -euo pipefail" \
+              "cat \"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)/share/pikaci/pika-followup-pika-desktop-check.ok\""
+            write_wrapper "$out/bin/run-pika-actionlint" \
+              "#!${pkgs.bash}/bin/bash" \
+              "set -euo pipefail" \
+              "cat \"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)/share/pikaci/pika-followup-actionlint.ok\""
+            write_wrapper "$out/bin/run-pika-doc-contracts" \
+              "#!${pkgs.bash}/bin/bash" \
+              "set -euo pipefail" \
+              "cat \"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)/share/pikaci/pika-followup-doc-contracts.ok\""
+          fi
+        ''
       else if lane == "rmp" then
         ''
           export PIKACI_RMP_EXECUTABLE="$TMPDIR/rmp-executable"
@@ -433,6 +570,7 @@ let
           export PIKACI_PIKACHAT_SIDECAR_PACKAGE_TESTS_MANIFEST="$TMPDIR/pikachat-sidecar-package-tests.manifest"
           export PIKACI_PIKA_DESKTOP_PACKAGE_TESTS_MANIFEST="$TMPDIR/pika-desktop-package-tests.manifest"
           export PIKACI_PIKAHUT_INTEGRATION_DETERMINISTIC_MANIFEST="$TMPDIR/pikahut-integration-deterministic.manifest"
+          export PIKACI_PIKAHUT_INTEGRATION_OPENCLAW_MANIFEST="$TMPDIR/pikahut-integration-openclaw.manifest"
           export PIKACI_PIKA_CORE_E2E_MESSAGING_BIN="$TMPDIR/pika-core-e2e-messaging-bin"
           export PIKACI_PIKA_CORE_APP_FLOWS_BIN="$TMPDIR/pika-core-app-flows-bin"
           cargoJobs="''${CARGO_BUILD_JOBS:-''${NIX_BUILD_CORES:-}}"
@@ -536,6 +674,16 @@ let
             "$cargoBuildLog" \
             "$PIKACI_PIKAHUT_INTEGRATION_DETERMINISTIC_MANIFEST" \
             "integration_deterministic"
+
+          cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
+          cargo test --locked -j "$cargoJobs" -p pikahut \
+            --test integration_openclaw \
+            --no-run \
+            --message-format json-render-diagnostics >"$cargoBuildLog"
+          capture_named_test_manifest \
+            "$cargoBuildLog" \
+            "$PIKACI_PIKAHUT_INTEGRATION_OPENCLAW_MANIFEST" \
+            "integration_openclaw"
 
           cargoBuildLog=$(mktemp cargoBuildLogXXXX.json)
           cargo test --locked -j "$cargoJobs" -p pika_core \
@@ -985,6 +1133,33 @@ let
           EOF
           chmod +x "$out/bin/run-fixture-relay-smoke"
         ''
+      else if lane == "pika-followup" then
+        ''
+          if [ ! -d "$out/bin" ]; then
+            echo "missing staged pika follow-up wrapper directory at $out/bin" >&2
+            exit 1
+          fi
+          if [ ! -s "$out/share/pikaci/pika-followup-pika-android-test-compile.ok" ]; then
+            echo "missing staged pika follow-up Android test compile marker in output" >&2
+            exit 1
+          fi
+          if [ ! -s "$out/share/pikaci/pika-followup-pikachat-build.ok" ]; then
+            echo "missing staged pika follow-up pikachat build marker in output" >&2
+            exit 1
+          fi
+          if [ ! -s "$out/share/pikaci/pika-followup-pika-desktop-check.ok" ]; then
+            echo "missing staged pika follow-up desktop-check marker in output" >&2
+            exit 1
+          fi
+          if [ ! -s "$out/share/pikaci/pika-followup-actionlint.ok" ]; then
+            echo "missing staged pika follow-up actionlint marker in output" >&2
+            exit 1
+          fi
+          if [ ! -s "$out/share/pikaci/pika-followup-doc-contracts.ok" ]; then
+            echo "missing staged pika follow-up doc-contract marker in output" >&2
+            exit 1
+          fi
+        ''
       else if lane == "rmp" then
         ''
           target_root="''${CARGO_TARGET_DIR:-target}"
@@ -1079,6 +1254,8 @@ CFG
             "$out/share/pikaci/pika-desktop-package-tests.manifest"
           cp "$PIKACI_PIKAHUT_INTEGRATION_DETERMINISTIC_MANIFEST" \
             "$out/share/pikaci/pikahut-integration-deterministic.manifest"
+          cp "$PIKACI_PIKAHUT_INTEGRATION_OPENCLAW_MANIFEST" \
+            "$out/share/pikaci/pikahut-integration-openclaw.manifest"
           target_root_abs="$(pwd)/$target_root/"
 
           copy_target_relative() {
@@ -1120,7 +1297,11 @@ CFG
             "$PIKACI_PIKACHAT_SIDECAR_PACKAGE_TESTS_MANIFEST" \
             "$PIKACI_PIKA_DESKTOP_PACKAGE_TESTS_MANIFEST" \
             "$PIKACI_PIKAHUT_INTEGRATION_DETERMINISTIC_MANIFEST" \
+            "$PIKACI_PIKAHUT_INTEGRATION_OPENCLAW_MANIFEST" \
             | sort -u >"$staged_runtime_manifest"
+
+          cp -R "$src/pikachat-openclaw/openclaw/extensions/pikachat-openclaw" \
+            "$out/share/pikaci/pikachat-openclaw-extension"
 
           while IFS= read -r relative; do
             [ -n "$relative" ] || continue
@@ -1140,6 +1321,11 @@ CFG
           install_staged_binary "$PIKACI_PIKACHAT_BIN" "pikachat"
           install_staged_binary "$PIKACI_PIKA_CORE_E2E_MESSAGING_BIN" "pika-core-e2e-messaging"
           install_staged_binary "$PIKACI_PIKA_CORE_APP_FLOWS_BIN" "pika-core-app-flows"
+          ${pkgs.lib.optionalString (openclawGatewayPkg != null) ''
+          mkdir -p "$out/lib"
+          cp -R ${openclawGatewayPkg}/lib/openclaw "$out/lib/openclaw"
+          ln -s ${openclawGatewayPkg}/bin/openclaw "$out/bin/openclaw"
+          ''}
           ${pkgs.lib.optionalString (pikaRelayPkg != null) ''
           ln -s ${pikaRelayPkg}/bin/pika-relay "$out/bin/pika-relay"
           ''}
@@ -1246,6 +1432,66 @@ CFG
           set -euo pipefail
           exec "$(dirname "$0")/run-pikahut-integration-deterministic" openclaw_scenario_audio_echo
           EOF
+          cat >"$out/bin/run-openclaw-gateway-e2e" <<'EOF'
+          #!${pkgs.bash}/bin/bash
+          set -euo pipefail
+
+          root="$(cd "$(dirname "''${BASH_SOURCE[0]}")/.." && pwd)"
+          if [ -f /workspace/snapshot/Cargo.toml ]; then
+            export PIKAHUT_TEST_WORKSPACE_ROOT=/workspace/snapshot
+            cd "$PIKAHUT_TEST_WORKSPACE_ROOT"
+          fi
+          openclaw_stage_dir="$(mktemp -d /tmp/pikaci-openclaw-package.XXXXXX)"
+          cleanup() {
+            rm -rf "$openclaw_stage_dir"
+          }
+          trap cleanup EXIT
+          mkdir -p \
+            "$openclaw_stage_dir/bin" \
+            "$openclaw_stage_dir/lib/openclaw/extensions" \
+            "$openclaw_stage_dir/lib/openclaw/node_modules"
+          for entry in "$root/lib/openclaw"/*; do
+            name="$(basename "$entry")"
+            if [ "$name" = "extensions" ] || [ "$name" = "node_modules" ] || [ "$name" = "package.json" ]; then
+              continue
+            fi
+            ln -s "$entry" "$openclaw_stage_dir/lib/openclaw/$name"
+          done
+          cp "$root/lib/openclaw/package.json" "$openclaw_stage_dir/lib/openclaw/package.json"
+          for entry in "$root/lib/openclaw/node_modules"/.* "$root/lib/openclaw/node_modules"/*; do
+            name="$(basename "$entry")"
+            if [ "$name" = "." ] || [ "$name" = ".." ]; then
+              continue
+            fi
+            ln -s "$entry" "$openclaw_stage_dir/lib/openclaw/node_modules/$name"
+          done
+          ln -s .. "$openclaw_stage_dir/lib/openclaw/node_modules/openclaw"
+          if [ -d "$root/lib/openclaw/extensions" ]; then
+            for entry in "$root/lib/openclaw/extensions"/*; do
+              name="$(basename "$entry")"
+              if [ "$name" = "pikachat-openclaw" ]; then
+                continue
+              fi
+              ln -s "$entry" "$openclaw_stage_dir/lib/openclaw/extensions/$name"
+            done
+          fi
+          cp -R "$root/share/pikaci/pikachat-openclaw-extension" \
+            "$openclaw_stage_dir/lib/openclaw/extensions/pikachat-openclaw"
+          export PIKAHUT_TEST_PIKACHAT_BIN="$root/bin/pikachat"
+          ln -s "$root/bin/openclaw" "$openclaw_stage_dir/bin/openclaw"
+          export PIKAHUT_OPENCLAW_E2E_GATEWAY_BIN="$openclaw_stage_dir/bin/openclaw"
+          export PIKAHUT_OPENCLAW_EXTENSION_SOURCE_ROOT="$openclaw_stage_dir/lib/openclaw/extensions/pikachat-openclaw"
+          if [ -x "$root/bin/pika-relay" ]; then
+            export PIKA_FIXTURE_RELAY_CMD="$root/bin/pika-relay"
+          fi
+
+          exec "$(dirname "$0")/run-staged-test-manifest" \
+            pikahut-integration-openclaw.manifest \
+            openclaw_gateway_e2e \
+            --exact \
+            --ignored \
+            --nocapture
+          EOF
           chmod +x \
             "$out/bin/run-staged-test-manifest" \
             "$out/bin/run-pikahut-integration-deterministic" \
@@ -1258,7 +1504,8 @@ CFG
             "$out/bin/run-openclaw-invite-and-chat" \
             "$out/bin/run-openclaw-invite-and-chat-rust-bot" \
             "$out/bin/run-openclaw-invite-and-chat-daemon" \
-            "$out/bin/run-openclaw-audio-echo"
+            "$out/bin/run-openclaw-audio-echo" \
+            "$out/bin/run-openclaw-gateway-e2e"
         ''
       else
         ''
@@ -1428,6 +1675,8 @@ rec {
     buildPhaseCargoCommand = laneCompileCommand;
     PIKACI_STAGE_PIKACHAT_BINARY = "1";
     PIKACI_REQUIRE_INTEGRATION_TEST_EXECUTABLES = "1";
+    PIKACI_FOLLOWUP_VALIDATE_NON_CARGO = if lane == "pika-followup" then "1" else "0";
+    PIKACI_FOLLOWUP_STAGE_OUTPUTS = if lane == "pika-followup" then "1" else "0";
     doInstallCargoArtifacts = false;
     inherit installPhaseCommand;
   });

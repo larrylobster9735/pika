@@ -129,11 +129,13 @@ impl JobSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StagedLinuxRustTarget {
     PreMergePikaRust,
+    PreMergePikaFollowup,
     PreMergeAgentContracts,
     PreMergeNotifications,
     PreMergeFixtureRust,
     PreMergeRmp,
     PreMergePikachatRust,
+    PreMergePikachatOpenclawE2e,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +154,11 @@ pub struct StagedLinuxRustTargetConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StagedLinuxRustLane {
+    PikaFollowupAndroidTestCompile,
+    PikaFollowupPikachatBuild,
+    PikaFollowupDesktopCheck,
+    PikaFollowupActionlint,
+    PikaFollowupDocContracts,
     PikaCoreLibAppFlows,
     PikaCoreMessagingE2e,
     AgentContractsControlPlaneUnit,
@@ -173,11 +180,17 @@ pub enum StagedLinuxRustLane {
     OpenclawInviteAndChatRustBot,
     OpenclawInviteAndChatDaemon,
     OpenclawAudioEcho,
+    OpenclawGatewayE2e,
 }
 
 impl StagedLinuxRustLane {
     pub fn target(self) -> StagedLinuxRustTarget {
         match self {
+            Self::PikaFollowupAndroidTestCompile
+            | Self::PikaFollowupPikachatBuild
+            | Self::PikaFollowupDesktopCheck
+            | Self::PikaFollowupActionlint
+            | Self::PikaFollowupDocContracts => StagedLinuxRustTarget::PreMergePikaFollowup,
             Self::PikaCoreLibAppFlows | Self::PikaCoreMessagingE2e => {
                 StagedLinuxRustTarget::PreMergePikaRust
             }
@@ -203,6 +216,7 @@ impl StagedLinuxRustLane {
             | Self::OpenclawInviteAndChatRustBot
             | Self::OpenclawInviteAndChatDaemon
             | Self::OpenclawAudioEcho => StagedLinuxRustTarget::PreMergePikachatRust,
+            Self::OpenclawGatewayE2e => StagedLinuxRustTarget::PreMergePikachatOpenclawE2e,
         }
     }
 
@@ -228,6 +242,21 @@ impl StagedLinuxRustLane {
 
     pub fn execute_wrapper_command(self) -> &'static str {
         match self {
+            Self::PikaFollowupAndroidTestCompile => {
+                "/staged/linux-rust/workspace-build/bin/run-pika-android-test-compile"
+            }
+            Self::PikaFollowupPikachatBuild => {
+                "/staged/linux-rust/workspace-build/bin/run-pika-followup-pikachat-build"
+            }
+            Self::PikaFollowupDesktopCheck => {
+                "/staged/linux-rust/workspace-build/bin/run-pika-desktop-check"
+            }
+            Self::PikaFollowupActionlint => {
+                "/staged/linux-rust/workspace-build/bin/run-pika-actionlint"
+            }
+            Self::PikaFollowupDocContracts => {
+                "/staged/linux-rust/workspace-build/bin/run-pika-doc-contracts"
+            }
             Self::PikaCoreLibAppFlows => {
                 "/staged/linux-rust/workspace-build/bin/run-pika-core-lib-app-flows-tests"
             }
@@ -289,6 +318,9 @@ impl StagedLinuxRustLane {
             Self::OpenclawAudioEcho => {
                 "/staged/linux-rust/workspace-build/bin/run-openclaw-audio-echo"
             }
+            Self::OpenclawGatewayE2e => {
+                "/staged/linux-rust/workspace-build/bin/run-openclaw-gateway-e2e"
+            }
         }
     }
 }
@@ -297,11 +329,13 @@ impl StagedLinuxRustTarget {
     pub fn from_target_id(target_id: &str) -> Option<Self> {
         match target_id {
             "pre-merge-pika-rust" => Some(Self::PreMergePikaRust),
+            "pre-merge-pika-followup" => Some(Self::PreMergePikaFollowup),
             "pre-merge-agent-contracts" => Some(Self::PreMergeAgentContracts),
             "pre-merge-notifications" => Some(Self::PreMergeNotifications),
             "pre-merge-fixture-rust" => Some(Self::PreMergeFixtureRust),
             "pre-merge-rmp" => Some(Self::PreMergeRmp),
             "pre-merge-pikachat-rust" => Some(Self::PreMergePikachatRust),
+            "pre-merge-pikachat-openclaw-e2e" => Some(Self::PreMergePikachatOpenclawE2e),
             _ => None,
         }
     }
@@ -319,6 +353,18 @@ impl StagedLinuxRustTarget {
                 workspace_deps_installable: ".#ci.x86_64-linux.workspaceDeps",
                 workspace_build_installable: ".#ci.x86_64-linux.workspaceBuild",
                 shadow_recipe: "pre-merge-pika-rust-shadow",
+            },
+            Self::PreMergePikaFollowup => StagedLinuxRustTargetConfig {
+                target_id: "pre-merge-pika-followup",
+                target_description: "Run the VM-backed non-Rust follow-up checks from the pre-merge pika lane",
+                shared_prepare_node_prefix: "pika-followup-linux-rust",
+                shared_prepare_description: "pika follow-up staged Linux lane",
+                workspace_deps_output_name: "ci.x86_64-linux.pikaFollowupWorkspaceDeps",
+                workspace_build_output_name: "ci.x86_64-linux.pikaFollowupWorkspaceBuild",
+                workspace_output_system: "x86_64-linux",
+                workspace_deps_installable: ".#ci.x86_64-linux.pikaFollowupWorkspaceDeps",
+                workspace_build_installable: ".#ci.x86_64-linux.pikaFollowupWorkspaceBuild",
+                shadow_recipe: "",
             },
             Self::PreMergeAgentContracts => StagedLinuxRustTargetConfig {
                 target_id: "pre-merge-agent-contracts",
@@ -379,6 +425,18 @@ impl StagedLinuxRustTarget {
                 workspace_deps_installable: ".#ci.x86_64-linux.pikachatWorkspaceDeps",
                 workspace_build_installable: ".#ci.x86_64-linux.pikachatWorkspaceBuild",
                 shadow_recipe: "pre-merge-pikachat-rust-shadow",
+            },
+            Self::PreMergePikachatOpenclawE2e => StagedLinuxRustTargetConfig {
+                target_id: "pre-merge-pikachat-openclaw-e2e",
+                target_description: "Run the VM-backed heavy OpenClaw gateway end-to-end scenario",
+                shared_prepare_node_prefix: "pikachat-openclaw-linux-rust",
+                shared_prepare_description: "pikachat OpenClaw staged Linux lane",
+                workspace_deps_output_name: "ci.x86_64-linux.pikachatWorkspaceDeps",
+                workspace_build_output_name: "ci.x86_64-linux.pikachatWorkspaceBuild",
+                workspace_output_system: "x86_64-linux",
+                workspace_deps_installable: ".#ci.x86_64-linux.pikachatWorkspaceDeps",
+                workspace_build_installable: ".#ci.x86_64-linux.pikachatWorkspaceBuild",
+                shadow_recipe: "",
             },
         }
     }
@@ -511,6 +569,24 @@ mod tests {
     }
 
     #[test]
+    fn pika_followup_lane_uses_followup_workspace_outputs() {
+        let lane = StagedLinuxRustLane::PikaFollowupActionlint;
+
+        assert_eq!(
+            lane.workspace_deps_output_name(),
+            "ci.x86_64-linux.pikaFollowupWorkspaceDeps"
+        );
+        assert_eq!(
+            lane.workspace_build_output_name(),
+            "ci.x86_64-linux.pikaFollowupWorkspaceBuild"
+        );
+        assert_eq!(
+            lane.execute_wrapper_command(),
+            "/staged/linux-rust/workspace-build/bin/run-pika-actionlint"
+        );
+    }
+
+    #[test]
     fn notifications_lane_uses_notifications_workspace_outputs() {
         let lane = StagedLinuxRustLane::NotificationsServerPackageTests;
 
@@ -596,6 +672,25 @@ mod tests {
             StagedLinuxRustTarget::PreMergeNotifications
         );
 
+        let followup = StagedLinuxRustTarget::from_target_id("pre-merge-pika-followup")
+            .expect("followup target");
+        let followup_config = followup.config();
+
+        assert_eq!(followup_config.target_id, "pre-merge-pika-followup");
+        assert_eq!(
+            followup_config.workspace_deps_installable,
+            ".#ci.x86_64-linux.pikaFollowupWorkspaceDeps"
+        );
+        assert_eq!(
+            followup_config.workspace_build_installable,
+            ".#ci.x86_64-linux.pikaFollowupWorkspaceBuild"
+        );
+        assert_eq!(followup_config.shadow_recipe, "");
+        assert_eq!(
+            StagedLinuxRustLane::PikaFollowupDocContracts.target(),
+            StagedLinuxRustTarget::PreMergePikaFollowup
+        );
+
         let fixture = StagedLinuxRustTarget::from_target_id("pre-merge-fixture-rust")
             .expect("fixture target");
         let fixture_config = fixture.config();
@@ -638,6 +733,25 @@ mod tests {
             StagedLinuxRustLane::PikachatCliSmokeLocal.target(),
             StagedLinuxRustTarget::PreMergePikachatRust
         );
+
+        let pikachat_openclaw =
+            StagedLinuxRustTarget::from_target_id("pre-merge-pikachat-openclaw-e2e")
+                .expect("pikachat openclaw target");
+        let pikachat_openclaw_config = pikachat_openclaw.config();
+
+        assert_eq!(
+            pikachat_openclaw_config.workspace_deps_installable,
+            ".#ci.x86_64-linux.pikachatWorkspaceDeps"
+        );
+        assert_eq!(
+            pikachat_openclaw_config.workspace_build_installable,
+            ".#ci.x86_64-linux.pikachatWorkspaceBuild"
+        );
+        assert_eq!(pikachat_openclaw_config.shadow_recipe, "");
+        assert_eq!(
+            StagedLinuxRustLane::OpenclawGatewayE2e.target(),
+            StagedLinuxRustTarget::PreMergePikachatOpenclawE2e
+        );
     }
 
     #[test]
@@ -669,11 +783,13 @@ mod tests {
 
         for target in [
             StagedLinuxRustTarget::PreMergePikaRust,
+            StagedLinuxRustTarget::PreMergePikaFollowup,
             StagedLinuxRustTarget::PreMergeAgentContracts,
             StagedLinuxRustTarget::PreMergeNotifications,
             StagedLinuxRustTarget::PreMergeFixtureRust,
             StagedLinuxRustTarget::PreMergeRmp,
             StagedLinuxRustTarget::PreMergePikachatRust,
+            StagedLinuxRustTarget::PreMergePikachatOpenclawE2e,
         ] {
             let config = target.config();
             assert!(
