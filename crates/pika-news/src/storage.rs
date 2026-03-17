@@ -1880,6 +1880,11 @@ fn migrations() -> Vec<Migration> {
             name: "0011_ci_lanes_and_nightlies",
             sql: include_str!("../migrations/0011_ci_lanes_and_nightlies.sql"),
         },
+        Migration {
+            version: 12,
+            name: "0012_ci_lane_leases",
+            sql: include_str!("../migrations/0012_ci_lane_leases.sql"),
+        },
     ]
 }
 

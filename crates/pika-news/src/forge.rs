@@ -3,6 +3,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use tempfile::TempDir;
@@ -245,30 +247,74 @@ pub fn close_branch(
     })
 }
 
-pub fn run_ci_command_for_head(
+pub fn run_ci_command_for_head_with_heartbeat<F>(
     repo: &ForgeRepoConfig,
     head_sha: &str,
     command: &[String],
-) -> anyhow::Result<CiExecutionResult> {
+    heartbeat_interval: Duration,
+    mut heartbeat: F,
+) -> anyhow::Result<CiExecutionResult>
+where
+    F: FnMut() -> anyhow::Result<()>,
+{
     if command.is_empty() {
         bail!("ci command is empty");
     }
     let worktree = temp_worktree(repo, head_sha)?;
     let ci_result = (|| {
+        let stdout_path = worktree.path().join(".pika-ci.stdout.log");
+        let stderr_path = worktree.path().join(".pika-ci.stderr.log");
+        let stdout = fs::File::create(&stdout_path)
+            .with_context(|| format!("create ci stdout log {}", stdout_path.display()))?;
+        let stderr = fs::File::create(&stderr_path)
+            .with_context(|| format!("create ci stderr log {}", stderr_path.display()))?;
         let mut cmd = Command::new(&command[0]);
-        cmd.args(&command[1..]).current_dir(worktree.path());
-        let output = cmd
-            .output()
+        cmd.args(&command[1..])
+            .current_dir(worktree.path())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("run ci command in {}", worktree.path().display()))?;
-        let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
-        if !output.stderr.is_empty() {
+        heartbeat()?;
+        let poll_interval = Duration::from_millis(250);
+        let mut next_heartbeat = Instant::now() + heartbeat_interval;
+        let status = loop {
+            let polled = child
+                .try_wait()
+                .with_context(|| format!("poll ci command in {}", worktree.path().display()));
+            match polled {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            }
+            if Instant::now() >= next_heartbeat {
+                if let Err(err) = heartbeat() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
+                next_heartbeat = Instant::now() + heartbeat_interval;
+            }
+            thread::sleep(poll_interval);
+        };
+        let stdout_bytes = fs::read(&stdout_path)
+            .with_context(|| format!("read ci stdout log {}", stdout_path.display()))?;
+        let stderr_bytes = fs::read(&stderr_path)
+            .with_context(|| format!("read ci stderr log {}", stderr_path.display()))?;
+        let mut log = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        if !stderr_bytes.is_empty() {
             if !log.is_empty() && !log.ends_with('\n') {
                 log.push('\n');
             }
-            log.push_str(&String::from_utf8_lossy(&output.stderr));
+            log.push_str(&String::from_utf8_lossy(&stderr_bytes));
         }
         Ok(CiExecutionResult {
-            success: output.status.success(),
+            success: status.success(),
             log,
         })
     })();
@@ -535,10 +581,11 @@ fn some_if_non_empty(input: &str) -> Option<String> {
 mod tests {
     use std::path::Path;
     use std::process::Command;
+    use std::time::Duration;
 
     use super::{
         close_branch, create_merge_commit, current_branch_head, install_hooks, merge_branch,
-        publish_merge_refs, run_ci_command_for_head, write_merge_tree,
+        publish_merge_refs, run_ci_command_for_head_with_heartbeat, write_merge_tree,
     };
     use crate::config::ForgeRepoConfig;
 
@@ -778,10 +825,12 @@ mod tests {
             .expect("resolve master head")
             .expect("master head");
 
-        let err = run_ci_command_for_head(
+        let err = run_ci_command_for_head_with_heartbeat(
             &forge_repo,
             &head_sha,
             &["/definitely/missing/pika-ci-command".to_string()],
+            Duration::from_secs(1),
+            || Ok(()),
         )
         .expect_err("ci command spawn should fail");
 

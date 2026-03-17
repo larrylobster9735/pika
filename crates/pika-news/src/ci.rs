@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, NaiveTime, Utc};
+use std::time::Duration;
 
 use crate::branch_store::{PendingBranchCiLaneJob, PendingNightlyLaneJob};
 use crate::ci_manifest::{self, ForgeCiManifest};
@@ -8,7 +9,8 @@ use crate::forge;
 use crate::storage::Store;
 
 pub const FORGE_LANE_MANIFEST_PATH: &str = "ci/forge-lanes.toml";
-pub const STALE_CI_RECOVERY_AFTER_SECS: u64 = 15 * 60;
+pub const CI_LANE_LEASE_SECS: u64 = 120;
+pub const CI_LANE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Default)]
 pub struct CiPassResult {
@@ -23,27 +25,68 @@ pub fn load_manifest_from_default_branch(
     forge_repo: &crate::config::ForgeRepoConfig,
 ) -> anyhow::Result<ForgeCiManifest> {
     let default_ref = format!("refs/heads/{}", forge_repo.default_branch);
-    let raw = forge::read_file_at_ref(forge_repo, &default_ref, FORGE_LANE_MANIFEST_PATH)?;
+    load_manifest_at_ref(forge_repo, &default_ref)
+}
+
+pub fn load_manifest_for_head(
+    forge_repo: &crate::config::ForgeRepoConfig,
+    head_sha: &str,
+) -> anyhow::Result<ForgeCiManifest> {
+    load_manifest_at_ref(forge_repo, head_sha)
+}
+
+fn load_manifest_at_ref(
+    forge_repo: &crate::config::ForgeRepoConfig,
+    git_ref: &str,
+) -> anyhow::Result<ForgeCiManifest> {
+    let raw = forge::read_file_at_ref(forge_repo, git_ref, FORGE_LANE_MANIFEST_PATH)?;
     ci_manifest::parse_manifest(&raw)
 }
 
 pub fn run_ci_pass(store: &Store, config: &Config) -> anyhow::Result<CiPassResult> {
+    run_ci_pass_with_timing(
+        store,
+        config,
+        Duration::from_secs(CI_LANE_HEARTBEAT_INTERVAL_SECS),
+        CI_LANE_LEASE_SECS,
+    )
+}
+
+fn run_ci_pass_with_timing(
+    store: &Store,
+    config: &Config,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
+) -> anyhow::Result<CiPassResult> {
     let Some(forge_repo) = config.effective_forge_repo() else {
         return Ok(CiPassResult::default());
     };
 
-    let manifest = load_manifest_from_default_branch(&forge_repo)?;
     let mut result = CiPassResult {
         retries_recovered: store
-            .recover_stale_ci_lanes(STALE_CI_RECOVERY_AFTER_SECS)
+            .recover_stale_ci_lanes()
             .context("recover stale ci lanes")?,
-        nightlies_scheduled: schedule_due_nightlies(store, &forge_repo, &manifest)
-            .context("schedule due nightlies")?,
         ..CiPassResult::default()
     };
 
-    drain_branch_jobs(store, &forge_repo, &mut result)?;
-    drain_nightly_jobs(store, &forge_repo, &mut result)?;
+    drain_branch_jobs(
+        store,
+        &forge_repo,
+        heartbeat_interval,
+        lease_secs,
+        &mut result,
+    )?;
+    drain_nightly_jobs(
+        store,
+        &forge_repo,
+        heartbeat_interval,
+        lease_secs,
+        &mut result,
+    )?;
+
+    let manifest = load_manifest_from_default_branch(&forge_repo)?;
+    result.nightlies_scheduled =
+        schedule_due_nightlies(store, &forge_repo, &manifest).context("schedule due nightlies")?;
 
     Ok(result)
 }
@@ -51,18 +94,27 @@ pub fn run_ci_pass(store: &Store, config: &Config) -> anyhow::Result<CiPassResul
 fn drain_branch_jobs(
     store: &Store,
     forge_repo: &crate::config::ForgeRepoConfig,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
     result: &mut CiPassResult,
 ) -> anyhow::Result<()> {
     loop {
         let branch_jobs = store
-            .claim_pending_branch_ci_lane_runs(1)
+            .claim_pending_branch_ci_lane_runs(1, lease_secs)
             .context("claim pending branch ci lanes")?;
         if branch_jobs.is_empty() {
             break;
         }
         for job in branch_jobs {
             result.claimed += 1;
-            execute_branch_job(store, forge_repo, job, result)?;
+            execute_branch_job(
+                store,
+                forge_repo,
+                job,
+                heartbeat_interval,
+                lease_secs,
+                result,
+            )?;
         }
     }
     Ok(())
@@ -71,18 +123,27 @@ fn drain_branch_jobs(
 fn drain_nightly_jobs(
     store: &Store,
     forge_repo: &crate::config::ForgeRepoConfig,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
     result: &mut CiPassResult,
 ) -> anyhow::Result<()> {
     loop {
         let nightly_jobs = store
-            .claim_pending_nightly_lane_runs(1)
+            .claim_pending_nightly_lane_runs(1, lease_secs)
             .context("claim pending nightly lanes")?;
         if nightly_jobs.is_empty() {
             break;
         }
         for job in nightly_jobs {
             result.claimed += 1;
-            execute_nightly_job(store, forge_repo, job, result)?;
+            execute_nightly_job(
+                store,
+                forge_repo,
+                job,
+                heartbeat_interval,
+                lease_secs,
+                result,
+            )?;
         }
     }
     Ok(())
@@ -92,15 +153,23 @@ fn execute_branch_job(
     store: &Store,
     forge_repo: &crate::config::ForgeRepoConfig,
     job: PendingBranchCiLaneJob,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
     result: &mut CiPassResult,
 ) -> anyhow::Result<()> {
-    let exec = forge::run_ci_command_for_head(forge_repo, &job.source_head_sha, &job.command)
-        .with_context(|| {
-            format!(
-                "run branch lane {} for branch {}",
-                job.lane_id, job.branch_id
-            )
-        });
+    let exec = forge::run_ci_command_for_head_with_heartbeat(
+        forge_repo,
+        &job.source_head_sha,
+        &job.command,
+        heartbeat_interval,
+        || store.heartbeat_branch_ci_lane_run(job.lane_run_id, lease_secs),
+    )
+    .with_context(|| {
+        format!(
+            "run branch lane {} for branch {}",
+            job.lane_id, job.branch_id
+        )
+    });
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
@@ -128,15 +197,23 @@ fn execute_nightly_job(
     store: &Store,
     forge_repo: &crate::config::ForgeRepoConfig,
     job: PendingNightlyLaneJob,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
     result: &mut CiPassResult,
 ) -> anyhow::Result<()> {
-    let exec = forge::run_ci_command_for_head(forge_repo, &job.source_head_sha, &job.command)
-        .with_context(|| {
-            format!(
-                "run nightly lane {} for nightly {}",
-                job.lane_id, job.nightly_run_id
-            )
-        });
+    let exec = forge::run_ci_command_for_head_with_heartbeat(
+        forge_repo,
+        &job.source_head_sha,
+        &job.command,
+        heartbeat_interval,
+        || store.heartbeat_nightly_lane_run(job.lane_run_id, lease_secs),
+    )
+    .with_context(|| {
+        format!(
+            "run nightly lane {} for nightly {}",
+            job.lane_id, job.nightly_run_id
+        )
+    });
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
@@ -216,10 +293,15 @@ fn current_scheduled_slot(
 mod tests {
     use std::fs;
     use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
 
     use chrono::TimeZone;
 
-    use super::{load_manifest_from_default_branch, run_ci_pass, schedule_due_nightlies_at};
+    use super::{
+        load_manifest_from_default_branch, run_ci_pass, run_ci_pass_with_timing,
+        schedule_due_nightlies_at,
+    };
     use crate::ci_manifest::ForgeLane;
     use crate::config::{Config, ForgeRepoConfig};
     use crate::storage::Store;
@@ -486,5 +568,128 @@ nightly_schedule_utc = "08:00"
         assert_eq!(runs[0].status, "success");
         assert_eq!(runs[0].lanes.len(), 2);
         assert!(runs[0].lanes.iter().all(|lane| lane.status == "success"));
+    }
+
+    #[test]
+    fn live_heartbeat_prevents_long_running_lane_from_being_requeued() {
+        let root = tempfile::tempdir().expect("create temp root");
+        let bare = root.path().join("pika.git");
+        let seed = root.path().join("seed");
+        let db_path = root.path().join("pika-news.db");
+
+        git(
+            root.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git(root.path(), &["init", seed.to_str().expect("seed path")]);
+        git(&seed, &["config", "user.name", "Test User"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        fs::create_dir_all(seed.join("ci")).expect("create ci dir");
+        fs::write(seed.join("README.md"), "hello\n").expect("write readme");
+        fs::write(
+            seed.join("slow-lane.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep 4\necho slow-ok\n",
+        )
+        .expect("write slow lane script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(seed.join("slow-lane.sh"))
+            .expect("slow lane metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(seed.join("slow-lane.sh"), perms).expect("chmod slow lane script");
+        fs::write(
+            seed.join("ci/forge-lanes.toml"),
+            r#"
+version = 1
+nightly_schedule_utc = "08:00"
+"#,
+        )
+        .expect("write manifest");
+        git(
+            &seed,
+            &["add", "README.md", "slow-lane.sh", "ci/forge-lanes.toml"],
+        );
+        git(&seed, &["commit", "-m", "initial"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", bare.to_str().expect("bare path")],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        let head_sha = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let forge_repo = ForgeRepoConfig {
+            repo: "sledtools/pika".to_string(),
+            canonical_git_dir: bare.to_str().expect("bare path").to_string(),
+            default_branch: "master".to_string(),
+            ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+            hook_url: Some("http://127.0.0.1:9999/news/webhook".to_string()),
+        };
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(forge_repo.clone()),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&crate::branch_store::BranchUpsertInput {
+                repo: forge_repo.repo.clone(),
+                canonical_git_dir: forge_repo.canonical_git_dir.clone(),
+                default_branch: forge_repo.default_branch.clone(),
+                ci_entrypoint: super::FORGE_LANE_MANIFEST_PATH.to_string(),
+                branch_name: "feature/heartbeat".to_string(),
+                title: "feature/heartbeat".to_string(),
+                head_sha: head_sha.clone(),
+                merge_base_sha: head_sha.clone(),
+                author_name: None,
+                author_email: None,
+                updated_at: "2026-03-17T00:00:00Z".to_string(),
+            })
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                &head_sha,
+                &[ForgeLane {
+                    id: "slow_lane".to_string(),
+                    title: "slow lane".to_string(),
+                    entrypoint: "./slow-lane.sh".to_string(),
+                    command: vec!["./slow-lane.sh".to_string()],
+                    paths: vec![],
+                }],
+            )
+            .expect("queue branch suite");
+
+        let runner_store = store.clone();
+        let runner_config = config.clone();
+        let handle = thread::spawn(move || {
+            run_ci_pass_with_timing(&runner_store, &runner_config, Duration::from_secs(1), 2)
+                .expect("run ci pass with heartbeat")
+        });
+
+        thread::sleep(Duration::from_millis(2600));
+        assert_eq!(
+            store.recover_stale_ci_lanes().expect("recover stale work"),
+            0
+        );
+
+        let result = handle.join().expect("join runner");
+        assert_eq!(result.succeeded, 1);
+        let runs = store
+            .list_branch_ci_runs(branch.branch_id, 4)
+            .expect("list branch runs");
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(runs[0].lanes[0].retry_count, 0);
     }
 }

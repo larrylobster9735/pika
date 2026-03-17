@@ -605,6 +605,54 @@ impl Store {
         })
     }
 
+    pub fn queue_branch_ci_failure_for_head(
+        &self,
+        branch_id: i64,
+        head_sha: &str,
+        log_text: &str,
+    ) -> anyhow::Result<bool> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("start queue failed branch ci suite transaction")?;
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id
+                     FROM branch_ci_runs
+                     WHERE branch_id = ?1 AND source_head_sha = ?2
+                     ORDER BY id DESC
+                     LIMIT 1",
+                    params![branch_id, head_sha],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("lookup existing failed branch ci suite for head")?;
+            if existing.is_some() {
+                tx.commit()
+                    .context("commit existing failed branch ci suite lookup")?;
+                return Ok(false);
+            }
+
+            tx.execute(
+                "INSERT INTO branch_ci_runs(
+                    branch_id,
+                    source_head_sha,
+                    entrypoint,
+                    command_json,
+                    status,
+                    log_text,
+                    finished_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'failed', ?5, CURRENT_TIMESTAMP)",
+                params![branch_id, head_sha, "ci/forge-lanes.toml", "[]", log_text],
+            )
+            .context("insert failed branch ci suite")?;
+
+            tx.commit()
+                .context("commit queue failed branch ci suite transaction")?;
+            Ok(true)
+        })
+    }
+
     pub fn list_recent_nightly_runs(&self, limit: usize) -> anyhow::Result<Vec<NightlyFeedItem>> {
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -1025,51 +1073,28 @@ impl Store {
         })
     }
 
-    pub fn recover_stale_ci_lanes(&self, stale_after_secs: u64) -> anyhow::Result<usize> {
+    pub fn recover_stale_ci_lanes(&self) -> anyhow::Result<usize> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start stale ci recovery transaction")?;
-            let cutoff = format!("-{} seconds", stale_after_secs);
-            tx.execute(
-                "UPDATE branch_ci_runs
-                 SET status = 'queued', started_at = NULL, finished_at = NULL
-                 WHERE status = 'running'
-                   AND id IN (
-                        SELECT DISTINCT branch_ci_run_id
-                        FROM branch_ci_run_lanes
-                        WHERE status = 'running'
-                          AND started_at IS NOT NULL
-                          AND started_at <= datetime('now', ?1)
-                   )",
-                params![cutoff],
-            )
-            .context("reset stale branch ci suites")?;
-            tx.execute(
-                "UPDATE nightly_runs
-                 SET status = 'queued', started_at = NULL, finished_at = NULL
-                 WHERE status = 'running'
-                   AND id IN (
-                        SELECT DISTINCT nightly_run_id
-                        FROM nightly_run_lanes
-                        WHERE status = 'running'
-                          AND started_at IS NOT NULL
-                          AND started_at <= datetime('now', ?1)
-                   )",
-                params![cutoff],
-            )
-            .context("reset stale nightly runs")?;
+            let branch_suite_ids = stale_parent_ids(&tx, "branch_ci_run_lanes", "branch_ci_run_id")
+                .context("load stale branch ci suite ids")?;
+            let nightly_run_ids = stale_parent_ids(&tx, "nightly_run_lanes", "nightly_run_id")
+                .context("load stale nightly run ids")?;
             let branch_rows = tx
                 .execute(
                     "UPDATE branch_ci_run_lanes
                      SET status = 'queued',
                          retry_count = retry_count + 1,
                          started_at = NULL,
-                         finished_at = NULL
+                         finished_at = NULL,
+                         last_heartbeat_at = NULL,
+                         lease_expires_at = NULL
                      WHERE status = 'running'
-                       AND started_at IS NOT NULL
-                       AND started_at <= datetime('now', ?1)",
-                    params![cutoff],
+                       AND lease_expires_at IS NOT NULL
+                       AND lease_expires_at <= CURRENT_TIMESTAMP",
+                    [],
                 )
                 .context("reset stale branch ci lanes")?;
             let nightly_rows = tx
@@ -1078,13 +1103,21 @@ impl Store {
                      SET status = 'queued',
                          retry_count = retry_count + 1,
                          started_at = NULL,
-                         finished_at = NULL
+                         finished_at = NULL,
+                         last_heartbeat_at = NULL,
+                         lease_expires_at = NULL
                      WHERE status = 'running'
-                       AND started_at IS NOT NULL
-                       AND started_at <= datetime('now', ?1)",
-                    params![cutoff],
+                       AND lease_expires_at IS NOT NULL
+                       AND lease_expires_at <= CURRENT_TIMESTAMP",
+                    [],
                 )
                 .context("reset stale nightly lanes")?;
+            for suite_id in branch_suite_ids {
+                update_branch_ci_suite_status(&tx, suite_id)?;
+            }
+            for nightly_run_id in nightly_run_ids {
+                update_nightly_run_status(&tx, nightly_run_id)?;
+            }
             tx.commit()
                 .context("commit stale ci recovery transaction")?;
             Ok(branch_rows + nightly_rows)
@@ -1094,11 +1127,13 @@ impl Store {
     pub fn claim_pending_branch_ci_lane_runs(
         &self,
         limit: usize,
+        lease_secs: u64,
     ) -> anyhow::Result<Vec<PendingBranchCiLaneJob>> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start branch ci lane claim transaction")?;
+            let lease_window = format!("+{} seconds", lease_secs);
             let mut jobs = Vec::new();
             {
                 let mut stmt = tx
@@ -1132,9 +1167,12 @@ impl Store {
                     let job = row.context("read queued branch ci lane row")?;
                     tx.execute(
                         "UPDATE branch_ci_run_lanes
-                         SET status = 'running', started_at = CURRENT_TIMESTAMP
+                         SET status = 'running',
+                             started_at = CURRENT_TIMESTAMP,
+                             last_heartbeat_at = CURRENT_TIMESTAMP,
+                             lease_expires_at = datetime('now', ?2)
                          WHERE id = ?1 AND status = 'queued'",
-                        params![job.lane_run_id],
+                        params![job.lane_run_id, lease_window],
                     )
                     .with_context(|| format!("mark branch ci lane {} running", job.lane_run_id))?;
                     tx.execute(
@@ -1152,6 +1190,25 @@ impl Store {
             tx.commit()
                 .context("commit branch ci lane claim transaction")?;
             Ok(jobs)
+        })
+    }
+
+    pub fn heartbeat_branch_ci_lane_run(
+        &self,
+        lane_run_id: i64,
+        lease_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            let lease_window = format!("+{} seconds", lease_secs);
+            conn.execute(
+                "UPDATE branch_ci_run_lanes
+                 SET last_heartbeat_at = CURRENT_TIMESTAMP,
+                     lease_expires_at = datetime('now', ?2)
+                 WHERE id = ?1 AND status = 'running'",
+                params![lane_run_id, lease_window],
+            )
+            .with_context(|| format!("heartbeat branch ci lane {}", lane_run_id))?;
+            Ok(())
         })
     }
 
@@ -1174,7 +1231,11 @@ impl Store {
                 .with_context(|| format!("lookup branch ci suite for lane {}", lane_run_id))?;
             tx.execute(
                 "UPDATE branch_ci_run_lanes
-                 SET status = ?1, log_text = ?2, finished_at = CURRENT_TIMESTAMP
+                 SET status = ?1,
+                     log_text = ?2,
+                     finished_at = CURRENT_TIMESTAMP,
+                     last_heartbeat_at = CURRENT_TIMESTAMP,
+                     lease_expires_at = NULL
                  WHERE id = ?3",
                 params![status, log_text, lane_run_id],
             )
@@ -1189,11 +1250,13 @@ impl Store {
     pub fn claim_pending_nightly_lane_runs(
         &self,
         limit: usize,
+        lease_secs: u64,
     ) -> anyhow::Result<Vec<PendingNightlyLaneJob>> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start nightly lane claim transaction")?;
+            let lease_window = format!("+{} seconds", lease_secs);
             let mut jobs = Vec::new();
             {
                 let mut stmt = tx
@@ -1224,9 +1287,12 @@ impl Store {
                     let job = row.context("read queued nightly lane row")?;
                     tx.execute(
                         "UPDATE nightly_run_lanes
-                         SET status = 'running', started_at = CURRENT_TIMESTAMP
+                         SET status = 'running',
+                             started_at = CURRENT_TIMESTAMP,
+                             last_heartbeat_at = CURRENT_TIMESTAMP,
+                             lease_expires_at = datetime('now', ?2)
                          WHERE id = ?1 AND status = 'queued'",
-                        params![job.lane_run_id],
+                        params![job.lane_run_id, lease_window],
                     )
                     .with_context(|| format!("mark nightly lane {} running", job.lane_run_id))?;
                     tx.execute(
@@ -1244,6 +1310,25 @@ impl Store {
             tx.commit()
                 .context("commit nightly lane claim transaction")?;
             Ok(jobs)
+        })
+    }
+
+    pub fn heartbeat_nightly_lane_run(
+        &self,
+        lane_run_id: i64,
+        lease_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            let lease_window = format!("+{} seconds", lease_secs);
+            conn.execute(
+                "UPDATE nightly_run_lanes
+                 SET last_heartbeat_at = CURRENT_TIMESTAMP,
+                     lease_expires_at = datetime('now', ?2)
+                 WHERE id = ?1 AND status = 'running'",
+                params![lane_run_id, lease_window],
+            )
+            .with_context(|| format!("heartbeat nightly lane {}", lane_run_id))?;
+            Ok(())
         })
     }
 
@@ -1266,7 +1351,11 @@ impl Store {
                 .with_context(|| format!("lookup nightly run for lane {}", lane_run_id))?;
             tx.execute(
                 "UPDATE nightly_run_lanes
-                 SET status = ?1, log_text = ?2, finished_at = CURRENT_TIMESTAMP
+                 SET status = ?1,
+                     log_text = ?2,
+                     finished_at = CURRENT_TIMESTAMP,
+                     last_heartbeat_at = CURRENT_TIMESTAMP,
+                     lease_expires_at = NULL
                  WHERE id = ?3",
                 params![status, log_text, lane_run_id],
             )
@@ -1484,16 +1573,37 @@ fn aggregate_lane_status(
     Ok(status.to_string())
 }
 
+fn stale_parent_ids(conn: &Connection, table: &str, foreign_key: &str) -> anyhow::Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT DISTINCT {foreign_key}
+         FROM {table}
+         WHERE status = 'running'
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at <= CURRENT_TIMESTAMP
+         ORDER BY {foreign_key} ASC"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .with_context(|| format!("prepare stale parent id query for {table}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))
+        .with_context(|| format!("query stale parent ids from {table}"))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.with_context(|| format!("read stale parent id from {table}"))?);
+    }
+    Ok(ids)
+}
+
 fn update_branch_ci_suite_status(conn: &Connection, suite_id: i64) -> anyhow::Result<()> {
     let status = aggregate_lane_status(conn, "branch_ci_run_lanes", "branch_ci_run_id", suite_id)?;
-    let finished = if status == "success" || status == "failed" {
-        Some("CURRENT_TIMESTAMP")
-    } else {
-        None
-    };
-    let sql = if finished.is_some() {
+    let sql = if status == "success" || status == "failed" {
         "UPDATE branch_ci_runs
          SET status = ?1, finished_at = CURRENT_TIMESTAMP
+         WHERE id = ?2"
+    } else if status == "queued" {
+        "UPDATE branch_ci_runs
+         SET status = ?1, started_at = NULL, finished_at = NULL
          WHERE id = ?2"
     } else {
         "UPDATE branch_ci_runs
@@ -1508,14 +1618,13 @@ fn update_branch_ci_suite_status(conn: &Connection, suite_id: i64) -> anyhow::Re
 fn update_nightly_run_status(conn: &Connection, nightly_run_id: i64) -> anyhow::Result<()> {
     let status =
         aggregate_lane_status(conn, "nightly_run_lanes", "nightly_run_id", nightly_run_id)?;
-    let finished = if status == "success" || status == "failed" {
-        Some("CURRENT_TIMESTAMP")
-    } else {
-        None
-    };
-    let sql = if finished.is_some() {
+    let sql = if status == "success" || status == "failed" {
         "UPDATE nightly_runs
          SET status = ?1, finished_at = CURRENT_TIMESTAMP
+         WHERE id = ?2"
+    } else if status == "queued" {
+        "UPDATE nightly_runs
+         SET status = ?1, started_at = NULL, finished_at = NULL
          WHERE id = ?2"
     } else {
         "UPDATE nightly_runs
@@ -1708,10 +1817,10 @@ mod tests {
             .expect("queue nightly");
 
         let branch_jobs = store
-            .claim_pending_branch_ci_lane_runs(2)
+            .claim_pending_branch_ci_lane_runs(2, 120)
             .expect("claim branch lanes");
         let nightly_jobs = store
-            .claim_pending_nightly_lane_runs(2)
+            .claim_pending_nightly_lane_runs(2, 120)
             .expect("claim nightly lanes");
         assert_eq!(branch_jobs.len(), 2);
         assert_eq!(nightly_jobs.len(), 2);
@@ -1720,25 +1829,29 @@ mod tests {
             .with_connection(|conn| {
                 conn.execute(
                     "UPDATE branch_ci_run_lanes
-                     SET started_at = datetime('now', '-20 minutes')
+                     SET last_heartbeat_at = datetime('now', '-20 minutes'),
+                         lease_expires_at = datetime('now', '-1 minute')
                      WHERE id = ?1",
                     params![branch_jobs[0].lane_run_id],
                 )?;
                 conn.execute(
                     "UPDATE branch_ci_run_lanes
-                     SET started_at = datetime('now', '-2 minutes')
+                     SET last_heartbeat_at = datetime('now', '-2 minutes'),
+                         lease_expires_at = datetime('now', '+2 minutes')
                      WHERE id = ?1",
                     params![branch_jobs[1].lane_run_id],
                 )?;
                 conn.execute(
                     "UPDATE nightly_run_lanes
-                     SET started_at = datetime('now', '-20 minutes')
+                     SET last_heartbeat_at = datetime('now', '-20 minutes'),
+                         lease_expires_at = datetime('now', '-1 minute')
                      WHERE id = ?1",
                     params![nightly_jobs[0].lane_run_id],
                 )?;
                 conn.execute(
                     "UPDATE nightly_run_lanes
-                     SET started_at = datetime('now', '-2 minutes')
+                     SET last_heartbeat_at = datetime('now', '-2 minutes'),
+                         lease_expires_at = datetime('now', '+2 minutes')
                      WHERE id = ?1",
                     params![nightly_jobs[1].lane_run_id],
                 )?;
@@ -1746,14 +1859,13 @@ mod tests {
             })
             .expect("age lane timestamps");
 
-        let recovered = store
-            .recover_stale_ci_lanes(15 * 60)
-            .expect("recover stale work");
+        let recovered = store.recover_stale_ci_lanes().expect("recover stale work");
         assert_eq!(recovered, 2);
 
         let branch_runs = store
             .list_branch_ci_runs(branch.branch_id, 4)
             .expect("list branch runs");
+        assert_eq!(branch_runs[0].status, "running");
         let old_branch_lane = branch_runs[0]
             .lanes
             .iter()
@@ -1774,6 +1886,7 @@ mod tests {
             .get_nightly_run(nightlies[0].nightly_run_id)
             .expect("get nightly")
             .expect("nightly exists");
+        assert_eq!(nightly.status, "running");
         let old_nightly_lane = nightly
             .lanes
             .iter()
