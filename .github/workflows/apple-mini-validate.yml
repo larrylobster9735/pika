@@ -19,6 +19,8 @@ jobs:
     name: validate-apple-mini (${{ github.event.inputs.lane || 'sanity' }})
     runs-on: ubuntu-latest
     timeout-minutes: ${{ (github.event.inputs.lane || 'sanity') == 'bundle' && 90 || 60 }}
+    environment:
+      name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
     concurrency:
       group: apple-mini-validate-${{ github.event.inputs.lane || 'sanity' }}
       cancel-in-progress: false
