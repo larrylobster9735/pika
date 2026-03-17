@@ -992,6 +992,8 @@ jobs:
     if: needs.detect-changes.outputs.pikachat == 'true' && (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pre-merge'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment:
+      name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
     concurrency:
       group: apple-host-sanity
       cancel-in-progress: false
@@ -1628,6 +1630,8 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    environment:
+      name: ${{ contains(fromJSON('["justinmoon","futurepaul","AnthonyRonning","benthecarman","clarkmoody"]'), github.actor) == false && 'ci-approval' || 'ci-auto' }}
     concurrency:
       group: apple-host-bundle
       cancel-in-progress: false
