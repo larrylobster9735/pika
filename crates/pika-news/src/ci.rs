@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, NaiveTime, Utc};
 use std::time::Duration;
 
-use crate::branch_store::{PendingBranchCiLaneJob, PendingNightlyLaneJob};
+use crate::branch_store::{PendingBranchCiLaneJob, PendingNightlyLaneJob, CI_LANE_LEASE_LOST};
 use crate::ci_manifest::{self, ForgeCiManifest};
 use crate::config::Config;
 use crate::forge;
@@ -69,13 +69,13 @@ fn run_ci_pass_with_timing(
         ..CiPassResult::default()
     };
 
-    drain_branch_jobs(
-        store,
-        &forge_repo,
-        heartbeat_interval,
-        lease_secs,
-        &mut result,
-    )?;
+    let nightly_schedule_result = load_manifest_from_default_branch(&forge_repo)
+        .and_then(|manifest| schedule_due_nightlies(store, &forge_repo, &manifest))
+        .context("schedule due nightlies");
+    if let Ok(nightlies_scheduled) = nightly_schedule_result.as_ref() {
+        result.nightlies_scheduled = *nightlies_scheduled;
+    }
+
     drain_nightly_jobs(
         store,
         &forge_repo,
@@ -83,10 +83,15 @@ fn run_ci_pass_with_timing(
         lease_secs,
         &mut result,
     )?;
+    drain_branch_jobs(
+        store,
+        &forge_repo,
+        heartbeat_interval,
+        lease_secs,
+        &mut result,
+    )?;
 
-    let manifest = load_manifest_from_default_branch(&forge_repo)?;
-    result.nightlies_scheduled =
-        schedule_due_nightlies(store, &forge_repo, &manifest).context("schedule due nightlies")?;
+    nightly_schedule_result?;
 
     Ok(result)
 }
@@ -162,7 +167,7 @@ fn execute_branch_job(
         &job.source_head_sha,
         &job.command,
         heartbeat_interval,
-        || store.heartbeat_branch_ci_lane_run(job.lane_run_id, lease_secs),
+        || store.heartbeat_branch_ci_lane_run(job.lane_run_id, job.claim_token, lease_secs),
     )
     .with_context(|| {
         format!(
@@ -173,20 +178,38 @@ fn execute_branch_job(
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
-            store
-                .finish_branch_ci_lane_run(job.lane_run_id, status, &exec.log)
-                .with_context(|| format!("persist branch lane result {}", job.lane_run_id))?;
+            match store.finish_branch_ci_lane_run(
+                job.lane_run_id,
+                job.claim_token,
+                status,
+                &exec.log,
+            ) {
+                Ok(()) => {}
+                Err(err) if is_lease_lost(&err) => return Ok(()),
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("persist branch lane result {}", job.lane_run_id))
+                }
+            }
             if exec.success {
                 result.succeeded += 1;
             } else {
                 result.failed += 1;
             }
         }
+        Err(err) if is_lease_lost(&err) => return Ok(()),
         Err(err) => {
             let log = format!("ci runner error: {}", err);
-            store
-                .finish_branch_ci_lane_run(job.lane_run_id, "failed", &log)
-                .with_context(|| format!("persist branch lane failure {}", job.lane_run_id))?;
+            match store.finish_branch_ci_lane_run(job.lane_run_id, job.claim_token, "failed", &log)
+            {
+                Ok(()) => {}
+                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(()),
+                Err(finish_err) => {
+                    return Err(finish_err).with_context(|| {
+                        format!("persist branch lane failure {}", job.lane_run_id)
+                    })
+                }
+            }
             result.failed += 1;
         }
     }
@@ -206,7 +229,7 @@ fn execute_nightly_job(
         &job.source_head_sha,
         &job.command,
         heartbeat_interval,
-        || store.heartbeat_nightly_lane_run(job.lane_run_id, lease_secs),
+        || store.heartbeat_nightly_lane_run(job.lane_run_id, job.claim_token, lease_secs),
     )
     .with_context(|| {
         format!(
@@ -217,24 +240,42 @@ fn execute_nightly_job(
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
-            store
-                .finish_nightly_lane_run(job.lane_run_id, status, &exec.log)
-                .with_context(|| format!("persist nightly lane result {}", job.lane_run_id))?;
+            match store.finish_nightly_lane_run(job.lane_run_id, job.claim_token, status, &exec.log)
+            {
+                Ok(()) => {}
+                Err(err) if is_lease_lost(&err) => return Ok(()),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("persist nightly lane result {}", job.lane_run_id)
+                    })
+                }
+            }
             if exec.success {
                 result.succeeded += 1;
             } else {
                 result.failed += 1;
             }
         }
+        Err(err) if is_lease_lost(&err) => return Ok(()),
         Err(err) => {
             let log = format!("ci runner error: {}", err);
-            store
-                .finish_nightly_lane_run(job.lane_run_id, "failed", &log)
-                .with_context(|| format!("persist nightly lane failure {}", job.lane_run_id))?;
+            match store.finish_nightly_lane_run(job.lane_run_id, job.claim_token, "failed", &log) {
+                Ok(()) => {}
+                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(()),
+                Err(finish_err) => {
+                    return Err(finish_err).with_context(|| {
+                        format!("persist nightly lane failure {}", job.lane_run_id)
+                    })
+                }
+            }
             result.failed += 1;
         }
     }
     Ok(())
+}
+
+fn is_lease_lost(err: &anyhow::Error) -> bool {
+    err.to_string().contains(CI_LANE_LEASE_LOST)
 }
 
 fn schedule_due_nightlies(
@@ -369,7 +410,7 @@ mod tests {
             seed.join("ci/forge-lanes.toml"),
             r#"
 version = 1
-nightly_schedule_utc = "08:00"
+nightly_schedule_utc = "00:00"
 
 [[nightly.lanes]]
 id = "nightly_smoke"
@@ -691,5 +732,150 @@ nightly_schedule_utc = "08:00"
             .expect("list branch runs");
         assert_eq!(runs[0].status, "success");
         assert_eq!(runs[0].lanes[0].retry_count, 0);
+    }
+
+    #[test]
+    fn due_nightly_is_queued_and_run_in_same_ci_pass() {
+        let root = tempfile::tempdir().expect("create temp root");
+        let bare = root.path().join("pika.git");
+        let seed = root.path().join("seed");
+        let db_path = root.path().join("pika-news.db");
+
+        git(
+            root.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git(root.path(), &["init", seed.to_str().expect("seed path")]);
+        git(&seed, &["config", "user.name", "Test User"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        fs::create_dir_all(seed.join("ci")).expect("create ci dir");
+        fs::write(seed.join("README.md"), "hello\n").expect("write readme");
+        fs::write(
+            seed.join("branch-lane.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho branch-ok\n",
+        )
+        .expect("write branch lane script");
+        fs::write(
+            seed.join("nightly.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho nightly-ok\n",
+        )
+        .expect("write nightly script");
+        use std::os::unix::fs::PermissionsExt;
+        for script in ["branch-lane.sh", "nightly.sh"] {
+            let mut perms = fs::metadata(seed.join(script))
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(seed.join(script), perms).expect("chmod script");
+        }
+        fs::write(
+            seed.join("ci/forge-lanes.toml"),
+            r#"
+version = 1
+nightly_schedule_utc = "08:00"
+
+[[nightly.lanes]]
+id = "nightly_smoke"
+title = "nightly smoke"
+entrypoint = "./nightly.sh"
+command = ["./nightly.sh"]
+"#,
+        )
+        .expect("write manifest");
+        git(
+            &seed,
+            &[
+                "add",
+                "README.md",
+                "branch-lane.sh",
+                "nightly.sh",
+                "ci/forge-lanes.toml",
+            ],
+        );
+        git(&seed, &["commit", "-m", "initial"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", bare.to_str().expect("bare path")],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        let head_sha = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let forge_repo = ForgeRepoConfig {
+            repo: "sledtools/pika".to_string(),
+            canonical_git_dir: bare.to_str().expect("bare path").to_string(),
+            default_branch: "master".to_string(),
+            ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+            hook_url: Some("http://127.0.0.1:9999/news/webhook".to_string()),
+        };
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(forge_repo.clone()),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&crate::branch_store::BranchUpsertInput {
+                repo: forge_repo.repo.clone(),
+                canonical_git_dir: forge_repo.canonical_git_dir.clone(),
+                default_branch: forge_repo.default_branch.clone(),
+                ci_entrypoint: super::FORGE_LANE_MANIFEST_PATH.to_string(),
+                branch_name: "feature/nightly-priority".to_string(),
+                title: "feature/nightly-priority".to_string(),
+                head_sha: head_sha.clone(),
+                merge_base_sha: head_sha.clone(),
+                author_name: None,
+                author_email: None,
+                updated_at: "2026-03-17T00:00:00Z".to_string(),
+            })
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                &head_sha,
+                &[ForgeLane {
+                    id: "branch_lane".to_string(),
+                    title: "branch lane".to_string(),
+                    entrypoint: "./branch-lane.sh".to_string(),
+                    command: vec!["./branch-lane.sh".to_string()],
+                    paths: vec![],
+                }],
+            )
+            .expect("queue branch suite");
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 17, 9, 30, 0)
+            .single()
+            .expect("fixed timestamp");
+        let result = run_ci_pass_with_timing(&store, &config, Duration::from_secs(1), 2)
+            .expect("run ci pass");
+        assert_eq!(result.nightlies_scheduled, 1);
+
+        let nightly_manifest = load_manifest_from_default_branch(&forge_repo).expect("manifest");
+        assert_eq!(
+            schedule_due_nightlies_at(&store, &forge_repo, &nightly_manifest, now)
+                .expect("nightly dedupe"),
+            0
+        );
+        let nightlies = store.list_recent_nightly_runs(4).expect("nightly feed");
+        let nightly = store
+            .get_nightly_run(nightlies[0].nightly_run_id)
+            .expect("nightly detail")
+            .expect("nightly exists");
+        assert_eq!(nightly.status, "success");
+        assert_eq!(nightly.lanes.len(), 1);
+        assert_eq!(nightly.lanes[0].status, "success");
+        assert_eq!(nightly.lanes[0].log_text.as_deref(), Some("nightly-ok\n"));
     }
 }

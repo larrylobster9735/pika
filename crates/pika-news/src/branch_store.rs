@@ -1,8 +1,10 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::ci_manifest::ForgeLane;
 use crate::storage::Store;
+
+pub const CI_LANE_LEASE_LOST: &str = "ci lane lease lost";
 
 #[derive(Debug, Clone)]
 pub struct BranchUpsertInput {
@@ -104,6 +106,7 @@ pub struct BranchCiLaneRecord {
 #[allow(dead_code)]
 pub struct PendingBranchCiLaneJob {
     pub lane_run_id: i64,
+    pub claim_token: i64,
     pub suite_id: i64,
     pub branch_id: i64,
     pub source_head_sha: String,
@@ -155,6 +158,7 @@ pub struct NightlyLaneRecord {
 #[derive(Debug, Clone)]
 pub struct PendingNightlyLaneJob {
     pub lane_run_id: i64,
+    pub claim_token: i64,
     pub nightly_run_id: i64,
     pub source_head_sha: String,
     pub lane_id: String,
@@ -1138,7 +1142,7 @@ impl Store {
             {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT lane.id, lane.branch_ci_run_id, suite.branch_id, suite.source_head_sha, lane.lane_id, lane.title, lane.entrypoint, lane.command_json
+                        "SELECT lane.id, lane.claim_token, lane.branch_ci_run_id, suite.branch_id, suite.source_head_sha, lane.lane_id, lane.title, lane.entrypoint, lane.command_json
                          FROM branch_ci_run_lanes lane
                          JOIN branch_ci_runs suite ON suite.id = lane.branch_ci_run_id
                          WHERE lane.status = 'queued'
@@ -1148,33 +1152,44 @@ impl Store {
                     .context("prepare branch ci lane claim query")?;
                 let rows = stmt
                     .query_map(params![limit as i64], |row| {
-                        let command_json: String = row.get(7)?;
+                        let command_json: String = row.get(8)?;
                         let command: Vec<String> =
                             serde_json::from_str(&command_json).unwrap_or_default();
                         Ok(PendingBranchCiLaneJob {
                             lane_run_id: row.get(0)?,
-                            suite_id: row.get(1)?,
-                            branch_id: row.get(2)?,
-                            source_head_sha: row.get(3)?,
-                            lane_id: row.get(4)?,
-                            title: row.get(5)?,
-                            entrypoint: row.get(6)?,
+                            claim_token: row.get::<_, i64>(1)? + 1,
+                            suite_id: row.get(2)?,
+                            branch_id: row.get(3)?,
+                            source_head_sha: row.get(4)?,
+                            lane_id: row.get(5)?,
+                            title: row.get(6)?,
+                            entrypoint: row.get(7)?,
                             command,
                         })
                     })
                     .context("query queued branch ci lanes")?;
                 for row in rows {
                     let job = row.context("read queued branch ci lane row")?;
-                    tx.execute(
+                    let updated = tx
+                        .execute(
                         "UPDATE branch_ci_run_lanes
                          SET status = 'running',
                              started_at = CURRENT_TIMESTAMP,
                              last_heartbeat_at = CURRENT_TIMESTAMP,
-                             lease_expires_at = datetime('now', ?2)
-                         WHERE id = ?1 AND status = 'queued'",
-                        params![job.lane_run_id, lease_window],
+                             lease_expires_at = datetime('now', ?2),
+                             claim_token = ?3
+                         WHERE id = ?1 AND status = 'queued' AND claim_token = ?4",
+                        params![
+                            job.lane_run_id,
+                            lease_window,
+                            job.claim_token,
+                            job.claim_token - 1,
+                        ],
                     )
                     .with_context(|| format!("mark branch ci lane {} running", job.lane_run_id))?;
+                    if updated == 0 {
+                        continue;
+                    }
                     tx.execute(
                         "UPDATE branch_ci_runs
                          SET status = 'running',
@@ -1196,18 +1211,23 @@ impl Store {
     pub fn heartbeat_branch_ci_lane_run(
         &self,
         lane_run_id: i64,
+        claim_token: i64,
         lease_secs: u64,
     ) -> anyhow::Result<()> {
         self.with_connection(|conn| {
             let lease_window = format!("+{} seconds", lease_secs);
-            conn.execute(
-                "UPDATE branch_ci_run_lanes
+            let updated = conn
+                .execute(
+                    "UPDATE branch_ci_run_lanes
                  SET last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = datetime('now', ?2)
-                 WHERE id = ?1 AND status = 'running'",
-                params![lane_run_id, lease_window],
-            )
-            .with_context(|| format!("heartbeat branch ci lane {}", lane_run_id))?;
+                 WHERE id = ?1 AND status = 'running' AND claim_token = ?3",
+                    params![lane_run_id, lease_window, claim_token],
+                )
+                .with_context(|| format!("heartbeat branch ci lane {}", lane_run_id))?;
+            if updated == 0 {
+                bail!("{CI_LANE_LEASE_LOST}");
+            }
             Ok(())
         })
     }
@@ -1215,6 +1235,7 @@ impl Store {
     pub fn finish_branch_ci_lane_run(
         &self,
         lane_run_id: i64,
+        claim_token: i64,
         status: &str,
         log_text: &str,
     ) -> anyhow::Result<()> {
@@ -1229,17 +1250,21 @@ impl Store {
                     |row| row.get(0),
                 )
                 .with_context(|| format!("lookup branch ci suite for lane {}", lane_run_id))?;
-            tx.execute(
-                "UPDATE branch_ci_run_lanes
+            let updated = tx
+                .execute(
+                    "UPDATE branch_ci_run_lanes
                  SET status = ?1,
                      log_text = ?2,
                      finished_at = CURRENT_TIMESTAMP,
                      last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL
-                 WHERE id = ?3",
-                params![status, log_text, lane_run_id],
-            )
-            .with_context(|| format!("finish branch ci lane {}", lane_run_id))?;
+                 WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
+                    params![status, log_text, lane_run_id, claim_token],
+                )
+                .with_context(|| format!("finish branch ci lane {}", lane_run_id))?;
+            if updated == 0 {
+                bail!("{CI_LANE_LEASE_LOST}");
+            }
             update_branch_ci_suite_status(&tx, suite_id)?;
             tx.commit()
                 .context("commit finish branch ci lane transaction")?;
@@ -1261,7 +1286,7 @@ impl Store {
             {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT lane.id, lane.nightly_run_id, nightly.source_head_sha, lane.lane_id, lane.command_json
+                        "SELECT lane.id, lane.claim_token, lane.nightly_run_id, nightly.source_head_sha, lane.lane_id, lane.command_json
                          FROM nightly_run_lanes lane
                          JOIN nightly_runs nightly ON nightly.id = lane.nightly_run_id
                          WHERE lane.status = 'queued'
@@ -1271,30 +1296,41 @@ impl Store {
                     .context("prepare nightly lane claim query")?;
                 let rows = stmt
                     .query_map(params![limit as i64], |row| {
-                        let command_json: String = row.get(4)?;
+                        let command_json: String = row.get(5)?;
                         let command: Vec<String> =
                             serde_json::from_str(&command_json).unwrap_or_default();
                         Ok(PendingNightlyLaneJob {
                             lane_run_id: row.get(0)?,
-                            nightly_run_id: row.get(1)?,
-                            source_head_sha: row.get(2)?,
-                            lane_id: row.get(3)?,
+                            claim_token: row.get::<_, i64>(1)? + 1,
+                            nightly_run_id: row.get(2)?,
+                            source_head_sha: row.get(3)?,
+                            lane_id: row.get(4)?,
                             command,
                         })
                     })
                     .context("query queued nightly lanes")?;
                 for row in rows {
                     let job = row.context("read queued nightly lane row")?;
-                    tx.execute(
+                    let updated = tx
+                        .execute(
                         "UPDATE nightly_run_lanes
                          SET status = 'running',
                              started_at = CURRENT_TIMESTAMP,
                              last_heartbeat_at = CURRENT_TIMESTAMP,
-                             lease_expires_at = datetime('now', ?2)
-                         WHERE id = ?1 AND status = 'queued'",
-                        params![job.lane_run_id, lease_window],
+                             lease_expires_at = datetime('now', ?2),
+                             claim_token = ?3
+                         WHERE id = ?1 AND status = 'queued' AND claim_token = ?4",
+                        params![
+                            job.lane_run_id,
+                            lease_window,
+                            job.claim_token,
+                            job.claim_token - 1,
+                        ],
                     )
                     .with_context(|| format!("mark nightly lane {} running", job.lane_run_id))?;
+                    if updated == 0 {
+                        continue;
+                    }
                     tx.execute(
                         "UPDATE nightly_runs
                          SET status = 'running',
@@ -1316,18 +1352,23 @@ impl Store {
     pub fn heartbeat_nightly_lane_run(
         &self,
         lane_run_id: i64,
+        claim_token: i64,
         lease_secs: u64,
     ) -> anyhow::Result<()> {
         self.with_connection(|conn| {
             let lease_window = format!("+{} seconds", lease_secs);
-            conn.execute(
-                "UPDATE nightly_run_lanes
+            let updated = conn
+                .execute(
+                    "UPDATE nightly_run_lanes
                  SET last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = datetime('now', ?2)
-                 WHERE id = ?1 AND status = 'running'",
-                params![lane_run_id, lease_window],
-            )
-            .with_context(|| format!("heartbeat nightly lane {}", lane_run_id))?;
+                 WHERE id = ?1 AND status = 'running' AND claim_token = ?3",
+                    params![lane_run_id, lease_window, claim_token],
+                )
+                .with_context(|| format!("heartbeat nightly lane {}", lane_run_id))?;
+            if updated == 0 {
+                bail!("{CI_LANE_LEASE_LOST}");
+            }
             Ok(())
         })
     }
@@ -1335,6 +1376,7 @@ impl Store {
     pub fn finish_nightly_lane_run(
         &self,
         lane_run_id: i64,
+        claim_token: i64,
         status: &str,
         log_text: &str,
     ) -> anyhow::Result<()> {
@@ -1349,17 +1391,21 @@ impl Store {
                     |row| row.get(0),
                 )
                 .with_context(|| format!("lookup nightly run for lane {}", lane_run_id))?;
-            tx.execute(
-                "UPDATE nightly_run_lanes
+            let updated = tx
+                .execute(
+                    "UPDATE nightly_run_lanes
                  SET status = ?1,
                      log_text = ?2,
                      finished_at = CURRENT_TIMESTAMP,
                      last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL
-                 WHERE id = ?3",
-                params![status, log_text, lane_run_id],
-            )
-            .with_context(|| format!("finish nightly lane {}", lane_run_id))?;
+                 WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
+                    params![status, log_text, lane_run_id, claim_token],
+                )
+                .with_context(|| format!("finish nightly lane {}", lane_run_id))?;
+            if updated == 0 {
+                bail!("{CI_LANE_LEASE_LOST}");
+            }
             update_nightly_run_status(&tx, nightly_run_id)?;
             tx.commit()
                 .context("commit finish nightly lane transaction")?;
@@ -1640,7 +1686,7 @@ fn update_nightly_run_status(conn: &Connection, nightly_run_id: i64) -> anyhow::
 mod tests {
     use rusqlite::params;
 
-    use super::BranchUpsertInput;
+    use super::{BranchUpsertInput, CI_LANE_LEASE_LOST};
     use crate::ci_manifest::ForgeLane;
     use crate::storage::Store;
 
@@ -1762,11 +1808,11 @@ mod tests {
         store
             .queue_branch_ci_run_for_head(branch.branch_id, "head333", &[sample_lane("pika")])
             .expect("queue ci suite");
-        let runs = store
-            .list_branch_ci_runs(branch.branch_id, 4)
-            .expect("list ci suites");
+        let jobs = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim ci lane");
         store
-            .finish_branch_ci_lane_run(runs[0].lanes[0].id, "success", "ci ok")
+            .finish_branch_ci_lane_run(jobs[0].lane_run_id, jobs[0].claim_token, "success", "ci ok")
             .expect("persist ci lane result");
         store
             .mark_branch_merged(branch.branch_id, "npub1trusted", "merge999")
@@ -1901,5 +1947,144 @@ mod tests {
         assert_eq!(old_nightly_lane.retry_count, 1);
         assert_eq!(fresh_nightly_lane.status, "running");
         assert_eq!(fresh_nightly_lane.retry_count, 0);
+    }
+
+    #[test]
+    fn reclaimed_lane_rejects_old_worker_heartbeats_and_finishes() {
+        let store = open_store();
+        let branch = store
+            .upsert_branch_record(&upsert_input("feature/fence", "head666"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(branch.branch_id, "head666", &[sample_lane("pika")])
+            .expect("queue branch suite");
+        let first_job = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim first branch worker")
+            .pop()
+            .expect("first branch job");
+
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET lease_expires_at = datetime('now', '-1 minute')
+                     WHERE id = ?1",
+                    params![first_job.lane_run_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("expire branch lease");
+        assert_eq!(
+            store
+                .recover_stale_ci_lanes()
+                .expect("recover stale branch"),
+            1
+        );
+        let second_job = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim second branch worker")
+            .pop()
+            .expect("second branch job");
+        assert!(second_job.claim_token > first_job.claim_token);
+        assert!(store
+            .heartbeat_branch_ci_lane_run(first_job.lane_run_id, first_job.claim_token, 120)
+            .expect_err("old branch heartbeat should fail")
+            .to_string()
+            .contains(CI_LANE_LEASE_LOST));
+        assert!(store
+            .finish_branch_ci_lane_run(
+                first_job.lane_run_id,
+                first_job.claim_token,
+                "success",
+                "stale worker",
+            )
+            .expect_err("old branch finish should fail")
+            .to_string()
+            .contains(CI_LANE_LEASE_LOST));
+        store
+            .heartbeat_branch_ci_lane_run(second_job.lane_run_id, second_job.claim_token, 120)
+            .expect("current branch heartbeat");
+        store
+            .finish_branch_ci_lane_run(
+                second_job.lane_run_id,
+                second_job.claim_token,
+                "success",
+                "current worker",
+            )
+            .expect("current branch finish");
+
+        let nightly_lanes = vec![sample_lane("nightly_fence")];
+        let repo_id = store
+            .ensure_forge_repo_metadata(
+                "sledtools/pika",
+                "/tmp/pika.git",
+                "master",
+                "ci/forge-lanes.toml",
+            )
+            .expect("ensure repo metadata");
+        store
+            .queue_nightly_run(
+                repo_id,
+                "refs/heads/master",
+                "nightly-fence-head",
+                "2026-03-17T08:00:00Z",
+                &nightly_lanes,
+            )
+            .expect("queue nightly");
+        let first_nightly = store
+            .claim_pending_nightly_lane_runs(1, 120)
+            .expect("claim first nightly worker")
+            .pop()
+            .expect("first nightly job");
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE nightly_run_lanes
+                     SET lease_expires_at = datetime('now', '-1 minute')
+                     WHERE id = ?1",
+                    params![first_nightly.lane_run_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("expire nightly lease");
+        assert_eq!(
+            store
+                .recover_stale_ci_lanes()
+                .expect("recover stale nightly"),
+            1
+        );
+        let second_nightly = store
+            .claim_pending_nightly_lane_runs(1, 120)
+            .expect("claim second nightly worker")
+            .pop()
+            .expect("second nightly job");
+        assert!(second_nightly.claim_token > first_nightly.claim_token);
+        assert!(store
+            .heartbeat_nightly_lane_run(first_nightly.lane_run_id, first_nightly.claim_token, 120)
+            .expect_err("old nightly heartbeat should fail")
+            .to_string()
+            .contains(CI_LANE_LEASE_LOST));
+        assert!(store
+            .finish_nightly_lane_run(
+                first_nightly.lane_run_id,
+                first_nightly.claim_token,
+                "success",
+                "stale nightly worker",
+            )
+            .expect_err("old nightly finish should fail")
+            .to_string()
+            .contains(CI_LANE_LEASE_LOST));
+        store
+            .heartbeat_nightly_lane_run(second_nightly.lane_run_id, second_nightly.claim_token, 120)
+            .expect("current nightly heartbeat");
+        store
+            .finish_nightly_lane_run(
+                second_nightly.lane_run_id,
+                second_nightly.claim_token,
+                "success",
+                "current nightly worker",
+            )
+            .expect("current nightly finish");
     }
 }
