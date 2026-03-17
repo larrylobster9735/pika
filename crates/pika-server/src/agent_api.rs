@@ -718,6 +718,7 @@ fn build_incus_http_client(resolved: &ResolvedIncusParams) -> anyhow::Result<req
     let tls = resolved_incus_tls_config(resolved)?;
     let mut builder = reqwest::Client::builder()
         .timeout(INCUS_HTTP_TIMEOUT)
+        .use_rustls_tls()
         .danger_accept_invalid_certs(resolved.insecure_tls);
 
     if let Some(server_cert_path) = tls.server_cert_path.as_deref() {
@@ -732,17 +733,20 @@ fn build_incus_http_client(resolved: &ResolvedIncusParams) -> anyhow::Result<req
         tls.client_cert_path.as_deref(),
         tls.client_key_path.as_deref(),
     ) {
-        let identity_cert_pem = fs::read(client_cert_path)
+        let mut identity_pem = fs::read(client_cert_path)
             .with_context(|| format!("read incus client certificate from {client_cert_path}"))?;
+        if !identity_pem.ends_with(b"\n") {
+            identity_pem.push(b'\n');
+        }
         let client_key_pem = fs::read(client_key_path)
             .with_context(|| format!("read incus client key from {client_key_path}"))?;
-        let identity = reqwest::Identity::from_pkcs8_pem(&identity_cert_pem, &client_key_pem)
-            .with_context(|| {
-                format!(
-                    "parse incus client identity from {} and {}",
-                    client_cert_path, client_key_path
-                )
-            })?;
+        identity_pem.extend_from_slice(&client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem).with_context(|| {
+            format!(
+                "parse incus client identity from {} and {}",
+                client_cert_path, client_key_path
+            )
+        })?;
         builder = builder.identity(identity);
     }
 
