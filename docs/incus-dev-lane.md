@@ -148,7 +148,7 @@ Expected results:
 4. A matching custom volume named `<vm_id>-state` appears.
 5. Inside the guest, bootstrap re-homes managed-agent state onto `/mnt/pika-state`.
 6. The guest writes `/workspace/pika-agent/service-ready.json`.
-7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=running`.
+7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
 
 Operator checks:
 
