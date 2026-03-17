@@ -59,6 +59,7 @@ const INCUS_PERSISTENT_VOLUME_TYPE: &str = "custom";
 const INCUS_PERSISTENT_VOLUME_CONTENT_TYPE: &str = "filesystem";
 const INCUS_PERSISTENT_VOLUME_DEVICE_NAME: &str = "pikastate";
 const INCUS_PERSISTENT_VOLUME_PATH: &str = "/mnt/pika-state";
+const INCUS_DEV_VM_MEMORY_LIMIT: &str = "2048MiB";
 const INCUS_CLOUD_INIT_USER_DATA_KEY: &str = "cloud-init.user-data";
 const INCUS_BOOTSTRAP_LAUNCHER_PATH: &str = "/workspace/pika-agent/incus-launcher.sh";
 const INCUS_STATE_VOLUME_SETUP_PATH: &str = "/workspace/pika-agent/incus-state-volume-setup.sh";
@@ -1189,6 +1190,7 @@ impl IncusManagedVmProvider {
             "devices": devices,
             "config": {
                 INCUS_CLOUD_INIT_USER_DATA_KEY: cloud_init_user_data,
+                "limits.memory": INCUS_DEV_VM_MEMORY_LIMIT,
                 "user.pika.provider": "incus",
                 "user.pika.state_volume": volume_name,
                 "user.pika.agent_kind": match self.resolved.agent_kind {
@@ -4534,6 +4536,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         assert_eq!(volume_name, format!("{instance_name}-state"));
         assert_eq!(instance_body["type"], "virtual-machine");
         assert_eq!(instance_body["source"]["alias"], "pika-agent/dev");
+        assert_eq!(
+            instance_body["config"]["limits.memory"],
+            INCUS_DEV_VM_MEMORY_LIMIT
+        );
         assert_eq!(
             instance_body["devices"][INCUS_PERSISTENT_VOLUME_DEVICE_NAME]["path"],
             INCUS_PERSISTENT_VOLUME_PATH
