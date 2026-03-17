@@ -58,6 +58,16 @@ fn run_ci_pass_with_timing(
     heartbeat_interval: Duration,
     lease_secs: u64,
 ) -> anyhow::Result<CiPassResult> {
+    run_ci_pass_with_timing_at(store, config, heartbeat_interval, lease_secs, Utc::now())
+}
+
+fn run_ci_pass_with_timing_at(
+    store: &Store,
+    config: &Config,
+    heartbeat_interval: Duration,
+    lease_secs: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<CiPassResult> {
     let Some(forge_repo) = config.effective_forge_repo() else {
         return Ok(CiPassResult::default());
     };
@@ -70,7 +80,7 @@ fn run_ci_pass_with_timing(
     };
 
     let nightly_schedule_result = load_manifest_from_default_branch(&forge_repo)
-        .and_then(|manifest| schedule_due_nightlies(store, &forge_repo, &manifest))
+        .and_then(|manifest| schedule_due_nightlies_at(store, &forge_repo, &manifest, now))
         .context("schedule due nightlies");
     if let Ok(nightlies_scheduled) = nightly_schedule_result.as_ref() {
         result.nightlies_scheduled = *nightlies_scheduled;
@@ -278,14 +288,6 @@ fn is_lease_lost(err: &anyhow::Error) -> bool {
     err.to_string().contains(CI_LANE_LEASE_LOST)
 }
 
-fn schedule_due_nightlies(
-    store: &Store,
-    forge_repo: &crate::config::ForgeRepoConfig,
-    manifest: &ForgeCiManifest,
-) -> anyhow::Result<usize> {
-    schedule_due_nightlies_at(store, forge_repo, manifest, Utc::now())
-}
-
 fn schedule_due_nightlies_at(
     store: &Store,
     forge_repo: &crate::config::ForgeRepoConfig,
@@ -341,7 +343,7 @@ mod tests {
 
     use super::{
         load_manifest_from_default_branch, run_ci_pass, run_ci_pass_with_timing,
-        schedule_due_nightlies_at,
+        run_ci_pass_with_timing_at, schedule_due_nightlies_at,
     };
     use crate::ci_manifest::ForgeLane;
     use crate::config::{Config, ForgeRepoConfig};
@@ -858,7 +860,7 @@ command = ["./nightly.sh"]
             .with_ymd_and_hms(2026, 3, 17, 9, 30, 0)
             .single()
             .expect("fixed timestamp");
-        let result = run_ci_pass_with_timing(&store, &config, Duration::from_secs(1), 2)
+        let result = run_ci_pass_with_timing_at(&store, &config, Duration::from_secs(1), 2, now)
             .expect("run ci pass");
         assert_eq!(result.nightlies_scheduled, 1);
 
