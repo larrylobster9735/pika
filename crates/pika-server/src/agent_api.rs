@@ -737,6 +737,18 @@ fn required_non_empty_field(
 }
 
 impl ManagedVmProvider {
+    fn ensure_customer_openclaw_flow_supported(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Microvm(_) => Ok(()),
+            Self::Incus(provider) => {
+                anyhow::bail!(
+                    "managed VM provider incus passed infrastructure checks but customer-facing OpenClaw launch/proxy is not implemented yet (endpoint={})",
+                    provider.resolved.endpoint
+                )
+            }
+        }
+    }
+
     fn openclaw_proxy_base_url(&self) -> anyhow::Result<&str> {
         match self {
             Self::Microvm(provider) => Ok(provider.spawner_base_url()),
@@ -3176,17 +3188,14 @@ pub async fn recover_my_agent(
 pub async fn agent_api_healthcheck() -> anyhow::Result<()> {
     let resolved = resolve_managed_vm_provider_config(None)
         .context("resolve and validate managed VM provider")?;
-    match &resolved {
-        ResolvedManagedVmProviderConfig::Microvm(_) => {}
-        ResolvedManagedVmProviderConfig::Incus(_) => {
-            let provider = managed_vm_provider_from_resolved(resolved)
-                .context("initialize configured incus managed VM provider")?;
-            match provider {
-                ManagedVmProvider::Incus(provider) => provider.healthcheck().await?,
-                ManagedVmProvider::Microvm(_) => unreachable!("resolved incus provider"),
-            }
-        }
+    let provider = managed_vm_provider_from_resolved(resolved)
+        .context("initialize configured managed VM provider")?;
+    if let ManagedVmProvider::Incus(incus) = &provider {
+        incus.healthcheck().await?;
     }
+    provider
+        .ensure_customer_openclaw_flow_supported()
+        .context("validate managed-agent customer OpenClaw flow")?;
     Ok(())
 }
 
@@ -3742,6 +3751,7 @@ mod tests {
 
     #[test]
     fn resolved_incus_params_require_all_scaffolding_fields() {
+        let _guard = serial_test_guard();
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
             microvm: None,
@@ -3798,6 +3808,7 @@ mod tests {
 
     #[test]
     fn resolved_incus_params_require_image_alias() {
+        let _guard = serial_test_guard();
         let requested = requested_incus_params(IncusProvisionParams {
             endpoint: Some("https://incus.internal:8443".to_string()),
             project: Some("managed-agents".to_string()),
@@ -4370,7 +4381,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_api_healthcheck_accepts_configured_incus_provider_when_client_probes_succeed() {
+    fn agent_api_healthcheck_rejects_incus_when_customer_openclaw_flow_is_unimplemented() {
         let (base_url, rx) = spawn_response_sequence_server(vec![
             ("200 OK", r#"{"type":"sync","metadata":{}}"#),
             ("200 OK", r#"{"type":"sync","metadata":{}}"#),
@@ -4392,9 +4403,12 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("build runtime");
-                runtime
+                let err = runtime
                     .block_on(agent_api_healthcheck())
-                    .expect("incus healthcheck should succeed");
+                    .expect_err("incus healthcheck should reject unsupported customer flow");
+                assert!(err
+                    .to_string()
+                    .contains("validate managed-agent customer OpenClaw flow"));
             },
         );
 
