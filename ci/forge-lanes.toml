@@ -7,6 +7,7 @@ title = "check-pika"
 entrypoint = "just checks::pre-merge-pika"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-pika"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "flake.nix",
@@ -26,6 +27,7 @@ paths = [
   "android/**",
   "ios/**",
   "docs/**",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/**",
   "tools/**",
 ]
@@ -36,6 +38,7 @@ title = "check-notifications"
 entrypoint = "just checks::pre-merge-notifications"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-notifications"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "flake.nix",
@@ -60,6 +63,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/lib/pikaci-tools.sh",
 ]
 
@@ -69,6 +73,7 @@ title = "check-agent-contracts"
 entrypoint = "just checks::pre-merge-agent-contracts"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-agent-contracts"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "cli/**",
@@ -102,6 +107,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/lib/pikaci-tools.sh",
 ]
 
@@ -111,6 +117,7 @@ title = "check-rmp"
 entrypoint = "just checks::pre-merge-rmp"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-rmp"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "flake.nix",
@@ -121,6 +128,7 @@ paths = [
   "crates/rmp-cli/**",
   "scripts/pikaci-staged-linux-remote.sh",
   "scripts/ci-add-known-host.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
   "scripts/lib/pikaci-tools.sh",
@@ -132,6 +140,7 @@ title = "check-pikachat"
 entrypoint = "just checks::pre-merge-pikachat"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-pikachat"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "cmd/pika-relay/**",
@@ -161,6 +170,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pikaci-staged-linux-remote.sh",
   "scripts/ci-add-known-host.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
   "scripts/lib/pikaci-tools.sh",
@@ -172,6 +182,7 @@ title = "check-apple-host-sanity"
 entrypoint = "./scripts/pikaci-apple-remote.sh run --just-recipe apple-host-sanity"
 command = ["./scripts/pikaci-apple-remote.sh", "run", "--just-recipe", "apple-host-sanity"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "cmd/pika-relay/**",
@@ -201,6 +212,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pikaci-staged-linux-remote.sh",
   "scripts/ci-add-known-host.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
   "scripts/lib/pikaci-tools.sh",
@@ -212,6 +224,7 @@ title = "check-pikachat-openclaw-e2e"
 entrypoint = "just checks::pre-merge-pikachat-openclaw-e2e"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-pikachat-openclaw-e2e"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "cmd/pika-relay/**",
@@ -235,6 +248,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pikaci-staged-linux-remote.sh",
   "scripts/ci-add-known-host.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
   "scripts/lib/pikaci-tools.sh",
@@ -246,6 +260,7 @@ title = "check-fixture"
 entrypoint = "just checks::pre-merge-fixture"
 command = ["nix", "develop", ".#default", "-c", "just", "checks::pre-merge-fixture"]
 paths = [
+  "ci/forge-lanes.toml",
   "Cargo.toml",
   "Cargo.lock",
   "flake.nix",
@@ -269,6 +284,7 @@ paths = [
   "scripts/pikaci-ci-run.sh",
   "scripts/pikaci-staged-linux-remote.sh",
   "scripts/ci-add-known-host.sh",
+  "scripts/forge-nightly-pika-ui-android.sh",
   "scripts/pika-build-prewarm-workspace-deps.sh",
   "scripts/pika-build-run-workspace-deps.sh",
   "scripts/lib/pikaci-tools.sh",

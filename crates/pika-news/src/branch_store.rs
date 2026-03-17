@@ -1025,11 +1025,40 @@ impl Store {
         })
     }
 
-    pub fn recover_stale_ci_lanes(&self) -> anyhow::Result<usize> {
+    pub fn recover_stale_ci_lanes(&self, stale_after_secs: u64) -> anyhow::Result<usize> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start stale ci recovery transaction")?;
+            let cutoff = format!("-{} seconds", stale_after_secs);
+            tx.execute(
+                "UPDATE branch_ci_runs
+                 SET status = 'queued', started_at = NULL, finished_at = NULL
+                 WHERE status = 'running'
+                   AND id IN (
+                        SELECT DISTINCT branch_ci_run_id
+                        FROM branch_ci_run_lanes
+                        WHERE status = 'running'
+                          AND started_at IS NOT NULL
+                          AND started_at <= datetime('now', ?1)
+                   )",
+                params![cutoff],
+            )
+            .context("reset stale branch ci suites")?;
+            tx.execute(
+                "UPDATE nightly_runs
+                 SET status = 'queued', started_at = NULL, finished_at = NULL
+                 WHERE status = 'running'
+                   AND id IN (
+                        SELECT DISTINCT nightly_run_id
+                        FROM nightly_run_lanes
+                        WHERE status = 'running'
+                          AND started_at IS NOT NULL
+                          AND started_at <= datetime('now', ?1)
+                   )",
+                params![cutoff],
+            )
+            .context("reset stale nightly runs")?;
             let branch_rows = tx
                 .execute(
                     "UPDATE branch_ci_run_lanes
@@ -1037,8 +1066,10 @@ impl Store {
                          retry_count = retry_count + 1,
                          started_at = NULL,
                          finished_at = NULL
-                     WHERE status = 'running'",
-                    [],
+                     WHERE status = 'running'
+                       AND started_at IS NOT NULL
+                       AND started_at <= datetime('now', ?1)",
+                    params![cutoff],
                 )
                 .context("reset stale branch ci lanes")?;
             let nightly_rows = tx
@@ -1048,24 +1079,12 @@ impl Store {
                          retry_count = retry_count + 1,
                          started_at = NULL,
                          finished_at = NULL
-                     WHERE status = 'running'",
-                    [],
+                     WHERE status = 'running'
+                       AND started_at IS NOT NULL
+                       AND started_at <= datetime('now', ?1)",
+                    params![cutoff],
                 )
                 .context("reset stale nightly lanes")?;
-            tx.execute(
-                "UPDATE branch_ci_runs
-                 SET status = 'queued', started_at = NULL, finished_at = NULL
-                 WHERE status = 'running'",
-                [],
-            )
-            .context("reset stale branch ci suites")?;
-            tx.execute(
-                "UPDATE nightly_runs
-                 SET status = 'queued', started_at = NULL, finished_at = NULL
-                 WHERE status = 'running'",
-                [],
-            )
-            .context("reset stale nightly runs")?;
             tx.commit()
                 .context("commit stale ci recovery transaction")?;
             Ok(branch_rows + nightly_rows)
@@ -1653,5 +1672,121 @@ mod tests {
         assert!(detail.tutorial_json.is_some());
         assert_eq!(detail.ci_status, "success");
         assert_eq!(detail.unified_diff.as_deref(), Some("@@ -1 +1 @@"));
+    }
+
+    #[test]
+    fn stale_recovery_only_requeues_old_running_work() {
+        let store = open_store();
+        let branch = store
+            .upsert_branch_record(&upsert_input("feature/stale", "head555"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head555",
+                &[sample_lane("old"), sample_lane("fresh")],
+            )
+            .expect("queue branch suite");
+
+        let nightly_lanes = vec![sample_lane("nightly_old"), sample_lane("nightly_fresh")];
+        let repo_id = store
+            .ensure_forge_repo_metadata(
+                "sledtools/pika",
+                "/tmp/pika.git",
+                "master",
+                "ci/forge-lanes.toml",
+            )
+            .expect("ensure repo metadata");
+        store
+            .queue_nightly_run(
+                repo_id,
+                "refs/heads/master",
+                "nightly-head",
+                "2026-03-17T08:00:00Z",
+                &nightly_lanes,
+            )
+            .expect("queue nightly");
+
+        let branch_jobs = store
+            .claim_pending_branch_ci_lane_runs(2)
+            .expect("claim branch lanes");
+        let nightly_jobs = store
+            .claim_pending_nightly_lane_runs(2)
+            .expect("claim nightly lanes");
+        assert_eq!(branch_jobs.len(), 2);
+        assert_eq!(nightly_jobs.len(), 2);
+
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET started_at = datetime('now', '-20 minutes')
+                     WHERE id = ?1",
+                    params![branch_jobs[0].lane_run_id],
+                )?;
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET started_at = datetime('now', '-2 minutes')
+                     WHERE id = ?1",
+                    params![branch_jobs[1].lane_run_id],
+                )?;
+                conn.execute(
+                    "UPDATE nightly_run_lanes
+                     SET started_at = datetime('now', '-20 minutes')
+                     WHERE id = ?1",
+                    params![nightly_jobs[0].lane_run_id],
+                )?;
+                conn.execute(
+                    "UPDATE nightly_run_lanes
+                     SET started_at = datetime('now', '-2 minutes')
+                     WHERE id = ?1",
+                    params![nightly_jobs[1].lane_run_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("age lane timestamps");
+
+        let recovered = store
+            .recover_stale_ci_lanes(15 * 60)
+            .expect("recover stale work");
+        assert_eq!(recovered, 2);
+
+        let branch_runs = store
+            .list_branch_ci_runs(branch.branch_id, 4)
+            .expect("list branch runs");
+        let old_branch_lane = branch_runs[0]
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_id == "old")
+            .expect("old branch lane");
+        let fresh_branch_lane = branch_runs[0]
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_id == "fresh")
+            .expect("fresh branch lane");
+        assert_eq!(old_branch_lane.status, "queued");
+        assert_eq!(old_branch_lane.retry_count, 1);
+        assert_eq!(fresh_branch_lane.status, "running");
+        assert_eq!(fresh_branch_lane.retry_count, 0);
+
+        let nightlies = store.list_recent_nightly_runs(4).expect("nightly feed");
+        let nightly = store
+            .get_nightly_run(nightlies[0].nightly_run_id)
+            .expect("get nightly")
+            .expect("nightly exists");
+        let old_nightly_lane = nightly
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_id == "nightly_old")
+            .expect("old nightly lane");
+        let fresh_nightly_lane = nightly
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_id == "nightly_fresh")
+            .expect("fresh nightly lane");
+        assert_eq!(old_nightly_lane.status, "queued");
+        assert_eq!(old_nightly_lane.retry_count, 1);
+        assert_eq!(fresh_nightly_lane.status, "running");
+        assert_eq!(fresh_nightly_lane.retry_count, 0);
     }
 }

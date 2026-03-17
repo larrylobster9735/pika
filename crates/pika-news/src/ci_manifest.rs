@@ -154,4 +154,15 @@ mod tests {
         assert!(ids.contains(&"apple_host_sanity".to_string()));
         assert!(ids.contains(&"fixture".to_string()));
     }
+
+    #[test]
+    fn canonical_manifest_change_selects_branch_lanes() {
+        let manifest =
+            parse_manifest(include_str!("../../../ci/forge-lanes.toml")).expect("manifest");
+        let changed = vec!["ci/forge-lanes.toml".to_string()];
+        let selected = select_branch_lanes(&manifest, &changed).expect("select lanes");
+
+        assert!(!selected.is_empty());
+        assert_eq!(selected.len(), manifest.branch_lanes.len());
+    }
 }

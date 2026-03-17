@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(n) => eprintln!("recovered {} stale generating artifact(s)", n),
                 Err(err) => eprintln!("warning: failed to recover stale generating: {}", err),
             }
-            match store.recover_stale_ci_lanes() {
+            match store.recover_stale_ci_lanes(ci::STALE_CI_RECOVERY_AFTER_SECS) {
                 Ok(0) => {}
                 Ok(n) => eprintln!("recovered {} stale ci lane(s)", n),
                 Err(err) => eprintln!("warning: failed to recover stale ci lanes: {}", err),
