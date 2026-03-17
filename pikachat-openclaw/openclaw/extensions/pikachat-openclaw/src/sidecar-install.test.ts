@@ -1,6 +1,9 @@
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { compareVersionsDesc, isCompatibleVersion } from "./sidecar-install.js";
+import { compareVersionsDesc, isCompatibleVersion, resolvePikachatDaemonCommand } from "./sidecar-install.js";
 
 describe("compareVersionsDesc", () => {
   it("sorts simple versions in descending order", () => {
@@ -76,5 +79,25 @@ describe("isCompatibleVersion", () => {
   it("works with bare version strings (no prefix)", () => {
     assert.strictEqual(isCompatibleVersion("v0.5.1", "0.5.0"), true);
     assert.strictEqual(isCompatibleVersion("v0.6.0", "0.5.0"), false);
+  });
+});
+
+describe("resolvePikachatDaemonCommand", () => {
+  it("prefers an existing pikachat binary on PATH before auto-install", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "pikachat-sidecar-test-"));
+    const binaryPath = path.join(tempDir, "pikachat");
+    await writeFile(binaryPath, "#!/bin/sh\nexit 0\n");
+    await chmod(binaryPath, 0o755);
+
+    const priorPath = process.env.PATH;
+    try {
+      process.env.PATH = `${tempDir}${path.delimiter}${priorPath ?? ""}`;
+      const resolved = await resolvePikachatDaemonCommand({
+        requestedCmd: "pikachat",
+      });
+      assert.equal(resolved, binaryPath);
+    } finally {
+      process.env.PATH = priorPath;
+    }
   });
 });
