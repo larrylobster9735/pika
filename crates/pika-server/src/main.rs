@@ -141,6 +141,8 @@ async fn route_openclaw_ui_host(mut request: Request<Body>, next: Next) -> Respo
     let request_path = request.uri().path();
     let rewritten_path = if request_path == "/launch" {
         OPENCLAW_INTERNAL_LAUNCH_PATH.to_string()
+    } else if request_path == format!("{OPENCLAW_INTERNAL_PROXY_PREFIX}/") {
+        OPENCLAW_INTERNAL_PROXY_PREFIX.to_string()
     } else if request_path == OPENCLAW_INTERNAL_LAUNCH_PATH
         || request_path == OPENCLAW_INTERNAL_PROXY_PREFIX
         || request_path.starts_with(&format!("{OPENCLAW_INTERNAL_PROXY_PREFIX}/"))
@@ -516,6 +518,23 @@ mod tests {
             response_body_string(response).await,
             "/_openclaw_proxy/assets/app.js"
         );
+    }
+
+    #[tokio::test]
+    async fn openclaw_localhost_internal_proxy_slash_path_normalizes_to_exact_proxy_route() {
+        let response = rewrite_test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/_openclaw_proxy/")
+                    .header(header::HOST, "openclaw.localhost:19401")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("internal proxy slash response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body_string(response).await, "/_openclaw_proxy");
     }
 
     #[tokio::test]
