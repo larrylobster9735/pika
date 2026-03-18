@@ -72,6 +72,11 @@ nix develop .#infra -c just -f infra/justfile build-deploy
 - the existing microVM host stack and `vm-spawner`
 - the Incus dev lane with `incusd` listening on `:8443`
 
+The canonical host config now also carries the Incus bridge firewall allowances needed for:
+
+- guest DHCP and DNS on `incusbr0`
+- guest egress through the host uplink
+
 Expected host-side prerequisites:
 
 - Incus API reachable on `https://pika-build:8443`
@@ -186,6 +191,8 @@ Expected results:
 5. Inside the guest, bootstrap re-homes managed-agent state onto `/mnt/pika-state`.
 6. The guest writes `/workspace/pika-agent/service-ready.json`.
 7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
+
+The first authenticated canary for this flow now succeeds on the canonical `pika-build` host shape.
 
 Operator checks:
 
