@@ -67,6 +67,9 @@ Deploy the canonical `pika-build` host shape:
 nix develop .#infra -c just -f infra/justfile build-deploy
 ```
 
+That entrypoint now uploads a clean repo snapshot and runs `nixos-rebuild` on `pika-build`
+itself, so operators do not need local `x86_64-linux` build support to deploy the canonical host.
+
 `pika-build` now runs both host roles side by side:
 
 - the existing microVM host stack and `vm-spawner`

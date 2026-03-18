@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <flake-root> <flake-attr> <target-host>" >&2
+  exit 2
+fi
+
+flake_root="$1"
+flake_attr="$2"
+target_host="$3"
+
+ssh_opts=()
+if [[ -n "${PIKA_BUILD_SSH_KEY:-}" ]]; then
+  ssh_opts+=(-i "${PIKA_BUILD_SSH_KEY}")
+fi
+ssh_opts+=(-o StrictHostKeyChecking=accept-new)
+
+ssh_cmd=(ssh "${ssh_opts[@]}" "root@${target_host}")
+
+remote_tmp="$("${ssh_cmd[@]}" 'mktemp -d /tmp/pika-deploy.XXXXXX')"
+cleanup() {
+  "${ssh_cmd[@]}" "rm -rf '${remote_tmp}'" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "==> Uploading repo snapshot to ${target_host}:${remote_tmp}..."
+(
+  cd "${flake_root}"
+  git archive --format=tar HEAD
+) | "${ssh_cmd[@]}" "mkdir -p '${remote_tmp}' && tar -xf - -C '${remote_tmp}'"
+
+echo "==> Building and switching ${flake_attr} on ${target_host}..."
+"${ssh_cmd[@]}" "cd '${remote_tmp}' && nix run nixpkgs#nixos-rebuild -- switch --fast --flake '.#${flake_attr}'"

@@ -4,6 +4,7 @@ PIKA_BUILD := env_var_or_default("PIKA_BUILD", "justin@65.108.234.158")
 PIKA_BUILD_SSH_KEY := env_var_or_default("PIKA_BUILD_SSH_KEY", env_var("HOME") + "/.ssh/id_ed25519")
 HCLOUD := justfile_directory() + "/scripts/hcloud"
 REQUIRE_CLEAN_DEPLOY_TREE := justfile_directory() + "/scripts/require-clean-deploy-tree"
+REMOTE_SELF_DEPLOY := justfile_directory() + "/scripts/remote-self-deploy"
 
 # Flake root is the parent directory (top-level pika repo).
 FLAKE_ROOT := parent_dir(justfile_directory())
@@ -502,16 +503,12 @@ build-deploy:
     #!/usr/bin/env bash
     set -euo pipefail
     IP="{{PIKA_BUILD_IP}}"
-    SSH_KEY="{{PIKA_BUILD_SSH_KEY}}"
     echo "==> Deploying pika-build ($IP)..."
 
     cd "{{FLAKE_ROOT}}"
     {{REQUIRE_CLEAN_DEPLOY_TREE}}
-    export NIX_SSHOPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new"
-    nix run nixpkgs#nixos-rebuild -- switch --fast \
-        --flake ".#pika-build" \
-        --build-host "root@$IP" \
-        --target-host "root@$IP"
+    export PIKA_BUILD_SSH_KEY="{{PIKA_BUILD_SSH_KEY}}"
+    {{REMOTE_SELF_DEPLOY}} "{{FLAKE_ROOT}}" "pika-build" "$IP"
 
     echo "==> pika-build deployed!"
 
