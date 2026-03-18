@@ -19,6 +19,12 @@
   '';
 
   networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8443 ];
+  networking.firewall.interfaces.tailscale0.allowedTCPPortRanges = [
+    {
+      from = 24000;
+      to = 33999;
+    }
+  ];
 
   environment.systemPackages = with pkgs; [
     incus
@@ -47,6 +53,10 @@
       - a trusted TLS client certificate restricted to pika-managed-agents
       - the matching client private key on pika-server
       - either PIKA_AGENT_INCUS_SERVER_CERT_PATH or PIKA_AGENT_INCUS_INSECURE_TLS=true
+
+    Customer dashboard OpenClaw on Incus:
+      - uses Incus-managed per-instance proxy ports on the pika-build Tailscale IP
+      - current reserved range: 24000-33999/tcp on tailscale0
 
     Trust a restricted client certificate:
       incus config trust add-certificate /path/to/pika-server-incus-client.crt --projects pika-managed-agents --restricted

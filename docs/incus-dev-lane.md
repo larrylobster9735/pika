@@ -30,10 +30,11 @@ This lane is meant to prove:
 - `pika-server` reads that signal through Incus and reports `guest_ready=true`
 - Incus-backed rows keep routing to Incus later through the persisted provider config
 
-It does not yet prove:
+This lane now also proves the internal coworker dashboard path:
 
-- customer-facing OpenClaw launch or proxy flows
-- a public API delete flow
+- the allowlisted `/dashboard` flow provisions, recovers, and resets explicitly on Incus
+- the built-in OpenClaw launch/auth/proxy flow works for Incus-backed rows through the real dashboard
+- a public API delete flow is still not present
 
 This lane now also proves the first Incus operational lifecycle model:
 
@@ -44,7 +45,6 @@ This lane now also proves the first Incus operational lifecycle model:
 What it still does not yet prove:
 
 - automated snapshot creation policy
-- customer-facing OpenClaw launch or proxy flows
 - a public API delete flow
 
 ## Build The Guest Image
@@ -88,6 +88,7 @@ The canonical host config now also carries the Incus bridge firewall allowances 
 
 - guest DHCP and DNS on `incusbr0`
 - guest egress through the host uplink
+- per-instance OpenClaw proxy ports on `tailscale0` for the internal dashboard flow
 - without broadly trusting `incusbr0` for host ingress
 
 Expected host-side prerequisites:
@@ -117,6 +118,8 @@ Notes:
   minimum provide a NIC
 - if your Incus host does not use `incusbr0`, replace it with the correct network from `incus network list`
 - off-host `pika-server` canaries now require a trusted Incus TLS client certificate
+- the internal dashboard OpenClaw flow uses Incus-managed host proxy ports in the `24000-33999`
+  range on `pika-build`
 
 ## Trust A `pika-server` Incus Client Certificate
 
@@ -250,6 +253,13 @@ Deploy the code with Incus configuration present, but keep the global default pr
 - do not set `PIKA_AGENT_VM_PROVIDER=incus`
 - keep the existing microVM environment working as the default path
 - use request-scoped Incus provisioning only for internal validation
+
+The real internal dashboard path is now Incus-only:
+
+- `/dashboard` provision, recover, and reset actions explicitly request `provider=incus`
+- built-in OpenClaw launch and proxying only unlock for Incus-backed rows
+- legacy microVM rows remain visible but the dashboard will only offer destructive reset to replace
+  them with a fresh Incus-backed environment
 
 Recommended server env for canarying:
 

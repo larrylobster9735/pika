@@ -34,6 +34,7 @@ tokio-tungstenite = { workspace = true }
 a2 = "0.10"
 base64 = { workspace = true }
 fcm-rs = "0.2"
+ipnet = "2.11"
 tower = { version = "0.5", features = ["make", "util"] }
 url = { workspace = true }
 

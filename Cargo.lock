@@ -6078,6 +6078,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "ipnet",
  "nostr-sdk",
  "pika-agent-control-plane",
  "pika-agent-microvm",

@@ -15,6 +15,10 @@ use crate::models::agent_allowlist::AgentAllowlistEntry;
 use crate::models::managed_environment_event::ManagedEnvironmentEvent;
 use crate::nostr_auth::{expected_host_from_headers, verify_nip98_event};
 use crate::{RequestContext, State};
+use pika_agent_control_plane::{
+    IncusProvisionParams, ManagedVmProvisionParams, MicrovmAgentBackend, MicrovmAgentKind,
+    MicrovmProvisionParams, ProviderKind,
+};
 
 mod openclaw;
 
@@ -96,10 +100,10 @@ struct DashboardTemplate {
     can_provision: bool,
     can_recover: bool,
     can_reset: bool,
-    control_loop_notice: &'static str,
+    control_loop_notice: String,
     has_control_loop_notice: bool,
     recover_action_label: &'static str,
-    recover_semantics_copy: &'static str,
+    recover_semantics_copy: String,
     backup_state_label: &'static str,
     backup_state_tone: &'static str,
     backup_status_copy: String,
@@ -113,6 +117,7 @@ struct DashboardTemplate {
     reset_safety_copy: String,
     can_launch_openclaw: bool,
     launch_status_copy: &'static str,
+    substrate_label: String,
     recent_activity: Vec<DashboardActivityItem>,
     has_recent_activity: bool,
 }
@@ -120,6 +125,7 @@ struct DashboardTemplate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OpenClawLaunchability {
     Launchable,
+    LegacySubstrate,
     UnexpectedRuntime,
     NotProvisioned,
     Provisioning,
@@ -137,12 +143,18 @@ impl OpenClawLaunchability {
             })
             .unwrap_or(false);
         let recoverable_vm_exists = row.and_then(|row| row.vm_id.as_deref()).is_some();
+        let is_incus_row = row
+            .map(|row| row.provider.eq_ignore_ascii_case("incus"))
+            .unwrap_or(false);
         if status.app_state == Some(crate::agent_api_v1_contract::AgentAppState::Ready)
             && status.startup_phase == Some(pika_agent_control_plane::AgentStartupPhase::Ready)
             && status.runtime_kind == Some(pika_agent_control_plane::MicrovmAgentKind::Openclaw)
+            && is_incus_row
             && recoverable_vm_exists
         {
             Self::Launchable
+        } else if row.is_some() && !is_incus_row {
+            Self::LegacySubstrate
         } else if status.runtime_kind == Some(pika_agent_control_plane::MicrovmAgentKind::Pi) {
             Self::UnexpectedRuntime
         } else if row.is_none() {
@@ -165,6 +177,9 @@ impl OpenClawLaunchability {
             Self::Launchable => {
                 "Open the built-in OpenClaw UI on its own platform-managed origin. Launch uses a short-lived platform ticket and a scoped UI session rather than the dashboard cookie."
             }
+            Self::LegacySubstrate => {
+                "This dashboard now launches OpenClaw only from Incus-backed managed environments. Reset this legacy environment to replace it with a fresh Incus-backed Managed OpenClaw runtime."
+            }
             Self::UnexpectedRuntime => {
                 "This managed environment was provisioned with the Pi runtime instead of OpenClaw. Reset or reprovision it before using the built-in OpenClaw UI."
             }
@@ -181,6 +196,18 @@ impl OpenClawLaunchability {
                 "OpenClaw launch becomes available once the managed environment is fully ready."
             }
         }
+    }
+}
+
+fn customer_dashboard_managed_vm_policy() -> ManagedVmProvisionParams {
+    ManagedVmProvisionParams {
+        provider: Some(ProviderKind::Incus),
+        microvm: Some(MicrovmProvisionParams {
+            spawner_url: None,
+            kind: Some(MicrovmAgentKind::Openclaw),
+            backend: Some(MicrovmAgentBackend::Native),
+        }),
+        incus: Some(IncusProvisionParams::default()),
     }
 }
 
@@ -422,6 +449,10 @@ fn dashboard_template(
     let launchability = OpenClawLaunchability::from_status(&status);
     let row = status.row;
     let runtime_kind = status.runtime_kind;
+    let is_incus_row = row
+        .as_ref()
+        .map(|row| row.provider.eq_ignore_ascii_case("incus"))
+        .unwrap_or(false);
     let inflight_without_vm = row
         .as_ref()
         .map(|row| {
@@ -466,25 +497,29 @@ fn dashboard_template(
         created_at: format_timestamp(row.as_ref().map(|row| row.created_at)),
         updated_at: format_timestamp(row.as_ref().map(|row| row.updated_at)),
         can_provision: row.is_none(),
-        can_recover: row.is_some() && !inflight_without_vm,
+        can_recover: row.is_some() && !inflight_without_vm && is_incus_row,
         can_reset: row.is_some() && !inflight_without_vm,
         control_loop_notice: if inflight_without_vm {
-            "Provisioning is already in flight. Recovery and reset stay locked until the current VM assignment finishes."
+            "Provisioning is already in flight. Recovery and reset stay locked until the current VM assignment finishes.".to_string()
+        } else if row.is_some() && !is_incus_row {
+            "This dashboard now manages Incus-backed environments. Destructive reset replaces the current legacy microVM environment with a fresh Incus-backed Managed OpenClaw runtime.".to_string()
         } else {
-            ""
+            String::new()
         },
-        has_control_loop_notice: inflight_without_vm,
+        has_control_loop_notice: inflight_without_vm || (row.is_some() && !is_incus_row),
         recover_action_label: if recoverable_vm_exists {
             "Recover Managed Environment"
         } else {
             "Provision Fresh Managed Environment"
         },
         recover_semantics_copy: if inflight_without_vm {
-            "stays locked while the initial VM assignment is still in flight. Wait for the current create request to finish before retrying any destructive action."
+            "stays locked while the initial VM assignment is still in flight. Wait for the current create request to finish before retrying any destructive action.".to_string()
+        } else if row.is_some() && !is_incus_row {
+            "is unavailable for legacy microVM rows. Use Destructive Reset to replace the current environment with a new Incus-backed Managed OpenClaw runtime.".to_string()
         } else if recoverable_vm_exists {
-            "asks the control plane to bring the managed environment back. If that VM is still recoverable, this path preserves the durable home. If the VM is already gone, Recover falls back to provisioning a fresh environment."
+            "asks the control plane to restart the current Incus appliance around the same persistent state volume. If that VM is already gone, Recover falls back to provisioning a fresh Incus environment.".to_string()
         } else {
-            "will provision a fresh Managed OpenClaw environment instead of restoring prior durable state because no recoverable VM is available."
+            "will provision a fresh Incus-backed Managed OpenClaw environment because no recoverable VM is available.".to_string()
         },
         backup_state_label: backup_state_label(backup.freshness),
         backup_state_tone: backup_state_tone(backup.freshness),
@@ -507,6 +542,13 @@ fn dashboard_template(
         },
         can_launch_openclaw: launchability.can_launch(),
         launch_status_copy: launchability.status_copy(),
+        substrate_label: if is_incus_row {
+            "Incus".to_string()
+        } else if row.is_some() {
+            "Legacy microVM".to_string()
+        } else {
+            "Incus".to_string()
+        },
         has_recent_activity: !recent_activity.is_empty(),
         recent_activity,
     }
@@ -715,12 +757,13 @@ pub async fn provision(
         return redirect_to_login(&state, true);
     };
     verify_action_csrf(&authenticated, &form)?;
+    let requested = customer_dashboard_managed_vm_policy();
 
     provision_managed_environment_if_missing(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;
@@ -737,12 +780,13 @@ pub async fn recover(
         return redirect_to_login(&state, true);
     };
     verify_action_csrf(&authenticated, &form)?;
+    let requested = customer_dashboard_managed_vm_policy();
 
     recover_agent_for_owner(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;
@@ -788,12 +832,13 @@ pub async fn reset(
             form.confirmation_token.as_deref(),
         )?;
     }
+    let requested = customer_dashboard_managed_vm_policy();
 
     reset_agent_for_owner(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;

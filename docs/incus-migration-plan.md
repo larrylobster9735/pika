@@ -314,8 +314,12 @@ Current transition status:
   state-volume snapshot, recover starts or restarts the current appliance around that volume, and
   restore rolls the state volume back to its latest snapshot before starting the appliance again
 - automatic state-volume snapshot creation policy and operator-selected restore points are still deferred
-- OpenClaw launch/proxy behavior remains intentionally unsupported in this phase
-- server startup should remain on the microVM default provider for now; request-scoped Incus provisioning is the current safe canary lane until the OpenClaw launch/proxy surface is migrated
+- the internal coworker dashboard path is now Incus-only:
+  `/dashboard` provision, recover, reset, launch, and same-origin OpenClaw proxying all route
+  through the Incus provider seam rather than the default backend
+- the Incus OpenClaw UI path currently uses Incus-managed host proxy ports on `pika-build`
+- server startup should remain on the microVM default provider for now, but the allowlisted
+  dashboard flow is no longer blocked on the old microVM customer path
 
 ### 2. Guest Image Pipeline
 
@@ -394,20 +398,20 @@ Incus should supply the lower-level primitives, not define our product vocabular
 
 ### 6. OpenClaw And Built-In UI Integration
 
-Today some OpenClaw launch and proxy behavior relies on spawner-specific APIs and host-side access
-to guest files.
+The internal dashboard path no longer depends on the spawner-specific customer flow.
 
-That needs to change.
+The first Incus dashboard implementation now does this:
 
-The Incus design should give us:
+- OpenClaw launch auth is read from the guest OpenClaw config through the Incus guest file API
+- the same-origin proxy targets an Incus-managed host endpoint for the guest gateway instead of a
+  spawner URL
+- the dashboard only advertises launchability for ready Incus-backed OpenClaw rows
 
-- a clean way to expose the managed UI service
-- a way to retrieve or inject launch credentials without reading guest config off the host
-- an auth boundary that still belongs to Pika, not directly to Incus
+What still remains open:
 
-This likely means the platform should either:
-
-- generate and store launch metadata in Pika-controlled state, or
+- hardening the least-privilege network exposure for those Incus-managed host proxy ports
+- deciding whether the long-term target should keep host proxy ports or move to a different
+  Incus-native ingress shape
 - retrieve it through a guest-facing control endpoint owned by the platform
 
 We should not preserve the old host-filesystem coupling.
@@ -526,8 +530,8 @@ Current validation shape:
 - the `pika-build` role in this phase is the Incus substrate; the agent API still comes from a `pika-server` process pointed at that Incus endpoint
 - `pika-server` should continue to deploy with `microvm` as the default provider and use explicit request-scoped Incus provisioning for internal canary validation
 - the concrete operator path for this phase lives in `docs/incus-dev-lane.md`
-- public validation currently reaches real create plus ready; delete is still validated through the provider seam and the existing dashboard reset path because there is not yet a public v1 delete endpoint
-- we should not flip `PIKA_AGENT_VM_PROVIDER=incus` globally until the customer-facing OpenClaw launch/proxy path is migrated or explicitly replaced
+- internal dashboard validation now reaches real create plus ready plus OpenClaw launch/proxy on Incus; delete is still validated through the provider seam and the existing dashboard reset path because there is not yet a public v1 delete endpoint
+- we should not flip `PIKA_AGENT_VM_PROVIDER=incus` globally until the broader product surface is intentionally migrated beyond the internal dashboard lane
 
 ### Phase 5: Backups, Restore, And Day-2 Operations
 
