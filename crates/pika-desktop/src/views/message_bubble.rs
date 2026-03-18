@@ -6,6 +6,7 @@ use pika_core::{
 
 use super::avatar::{avatar_circle, AvatarCache};
 use super::conversation::Message;
+use super::hypernote;
 use super::markdown;
 use crate::design::{self, BubblePosition};
 use crate::icons;
@@ -122,8 +123,12 @@ pub fn message_bubble<'a>(
         for attachment in &msg.media {
             bubble_content = bubble_content.push(media_attachment_view(attachment, &msg_id, true));
         }
-        bubble_content =
-            push_message_content(bubble_content, &msg.segments, &msg.display_content, true);
+        if let Some(hypernote) = msg.hypernote.as_ref() {
+            bubble_content = bubble_content.push(hypernote::render_hypernote(hypernote));
+        } else {
+            bubble_content =
+                push_message_content(bubble_content, &msg.segments, &msg.display_content, true);
+        }
         bubble_content = bubble_content.push(timestamp_row(timestamp, &msg.delivery, true));
         let bubble = container(bubble_content)
             .padding([10, 14])
@@ -186,8 +191,12 @@ pub fn message_bubble<'a>(
         for attachment in &msg.media {
             bubble_content = bubble_content.push(media_attachment_view(attachment, &msg_id, false));
         }
-        bubble_content =
-            push_message_content(bubble_content, &msg.segments, &msg.display_content, false);
+        if let Some(hypernote) = msg.hypernote.as_ref() {
+            bubble_content = bubble_content.push(hypernote::render_hypernote(hypernote));
+        } else {
+            bubble_content =
+                push_message_content(bubble_content, &msg.segments, &msg.display_content, false);
+        }
         bubble_content = bubble_content.push(timestamp_row(timestamp, &msg.delivery, false));
 
         let bubble = container(bubble_content)

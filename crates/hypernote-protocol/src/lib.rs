@@ -1,6 +1,13 @@
+mod document;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
+
+pub use document::{
+    HypernoteAttribute, HypernoteAttributeValue, HypernoteDocument, HypernoteNode,
+    HypernoteNodeType, ParsedHypernote, extract_submit_actions, parse_hypernote,
+};
 
 pub const HYPERNOTE_KIND: u16 = 9467;
 pub const HYPERNOTE_ACTION_RESPONSE_KIND: u16 = 9468;
