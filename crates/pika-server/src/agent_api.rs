@@ -33,12 +33,12 @@ use crate::nostr_auth::{
 use crate::{RequestContext, State};
 use pika_agent_control_plane::{
     AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams,
-    MicrovmAgentKind, MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth,
-    SpawnerVmBackupStatus, SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind,
-    VmRecoveryPointKind, GUEST_READY_MARKER_PATH,
+    MicrovmAgentKind, ProviderKind, SpawnerOpenClawLaunchAuth, SpawnerVmBackupStatus,
+    SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind, VmRecoveryPointKind,
+    GUEST_READY_MARKER_PATH,
 };
 use pika_agent_microvm::{
-    build_create_vm_request, resolve_params, ManagedVmCreateInput, ResolvedMicrovmAgentBackend,
+    build_create_vm_request, ManagedVmCreateInput, ResolvedMicrovmAgentBackend,
     ResolvedMicrovmAgentKind, ResolvedMicrovmParams,
 };
 use pika_relay_profiles::default_message_relays;
@@ -105,8 +105,6 @@ mod tests {
     use super::*;
     use crate::test_support::serial_test_guard;
     use axum::body::to_bytes;
-    use pika_agent_microvm::{ResolvedMicrovmAgentBackend, ResolvedMicrovmAgentKind};
-
     struct EnvGuard {
         prior: Vec<(&'static str, Option<String>)>,
     }
@@ -257,8 +255,6 @@ mod tests {
                 resolved.openclaw_proxy_host.as_deref(),
                 Some("203.0.113.10")
             );
-            assert_eq!(resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw);
-            assert_eq!(resolved.agent_backend, ResolvedMicrovmAgentBackend::Native);
         });
     }
 
@@ -269,8 +265,6 @@ mod tests {
             match config {
                 ResolvedManagedVmProviderConfig::Incus(resolved) => {
                     assert_eq!(resolved.project, "pika-managed-agents");
-                    assert_eq!(resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw);
-                    assert_eq!(resolved.agent_backend, ResolvedMicrovmAgentBackend::Native);
                 }
             }
         });
@@ -287,8 +281,6 @@ mod tests {
             insecure_tls: true,
             openclaw_guest_ipv4_cidr: Some("10.200.0.10/24".to_string()),
             openclaw_proxy_host: Some("203.0.113.10".to_string()),
-            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
-            agent_backend: ResolvedMicrovmAgentBackend::Native,
         });
         let params = materialized_managed_vm_params(&config);
         assert_eq!(params.provider, Some(ProviderKind::Incus));
@@ -320,8 +312,6 @@ mod tests {
             insecure_tls: true,
             openclaw_guest_ipv4_cidr: None,
             openclaw_proxy_host: None,
-            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
-            agent_backend: ResolvedMicrovmAgentBackend::Native,
         });
         let json = serialize_managed_vm_provider_config(&config).expect("serialize config");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse config json");
@@ -489,8 +479,6 @@ struct ResolvedIncusParams {
     insecure_tls: bool,
     openclaw_guest_ipv4_cidr: Option<String>,
     openclaw_proxy_host: Option<String>,
-    agent_kind: ResolvedMicrovmAgentKind,
-    agent_backend: ResolvedMicrovmAgentBackend,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1121,20 +1109,12 @@ impl IncusManagedVmProvider {
                 "load configured incus image alias",
             )
             .await?;
-        if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
-            self.ensure_customer_openclaw_flow_supported()
-                .context("validate incus OpenClaw dashboard support")?;
-            self.openclaw_proxy_host_ipv4()
-                .context("validate incus OpenClaw dashboard access plan")?;
-        }
+        self.ensure_customer_openclaw_flow_supported()
+            .context("validate incus OpenClaw dashboard support")?;
         Ok(())
     }
 
     fn ensure_customer_openclaw_flow_supported(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw),
-            "configured Incus customer flow requires the OpenClaw runtime"
-        );
         self.openclaw_guest_ipv4_network()
             .context("configured Incus customer flow requires a static guest IPv4 subnet")?;
         self.openclaw_proxy_host_ipv4()
@@ -1620,7 +1600,7 @@ impl IncusManagedVmProvider {
                 Ok(SpawnerVmResponse {
                     id: vm_id,
                     status: "starting".to_string(),
-                    agent_kind: Some(agent_kind_from_resolved(self.resolved.agent_kind)),
+                    agent_kind: Some(MicrovmAgentKind::Openclaw),
                     startup_probe_satisfied: false,
                     guest_ready: false,
                 })
@@ -1658,7 +1638,7 @@ impl IncusManagedVmProvider {
         Ok(SpawnerVmResponse {
             id: vm_id.to_string(),
             status: status.to_string(),
-            agent_kind: Some(agent_kind_from_resolved(self.resolved.agent_kind)),
+            agent_kind: Some(MicrovmAgentKind::Openclaw),
             startup_probe_satisfied: guest_ready,
             guest_ready,
         })
@@ -1880,12 +1860,7 @@ impl IncusManagedVmProvider {
                 "path": INCUS_PERSISTENT_VOLUME_PATH,
             }),
         );
-        let openclaw_nic_network =
-            if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
-                Some(self.load_primary_nic_network_name(request_id).await?)
-            } else {
-                None
-            };
+        let openclaw_nic_network = self.load_primary_nic_network_name(request_id).await?;
 
         let cloud_init_user_data = self
             .cloud_init_user_data(input)
@@ -1909,44 +1884,34 @@ impl IncusManagedVmProvider {
             ),
             (
                 "user.pika.agent_kind".to_string(),
-                serde_json::Value::String(
-                    match self.resolved.agent_kind {
-                        ResolvedMicrovmAgentKind::Pi => "pi",
-                        ResolvedMicrovmAgentKind::Openclaw => "openclaw",
-                    }
-                    .to_string(),
-                ),
+                serde_json::Value::String("openclaw".to_string()),
             ),
         ]);
-        if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
-            let proxy_host = self.openclaw_proxy_host_ipv4()?;
-            let (proxy_port, guest_ipv4) = self
-                .allocate_openclaw_proxy_binding(vm_id, None, None, request_id)
-                .await?;
-            instance_config.insert(
-                INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY.to_string(),
-                serde_json::Value::String(proxy_host.to_string()),
-            );
-            instance_config.insert(
-                INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY.to_string(),
-                serde_json::Value::String(proxy_port.to_string()),
-            );
-            instance_config.insert(
-                INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY.to_string(),
-                serde_json::Value::String(guest_ipv4.to_string()),
-            );
-            devices.insert(
-                INCUS_PRIMARY_NIC_DEVICE_NAME.to_string(),
-                serde_json::json!({
-                    "type": "nic",
-                    "network": openclaw_nic_network
-                        .as_deref()
-                        .expect("OpenClaw create must resolve a primary nic network"),
-                    "name": INCUS_PRIMARY_NIC_DEVICE_NAME,
-                    "ipv4.address": guest_ipv4.to_string(),
-                }),
-            );
-        }
+        let proxy_host = self.openclaw_proxy_host_ipv4()?;
+        let (proxy_port, guest_ipv4) = self
+            .allocate_openclaw_proxy_binding(vm_id, None, None, request_id)
+            .await?;
+        instance_config.insert(
+            INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY.to_string(),
+            serde_json::Value::String(proxy_host.to_string()),
+        );
+        instance_config.insert(
+            INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY.to_string(),
+            serde_json::Value::String(proxy_port.to_string()),
+        );
+        instance_config.insert(
+            INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY.to_string(),
+            serde_json::Value::String(guest_ipv4.to_string()),
+        );
+        devices.insert(
+            INCUS_PRIMARY_NIC_DEVICE_NAME.to_string(),
+            serde_json::json!({
+                "type": "nic",
+                "network": openclaw_nic_network,
+                "name": INCUS_PRIMARY_NIC_DEVICE_NAME,
+                "ipv4.address": guest_ipv4.to_string(),
+            }),
+        );
         let body = serde_json::json!({
             "name": vm_id,
             "type": INCUS_VM_KIND,
@@ -2109,8 +2074,8 @@ impl IncusManagedVmProvider {
             input.bot_pubkey_hex,
             &ResolvedMicrovmParams {
                 spawner_url: String::new(),
-                kind: self.resolved.agent_kind,
-                backend: self.resolved.agent_backend.clone(),
+                kind: ResolvedMicrovmAgentKind::Openclaw,
+                backend: ResolvedMicrovmAgentBackend::Native,
             },
         );
         let guest_autostart = bootstrap_request.guest_autostart;
@@ -2193,10 +2158,7 @@ impl IncusManagedVmProvider {
         if !marker.ready {
             return false;
         }
-        let expected_agent_kind = match self.resolved.agent_kind {
-            ResolvedMicrovmAgentKind::Pi => "pi",
-            ResolvedMicrovmAgentKind::Openclaw => "openclaw",
-        };
+        let expected_agent_kind = "openclaw";
         if marker.agent_kind.as_deref() != Some(expected_agent_kind) {
             tracing::warn!(
                 vm_id = %vm_id,
@@ -2777,13 +2739,6 @@ fn incus_profile_has_nic_device(profile: &serde_json::Value) -> bool {
                 .values()
                 .any(|device| device.get("type").and_then(serde_json::Value::as_str) == Some("nic"))
         })
-}
-
-fn agent_kind_from_resolved(kind: ResolvedMicrovmAgentKind) -> MicrovmAgentKind {
-    match kind {
-        ResolvedMicrovmAgentKind::Pi => MicrovmAgentKind::Pi,
-        ResolvedMicrovmAgentKind::Openclaw => MicrovmAgentKind::Openclaw,
-    }
 }
 
 fn bootstrap_file_permissions(path: &str) -> &'static str {
@@ -3645,11 +3600,6 @@ fn resolved_incus_params(
             provider
         );
     }
-    let guest_selection = resolve_params(&MicrovmProvisionParams {
-        spawner_url: None,
-        kind: Some(MicrovmAgentKind::Openclaw),
-        backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
-    });
     let endpoint = required_non_empty_field(params.endpoint, "incus.endpoint", INCUS_ENDPOINT_ENV)?;
     let mut endpoint_url = Url::parse(&endpoint)
         .with_context(|| format!("incus.endpoint must be a valid URL, got {endpoint:?}"))?;
@@ -3677,8 +3627,6 @@ fn resolved_incus_params(
         insecure_tls: params.insecure_tls.unwrap_or(false),
         openclaw_guest_ipv4_cidr: params.openclaw_guest_ipv4_cidr,
         openclaw_proxy_host: params.openclaw_proxy_host,
-        agent_kind: guest_selection.kind,
-        agent_backend: guest_selection.backend,
     })
 }
 
