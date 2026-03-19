@@ -364,16 +364,16 @@ These wrappers:
 - default to `https://api.pikachat.org` unless `PIKA_AGENT_API_BASE_URL` or `PIKA_SERVER_URL` is set
 - request `provider=incus` explicitly
 - default to the hosted Incus lane on `pika-build`
+- default to the OpenClaw native runtime because that is the usable conversational managed-agent path
 - use normal `pika-server` ensure or recover semantics instead of direct `vm-spawner` deletion
 
-The default demo runtime is still the Pi ACP path because it gives the shortest repeatable
-Marmot message loop. Override it with the neutral runtime-selection env vars if you want to
-exercise a different managed guest:
+If you want to exercise the Pi daemon path instead, override it with the neutral
+runtime-selection env vars:
 
 ```bash
-PIKA_AGENT_RUNTIME_KIND=openclaw \
-PIKA_AGENT_RUNTIME_BACKEND=native \
-just agent-incus-chat "hello from OpenClaw on Incus"
+PIKA_AGENT_RUNTIME_KIND=pi \
+PIKA_AGENT_RUNTIME_BACKEND=acp \
+just agent-incus-chat "hello from the Incus Pi daemon lane"
 ```
 
 Legacy compatibility aliases still work for older shells and scripts:

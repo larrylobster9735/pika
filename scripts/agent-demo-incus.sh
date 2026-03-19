@@ -9,7 +9,7 @@ load_local_env "$ROOT"
 set_agent_api_base_url_default remote-demo
 require_agent_api_nsec
 set_agent_incus_lane_defaults
-set_agent_runtime_defaults pi
+set_agent_runtime_defaults openclaw
 
 STATE_DIR="${PIKA_AGENT_DEMO_STATE_DIR:-$ROOT/.tmp/agent-cli-incus}"
 LISTEN_TIMEOUT="${PIKA_AGENT_DEMO_LISTEN_TIMEOUT:-90}"
