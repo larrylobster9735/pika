@@ -2880,7 +2880,7 @@ fn managed_environment_status_copy(
     }
 }
 
-fn managed_environment_backup_status_from_spawner(
+fn managed_environment_backup_status_from_provider(
     backup: SpawnerVmBackupStatus,
 ) -> ManagedEnvironmentBackupStatus {
     let freshness = match backup.freshness {
@@ -2891,11 +2891,11 @@ fn managed_environment_backup_status_from_spawner(
     };
     let backup_target = (!backup.backup_target.trim().is_empty()).then_some(backup.backup_target);
     let backup_target_label = match backup.backup_unit_kind {
-        VmBackupUnitKind::DurableHome => "Durable Home".to_string(),
+        VmBackupUnitKind::DurableHome => "Legacy Recovery Target".to_string(),
         VmBackupUnitKind::PersistentStateVolume => "State Volume".to_string(),
     };
     let recovery_point_label = match backup.recovery_point_kind {
-        VmRecoveryPointKind::MetadataRecord => "durable-home backup record",
+        VmRecoveryPointKind::MetadataRecord => "recovery record",
         VmRecoveryPointKind::VolumeSnapshot => "state-volume snapshot",
     };
     let latest_successful_backup_at = backup
@@ -3236,22 +3236,22 @@ pub(crate) async fn load_managed_environment_backup_status(
                 "failed to resolve managed VM provider while loading backup status"
             );
             return unavailable_backup_status(
-                "Backup protection could not be verified because the backup host control plane is unavailable.",
+                "Recovery-point protection could not be verified because the managed-environment control path is unavailable.",
             );
         }
     };
     match provider.get_vm_backup_status(vm_id, Some(request_id)).await {
-        Ok(backup) => managed_environment_backup_status_from_spawner(backup),
+        Ok(backup) => managed_environment_backup_status_from_provider(backup),
         Err(err) => {
             tracing::warn!(
                 request_id = %request_id,
                 agent_id = %row.agent_id,
                 vm_id = %vm_id,
                 error = %err,
-                "failed to load backup status from spawner"
+                "failed to load backup status from managed VM provider"
             );
             unavailable_backup_status(
-                "Backup protection could not be verified from the control plane right now.",
+                "Recovery-point protection could not be verified from the control plane right now.",
             )
         }
     }
@@ -4253,7 +4253,7 @@ pub(crate) async fn restore_managed_environment_from_backup(
     };
 
     let restore_requested_message = format!(
-        "Restore from backup requested for Managed OpenClaw on VM {vm_id}. The current state volume will be rolled back to the latest recovery snapshot before the environment is restarted."
+        "Restore from recovery point requested for Managed OpenClaw on VM {vm_id}. The current state volume will be rolled back to the latest recovery snapshot before the environment is restarted."
     );
     record_managed_environment_event(
         &mut conn,
@@ -4297,7 +4297,7 @@ pub(crate) async fn restore_managed_environment_from_backup(
                         Some(&active.agent_id),
                         Some(&vm_id),
                         EVENT_RESTORE_FAILED,
-                        "Restore from backup failed. The managed environment was left in error for operator review.",
+                        "Restore from recovery point failed. The managed environment was left in error for operator review.",
                         Some(request_id),
                     )?;
                     Ok(active.clone())
@@ -4322,7 +4322,7 @@ pub(crate) async fn restore_managed_environment_from_backup(
                 Some(&restored.id),
             )?;
             let message = format!(
-                "Restore from backup succeeded. Managed OpenClaw is starting again on VM {} with restored state-volume contents.",
+                "Restore from recovery point succeeded. Managed OpenClaw is starting again on VM {} with restored state-volume contents.",
                 restored.id
             );
             insert_managed_environment_event(

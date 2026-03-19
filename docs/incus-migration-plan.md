@@ -330,6 +330,38 @@ Current transition status:
 - server startup should remain on the microVM default provider for now, but the allowlisted
   dashboard flow is no longer blocked on the old microVM customer path
 
+### Lessons From Real Dogfooding
+
+- reset across provider migration must destroy the old environment via the stored row provider
+  first, then reprovision using the new requested policy; otherwise the control plane tries to
+  interpret an old row through the wrong substrate
+- Incus mutating APIs may return either sync or async responses for the same logical operation, so
+  the client must accept both shapes instead of assuming one response mode
+- the current internal OpenClaw ingress works by combining:
+  - an Incus-managed host proxy port on `pika-build`
+  - a guest-side OpenClaw gateway listener
+  - guest firewall allowance for that gateway port
+- that ingress shape is tactical, not the desired long-term product shape; it works today, but it
+  still mutates per-instance proxy devices on demand and should likely be simplified later
+- guest secret injection exists today for the internal lane and currently rides the guest bootstrap
+  path; it needs a more deliberate long-term model for provenance, rotation, and auditability
+- the customer dashboard path is now Incus-only internally, but the broader platform still carries
+  transitional contract debt for old microVM rows and compatibility-oriented API shapes
+
+### Focused Simplification Debt
+
+The next high-signal simplification targets are:
+
+- split runtime kind/backend selection from VM substrate selection more cleanly so Incus is not
+  still carrying `microvm`-shaped runtime knobs in product-facing request types
+- simplify Incus OpenClaw ingress so less instance mutation happens on demand and the proxy target
+  is more static and obvious
+- decide on a deliberate guest secret injection model instead of growing more bootstrap-time env
+  stamping ad hoc
+- retire legacy microVM customer-row compatibility once the old internal rows are gone
+- automate snapshot creation policy for the Incus state volume so recovery-point protection is not
+  purely operator-managed
+
 ### 2. Guest Image Pipeline
 
 We need a new image pipeline for managed agents.

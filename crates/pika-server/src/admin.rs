@@ -572,7 +572,7 @@ pub async fn dashboard(
             restore_blocked_reason: if row.vm_id.is_some() {
                 String::new()
             } else {
-                "Restore from backup requires a current VM assignment.".to_string()
+                "Restore requires a current VM assignment.".to_string()
             },
         });
     }
@@ -608,7 +608,7 @@ pub async fn restore_confirm_page(
     let Some(vm_id) = row.vm_id.as_deref() else {
         return Err((
             StatusCode::CONFLICT,
-            "restore from backup requires a current VM assignment".to_string(),
+            "restore requires a current VM assignment".to_string(),
         ));
     };
     let backup = load_managed_environment_backup_status(&status, &request_context.request_id).await;
@@ -673,7 +673,7 @@ pub async fn restore_from_backup(
     let Some(vm_id) = row.vm_id.as_deref() else {
         return Err((
             StatusCode::CONFLICT,
-            "restore from backup requires a current VM assignment".to_string(),
+            "restore requires a current VM assignment".to_string(),
         ));
     };
     verify_restore_confirmation_ticket(
@@ -1182,12 +1182,12 @@ mod tests {
             .await
             .expect("dashboard response");
         let body = response_body_string(response).await;
-        assert!(body.contains("Managed Environment Backups"));
+        assert!(body.contains("Managed Environment Recovery Protection"));
         assert!(body.contains("agent-admin-backup"));
         assert!(body.contains("vm-admin-backup"));
         assert!(body.contains("healthy"));
         assert!(body.contains("/var/lib/microvms/vm-admin-backup/home"));
-        assert!(body.contains("Review Restore From Backup"));
+        assert!(body.contains("Review Restore From Recovery Point"));
 
         clear_test_database(&db_pool);
     }
@@ -1244,7 +1244,7 @@ mod tests {
         .await
         .expect("restore confirm response");
         let body = response_body_string(response).await;
-        assert!(body.contains("Confirm Restore From Backup"));
+        assert!(body.contains("Confirm Restore From Recovery Point"));
         assert!(body.contains("agent-admin-restore"));
         assert!(body.contains("vm-admin-restore"));
         assert!(body.contains("stale"));

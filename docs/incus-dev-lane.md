@@ -230,6 +230,35 @@ ssh pika-build incus storage volume list default --project pika-managed-agents
 ssh pika-build incus file pull --project pika-managed-agents <vm_id>/workspace/pika-agent/service-ready.json -
 ```
 
+## Repeated Dogfood Checks
+
+For repeated internal checks after reset, recover, or restore, use the helper:
+
+```bash
+scripts/incus-dogfood-check.sh \
+  --api-base-url https://api.pikachat.org \
+  --nsec '<coworker nsec>' \
+  --remote-host pika-build \
+  --project pika-managed-agents \
+  --storage-pool default
+```
+
+That prints:
+
+- current API-visible `state` and `startup_phase`
+- the assigned `vm_id`
+- whether the Incus instance exists
+- whether the matching `-state` volume exists
+- the current guest ready marker, when present
+
+For a repeated internal dashboard check, the shortest useful loop is now:
+
+1. open `https://api.pikachat.org/dashboard`
+2. reset or recover the environment
+3. run `scripts/incus-dogfood-check.sh ...`
+4. refresh the dashboard until `state=ready` and `startup_phase=ready`
+5. click OpenClaw and confirm the UI loads on `openclaw.api.pikachat.org`
+
 ## Incus Operational Lifecycle Model
 
 The first Incus operational model is intentionally narrow and volume-centric.

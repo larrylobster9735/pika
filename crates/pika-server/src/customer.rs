@@ -125,7 +125,7 @@ struct DashboardTemplate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OpenClawLaunchability {
     Launchable,
-    LegacySubstrate,
+    ReplaceRequired,
     UnexpectedRuntime,
     NotProvisioned,
     Provisioning,
@@ -154,7 +154,7 @@ impl OpenClawLaunchability {
         {
             Self::Launchable
         } else if row.is_some() && !is_incus_row {
-            Self::LegacySubstrate
+            Self::ReplaceRequired
         } else if status.runtime_kind == Some(pika_agent_control_plane::MicrovmAgentKind::Pi) {
             Self::UnexpectedRuntime
         } else if row.is_none() {
@@ -177,8 +177,8 @@ impl OpenClawLaunchability {
             Self::Launchable => {
                 "Open the built-in OpenClaw UI on its own platform-managed origin. Launch uses a short-lived platform ticket and a scoped UI session rather than the dashboard cookie."
             }
-            Self::LegacySubstrate => {
-                "This dashboard now launches OpenClaw only from Incus-backed managed environments. Reset this legacy environment to replace it with a fresh Incus-backed Managed OpenClaw runtime."
+            Self::ReplaceRequired => {
+                "This older managed environment predates the current Incus dashboard lane. Destructive reset replaces it with a fresh Incus-backed Managed OpenClaw runtime."
             }
             Self::UnexpectedRuntime => {
                 "This managed environment was provisioned with the Pi runtime instead of OpenClaw. Reset or reprovision it before using the built-in OpenClaw UI."
@@ -196,6 +196,21 @@ impl OpenClawLaunchability {
                 "OpenClaw launch becomes available once the managed environment is fully ready."
             }
         }
+    }
+}
+
+fn is_legacy_customer_row(row: Option<&crate::models::agent_instance::AgentInstance>) -> bool {
+    row.map(|row| !row.provider.eq_ignore_ascii_case("incus"))
+        .unwrap_or(false)
+}
+
+fn dashboard_substrate_label(
+    row: Option<&crate::models::agent_instance::AgentInstance>,
+) -> &'static str {
+    if row.is_none() || !is_legacy_customer_row(row) {
+        "Incus"
+    } else {
+        "Older environment awaiting replacement"
     }
 }
 
@@ -449,10 +464,8 @@ fn dashboard_template(
     let launchability = OpenClawLaunchability::from_status(&status);
     let row = status.row;
     let runtime_kind = status.runtime_kind;
-    let is_incus_row = row
-        .as_ref()
-        .map(|row| row.provider.eq_ignore_ascii_case("incus"))
-        .unwrap_or(false);
+    let is_legacy_row = is_legacy_customer_row(row.as_ref());
+    let is_incus_row = !is_legacy_row;
     let inflight_without_vm = row
         .as_ref()
         .map(|row| {
@@ -501,12 +514,12 @@ fn dashboard_template(
         can_reset: row.is_some() && !inflight_without_vm,
         control_loop_notice: if inflight_without_vm {
             "Provisioning is already in flight. Recovery and reset stay locked until the current VM assignment finishes.".to_string()
-        } else if row.is_some() && !is_incus_row {
-            "This dashboard now manages Incus-backed environments. Destructive reset replaces the current legacy microVM environment with a fresh Incus-backed Managed OpenClaw runtime.".to_string()
+        } else if row.is_some() && is_legacy_row {
+            "This dashboard now drives the Incus managed-environment lane. Destructive reset replaces this older environment with a fresh Incus-backed Managed OpenClaw runtime.".to_string()
         } else {
             String::new()
         },
-        has_control_loop_notice: inflight_without_vm || (row.is_some() && !is_incus_row),
+        has_control_loop_notice: inflight_without_vm || (row.is_some() && is_legacy_row),
         recover_action_label: if recoverable_vm_exists {
             "Recover Managed Environment"
         } else {
@@ -514,8 +527,8 @@ fn dashboard_template(
         },
         recover_semantics_copy: if inflight_without_vm {
             "stays locked while the initial VM assignment is still in flight. Wait for the current create request to finish before retrying any destructive action.".to_string()
-        } else if row.is_some() && !is_incus_row {
-            "is unavailable for legacy microVM rows. Use Destructive Reset to replace the current environment with a new Incus-backed Managed OpenClaw runtime.".to_string()
+        } else if row.is_some() && is_legacy_row {
+            "is unavailable for older pre-Incus rows. Use Destructive Reset to replace the current environment with a new Incus-backed Managed OpenClaw runtime.".to_string()
         } else if recoverable_vm_exists {
             "asks the control plane to restart the current Incus appliance around the same persistent state volume. If that VM is already gone, Recover falls back to provisioning a fresh Incus environment.".to_string()
         } else {
@@ -542,13 +555,7 @@ fn dashboard_template(
         },
         can_launch_openclaw: launchability.can_launch(),
         launch_status_copy: launchability.status_copy(),
-        substrate_label: if is_incus_row {
-            "Incus".to_string()
-        } else if row.is_some() {
-            "Legacy microVM".to_string()
-        } else {
-            "Incus".to_string()
-        },
+        substrate_label: dashboard_substrate_label(row.as_ref()).to_string(),
         has_recent_activity: !recent_activity.is_empty(),
         recent_activity,
     }
@@ -1491,7 +1498,7 @@ mod tests {
         let body = response_body_string(response).await;
         assert!(body.contains("Recovery Protection"));
         assert!(body.contains("healthy"));
-        assert!(body.contains("A recent durable-home backup record is available"));
+        assert!(body.contains("A recent recovery record is available"));
         assert!(body.contains("/var/lib/microvms/vm-backup-healthy/home"));
         assert!(body.contains("Destructive Reset"));
         assert!(!body.contains("Review Destructive Reset"));
@@ -2735,7 +2742,7 @@ mod tests {
         let body = response_body_string(response).await;
         assert!(body.contains("Confirm Destructive Reset"));
         assert!(body.contains("Reset Without Recent Recovery Point"));
-        assert!(body.contains("No durable-home backup record is known yet"));
+        assert!(body.contains("No recovery record is known yet"));
 
         clear_test_database(&db_pool);
     }
