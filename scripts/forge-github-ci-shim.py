@@ -256,7 +256,7 @@ def find_lane(manifest: dict, mode: str, lane_id: str) -> dict:
 def cmd_run(args: argparse.Namespace) -> int:
     manifest = load_manifest(manifest_path())
     lane = find_lane(manifest, args.mode, args.lane_id)
-    command = list(lane["command"])
+    command = lane_command(lane)
     print(f"running {lane['title']}: {shlex.join(command)}", flush=True)
     completed = subprocess.run(command, cwd=repo_root())
     return completed.returncode
