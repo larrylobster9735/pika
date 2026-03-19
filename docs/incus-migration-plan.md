@@ -318,6 +318,8 @@ Current transition status:
   `/dashboard` provision, recover, reset, launch, and same-origin OpenClaw proxying all route
   through the Incus provider seam rather than the default backend
 - the Incus OpenClaw UI path currently uses Incus-managed host proxy ports on `pika-build`
+- the Incus guest image now explicitly opens the OpenClaw gateway port inside the guest so the
+  host-side Incus proxy device can reach the gateway over the guest VM IP
 - server startup should remain on the microVM default provider for now, but the allowlisted
   dashboard flow is no longer blocked on the old microVM customer path
 

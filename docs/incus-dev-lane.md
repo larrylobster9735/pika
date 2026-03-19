@@ -67,6 +67,7 @@ The image is a NixOS VM image for the Incus dev lane. It includes:
 - `pikachat`
 - the OpenClaw gateway runtime dependency currently used by the managed-agent bootstrap bundle
 - the base directories expected by the managed-agent service
+- guest firewall allowance for the OpenClaw gateway port used by the host-side Incus proxy device
 
 ## Deploy `pika-build` With Incus Enabled
 
@@ -209,6 +210,13 @@ Expected results:
 7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
 
 The first authenticated canary for this flow now succeeds on the canonical `pika-build` host shape.
+The deployed internal dashboard flow on `api.pikachat.org/dashboard` now also succeeds end to end:
+
+- login with the normal dashboard flow
+- reset/reprovision an Incus-backed environment
+- wait for `state=ready` and `startup_phase=ready`
+- click OpenClaw
+- load the OpenClaw UI and its static assets through `openclaw.api.pikachat.org`
 
 Operator checks:
 
