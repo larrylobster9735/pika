@@ -910,13 +910,18 @@ fi
 
 write_ready_marker() {{
   local probe="$1"
+  local boot_id=""
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    boot_id="$(tr -d '\n' < /proc/sys/kernel/random/boot_id)"
+  fi
   cat >"$ready_path" <<EOF
 {{
   "ready": true,
   "agent_kind": "${{agent_kind}}",
   "backend_mode": "${{backend_mode}}",
   "service_kind": "${{service_kind}}",
-  "probe": "${{probe}}"
+  "probe": "${{probe}}",
+  "boot_id": "${{boot_id}}"
 }}
 EOF
   rm -f "$failed_path"
@@ -1135,6 +1140,7 @@ start_service() {{
       openclaw_exec="$(plan_value '.service.exec_command')"
       openclaw_state_dir="$(plan_value '.service.state_dir')"
       openclaw_config_path="$(workspace_path "$(plan_value '.service.config_path')")"
+      openclaw_workspace_root="$(dirname "$openclaw_config_path")"
       openclaw_package_root="${{PIKA_OPENCLAW_PACKAGE_ROOT:-$(dirname "$(dirname "$openclaw_exec")")/lib/openclaw}}"
       gateway_port="$(plan_value '.service.gateway_port | tostring')"
       if [[ -z "$openclaw_exec" ]]; then
@@ -1161,8 +1167,12 @@ start_service() {{
       mkdir -p "$openclaw_state_dir/node_modules"
       rm -rf "$openclaw_state_dir/node_modules/openclaw"
       ln -s "$openclaw_package_root" "$openclaw_state_dir/node_modules/openclaw"
+      mkdir -p "$openclaw_workspace_root/node_modules"
+      rm -rf "$openclaw_workspace_root/node_modules/openclaw"
+      ln -s "$openclaw_package_root" "$openclaw_workspace_root/node_modules/openclaw"
       export OPENCLAW_STATE_DIR="$openclaw_state_dir"
       export OPENCLAW_CONFIG_PATH="$openclaw_config_path"
+      export NODE_PATH="$openclaw_state_dir/node_modules${{NODE_PATH:+:$NODE_PATH}}"
       export PIKACHAT_DAEMON_CMD="$bin"
       export PIKACHAT_SIDECAR_CMD="$bin"
       export OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1
@@ -1174,7 +1184,9 @@ start_service() {{
       echo "[microvm-agent] starting OpenClaw gateway via $openclaw_exec" >&2
       "$openclaw_exec" gateway --allow-unconfigured &
       agent_pid=$!
-      start_openclaw_private_proxy "$PIKA_VM_IP" "$gateway_port"
+      if [[ "${{PIKA_ENABLE_OPENCLAW_PRIVATE_PROXY:-1}}" != "0" ]]; then
+        start_openclaw_private_proxy "$PIKA_VM_IP" "$gateway_port"
+      fi
       ;;
     *)
       echo "[microvm-agent] unsupported startup service kind: $service_kind" >&2
@@ -2117,6 +2129,14 @@ done
         assert!(script.contains(
             "ln -s \"$openclaw_package_root\" \"$openclaw_state_dir/node_modules/openclaw\""
         ));
+        assert!(script.contains("mkdir -p \"$openclaw_workspace_root/node_modules\""));
+        assert!(script.contains("rm -rf \"$openclaw_workspace_root/node_modules/openclaw\""));
+        assert!(script.contains(
+            "ln -s \"$openclaw_package_root\" \"$openclaw_workspace_root/node_modules/openclaw\""
+        ));
+        assert!(script.contains(
+            "export NODE_PATH=\"$openclaw_state_dir/node_modules${NODE_PATH:+:$NODE_PATH}\""
+        ));
         assert!(script.contains("export PIKACHAT_DAEMON_CMD=\"$bin\""));
         assert!(script.contains("export PIKACHAT_SIDECAR_CMD=\"$bin\""));
         assert!(script.contains("OpenClaw gateway exec must be a binary path"));
@@ -2706,7 +2726,7 @@ done
     async fn get_vm_backup_status_contract_request_shape() {
         let (base_url, rx) = spawn_one_shot_server(
             "200 OK",
-            r#"{"vm_id":"vm-123","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-123/home","successful_backup_known":true,"freshness":"healthy","latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
+            r#"{"vm_id":"vm-123","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-123/home","recovery_point_kind":"metadata_record","freshness":"healthy","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
         );
         let client = MicrovmSpawnerClient::new(base_url);
 
@@ -2715,7 +2735,7 @@ done
             .await
             .expect("get backup status succeeds");
         assert_eq!(status.vm_id, "vm-123");
-        assert!(status.successful_backup_known);
+        assert_eq!(status.backup_target, "/var/lib/microvms/vm-123/home");
 
         let captured = rx
             .recv_timeout(StdDuration::from_secs(2))

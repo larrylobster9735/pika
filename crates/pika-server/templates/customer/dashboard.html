@@ -213,6 +213,10 @@
               <dt>Template</dt>
               <dd>{{ template_name }}</dd>
             </div>
+            <div>
+              <dt>Managed substrate</dt>
+              <dd>{{ substrate_label }}</dd>
+            </div>
           </dl>
         </section>
 
@@ -247,7 +251,7 @@
             {% if can_provision %}
             <form method="post" action="/dashboard/provision">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-              <button type="submit">Provision Managed OpenClaw</button>
+              <button type="submit">Provision Managed OpenClaw on Incus</button>
             </form>
             {% endif %}
 
@@ -274,20 +278,26 @@
         </section>
 
         <section class="card">
-          <h2>Backup Protection</h2>
+          <h2>Recovery Protection</h2>
           <div class="pill tone-{{ backup_state_tone }}" style="margin-bottom:14px">
             <span>{{ backup_state_label }}</span>
           </div>
           <p>{{ backup_status_copy }}</p>
           <dl>
             <div>
-              <dt>Latest successful backup</dt>
+              <dt>Latest recovery point</dt>
               <dd>{{ backup_last_successful_at }}</dd>
             </div>
-            {% if has_backup_host %}
+            {% if has_backup_latest_recovery_point_name %}
             <div>
-              <dt>Backup host</dt>
-              <dd><code>{{ backup_host }}</code></dd>
+              <dt>Recovery point name</dt>
+              <dd><code>{{ backup_latest_recovery_point_name }}</code></dd>
+            </div>
+            {% endif %}
+            {% if has_backup_target %}
+            <div>
+              <dt>{{ backup_target_label }}</dt>
+              <dd><code>{{ backup_target }}</code></dd>
             </div>
             {% endif %}
           </dl>

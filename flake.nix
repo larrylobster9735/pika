@@ -395,7 +395,7 @@
         ln -s "$qcow2_path" "$out/disk.qcow2"
         cat >"$out/README.txt" <<'EOF'
         Build:
-          nix build .#pika-agent-incus-dev-image
+          nix build .#packages.x86_64-linux.pika-agent-incus-dev-image
 
         Import on a remote Incus dev host:
           ./scripts/incus-dev-image.sh build-import --remote-host pika-build --alias pika-agent/dev
@@ -1057,17 +1057,6 @@ EOF
             sops-nix.nixosModules.sops
             microvm.nixosModules.host
             (import ./infra/nix/hosts/builder.nix)
-          ];
-        };
-
-        pika-build-incus-dev = nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          specialArgs = { inherit self sops-nix vmSpawnerPkg piAgentPkg openclawGatewayPkg pikaNewsPkg pikachatPkg pikaciServerPkg; };
-          modules = [
-            disko.nixosModules.disko
-            sops-nix.nixosModules.sops
-            microvm.nixosModules.host
-            (import ./infra/nix/hosts/builder-incus-dev.nix)
           ];
         };
 

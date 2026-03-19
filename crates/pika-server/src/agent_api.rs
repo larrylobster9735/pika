@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use base64::Engine;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel::Connection;
 use diesel::PgConnection;
+use ipnet::Ipv4Net;
 use nostr_sdk::prelude::{Keys, PublicKey};
 use nostr_sdk::ToBech32;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -32,7 +34,8 @@ use crate::{RequestContext, State};
 use pika_agent_control_plane::{
     AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams,
     MicrovmAgentKind, MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth,
-    SpawnerVmBackupStatus, SpawnerVmResponse, VmBackupFreshness, GUEST_READY_MARKER_PATH,
+    SpawnerVmBackupStatus, SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind,
+    VmRecoveryPointKind, GUEST_READY_MARKER_PATH,
 };
 use pika_agent_microvm::{
     build_create_vm_request, resolve_params, validate_resolved_params, ManagedVmCreateInput,
@@ -44,28 +47,41 @@ use pika_relay_profiles::default_message_relays;
 const AGENT_OWNER_ACTIVE_INDEX: &str = "agent_instances_owner_active_idx";
 const VM_PROVIDER_ENV: &str = "PIKA_AGENT_VM_PROVIDER";
 const MICROVM_SPAWNER_URL_ENV: &str = "PIKA_AGENT_MICROVM_SPAWNER_URL";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const INCUS_ENDPOINT_ENV: &str = "PIKA_AGENT_INCUS_ENDPOINT";
 const INCUS_PROJECT_ENV: &str = "PIKA_AGENT_INCUS_PROJECT";
 const INCUS_PROFILE_ENV: &str = "PIKA_AGENT_INCUS_PROFILE";
 const INCUS_STORAGE_POOL_ENV: &str = "PIKA_AGENT_INCUS_STORAGE_POOL";
 const INCUS_IMAGE_ALIAS_ENV: &str = "PIKA_AGENT_INCUS_IMAGE_ALIAS";
 const INCUS_INSECURE_TLS_ENV: &str = "PIKA_AGENT_INCUS_INSECURE_TLS";
+const INCUS_CLIENT_CERT_PATH_ENV: &str = "PIKA_AGENT_INCUS_CLIENT_CERT_PATH";
+const INCUS_CLIENT_KEY_PATH_ENV: &str = "PIKA_AGENT_INCUS_CLIENT_KEY_PATH";
+const INCUS_SERVER_CERT_PATH_ENV: &str = "PIKA_AGENT_INCUS_SERVER_CERT_PATH";
+const INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV: &str = "PIKA_AGENT_INCUS_OPENCLAW_GUEST_IPV4_CIDR";
+const INCUS_OPENCLAW_PROXY_HOST_ENV: &str = "PIKA_AGENT_INCUS_OPENCLAW_PROXY_HOST";
 const INCUS_VM_KIND: &str = "virtual-machine";
 const INCUS_PERSISTENT_VOLUME_TYPE: &str = "custom";
 const INCUS_PERSISTENT_VOLUME_CONTENT_TYPE: &str = "filesystem";
 const INCUS_PERSISTENT_VOLUME_DEVICE_NAME: &str = "pikastate";
 const INCUS_PERSISTENT_VOLUME_PATH: &str = "/mnt/pika-state";
+const INCUS_DEV_VM_MEMORY_LIMIT: &str = "2048MiB";
 const INCUS_CLOUD_INIT_USER_DATA_KEY: &str = "cloud-init.user-data";
-const INCUS_BOOTSTRAP_LAUNCHER_PATH: &str = "/usr/local/bin/pika-managed-agent-launcher.sh";
-const INCUS_STATE_VOLUME_SETUP_PATH: &str =
-    "/usr/local/bin/pika-managed-agent-state-volume-setup.sh";
-const INCUS_SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/pika-managed-agent.service";
-const INCUS_SYSTEMD_SERVICE_NAME: &str = "pika-managed-agent.service";
+const INCUS_OPENCLAW_PROXY_DEVICE_NAME: &str = "pikaopenclaw";
+const INCUS_OPENCLAW_PROXY_PORT_START: u16 = 24000;
+const INCUS_OPENCLAW_PROXY_PORT_SPAN: u16 = 10000;
+const INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY: &str = "user.pika.openclaw_proxy_host";
+const INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY: &str = "user.pika.openclaw_proxy_port";
+const INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY: &str = "user.pika.openclaw_guest_ipv4";
+const INCUS_PRIMARY_NIC_DEVICE_NAME: &str = "eth0";
+const INCUS_BOOTSTRAP_LAUNCHER_PATH: &str = "/workspace/pika-agent/incus-launcher.sh";
+const INCUS_STATE_VOLUME_SETUP_PATH: &str = "/workspace/pika-agent/incus-state-volume-setup.sh";
 const INCUS_PERSISTENT_AGENT_STATE_ROOT: &str = "/mnt/pika-state/pika-agent";
 const INCUS_PERSISTENT_DAEMON_STATE_DIR: &str = "/mnt/pika-state/pika-agent/state";
 const INCUS_PERSISTENT_OPENCLAW_STATE_DIR: &str = "/mnt/pika-state/pika-agent/openclaw";
 const INCUS_OPERATION_WAIT_TIMEOUT_SECS: i64 = 60;
 const INCUS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const INCUS_BACKUP_HEALTHY_MAX_AGE_HOURS: i64 = 24;
+const INCUS_GUEST_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const EVENT_PROVISION_REQUESTED: &str = "provision_requested";
 const EVENT_PROVISION_ACCEPTED: &str = "provision_accepted";
 const EVENT_RECOVER_REQUESTED: &str = "recover_requested";
@@ -183,7 +199,9 @@ pub(crate) enum ManagedEnvironmentBackupFreshness {
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedEnvironmentBackupStatus {
     pub freshness: ManagedEnvironmentBackupFreshness,
-    pub backup_host: Option<String>,
+    pub backup_target: Option<String>,
+    pub backup_target_label: String,
+    pub latest_recovery_point_name: Option<String>,
     pub latest_successful_backup_at: Option<String>,
     pub status_copy: String,
     pub reset_requires_confirmation: bool,
@@ -198,6 +216,11 @@ pub(crate) struct ManagedEnvironmentHandle {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct OpenClawProxyTarget {
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ResolvedIncusParams {
     endpoint: String,
     project: String,
@@ -205,8 +228,17 @@ struct ResolvedIncusParams {
     storage_pool: String,
     image_alias: String,
     insecure_tls: bool,
+    openclaw_guest_ipv4_cidr: Option<String>,
+    openclaw_proxy_host: Option<String>,
     agent_kind: ResolvedMicrovmAgentKind,
     agent_backend: ResolvedMicrovmAgentBackend,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResolvedIncusTlsConfig {
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    server_cert_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -249,6 +281,41 @@ struct IncusOperationMetadata {
 #[derive(Debug, Deserialize)]
 struct IncusInstanceState {
     status: String,
+    #[serde(default)]
+    network: Option<BTreeMap<String, IncusInstanceNetwork>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IncusStorageVolumeSnapshot {
+    name: String,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusInstanceNetwork {
+    #[serde(default)]
+    addresses: Vec<IncusInstanceNetworkAddress>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusInstanceNetworkAddress {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    family: String,
+    #[serde(default)]
+    scope: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusInstanceDetails {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+    #[serde(default)]
+    devices: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +325,26 @@ struct IncusGuestReadyMarker {
     agent_kind: Option<String>,
     #[serde(default)]
     probe: Option<String>,
+    #[serde(default)]
+    boot_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusOpenClawConfigFile {
+    #[serde(default)]
+    gateway: Option<IncusOpenClawGatewayConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusOpenClawGatewayConfig {
+    #[serde(default)]
+    auth: Option<IncusOpenClawAuthConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IncusOpenClawAuthConfig {
+    #[serde(default)]
+    token: Option<String>,
 }
 
 fn provider_kind_db_value(provider: ProviderKind) -> &'static str {
@@ -330,6 +417,8 @@ fn materialized_managed_vm_params(
                 storage_pool: Some(resolved.storage_pool.clone()),
                 image_alias: Some(resolved.image_alias.clone()),
                 insecure_tls: Some(resolved.insecure_tls),
+                openclaw_guest_ipv4_cidr: resolved.openclaw_guest_ipv4_cidr.clone(),
+                openclaw_proxy_host: resolved.openclaw_proxy_host.clone(),
             }),
         },
     }
@@ -447,6 +536,22 @@ fn merge_incus_provision_params(
             merged.insecure_tls = requested.insecure_tls;
             changed = true;
         }
+        if requested
+            .openclaw_guest_ipv4_cidr
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            merged.openclaw_guest_ipv4_cidr = requested.openclaw_guest_ipv4_cidr.clone();
+            changed = true;
+        }
+        if requested
+            .openclaw_proxy_host
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            merged.openclaw_proxy_host = requested.openclaw_proxy_host.clone();
+            changed = true;
+        }
     }
     if changed
         || merged.endpoint.is_some()
@@ -455,6 +560,7 @@ fn merge_incus_provision_params(
         || merged.storage_pool.is_some()
         || merged.image_alias.is_some()
         || merged.insecure_tls.is_some()
+        || merged.openclaw_proxy_host.is_some()
     {
         Some(merged)
     } else {
@@ -696,7 +802,73 @@ fn default_incus_params_from_env() -> IncusProvisionParams {
         insecure_tls: std::env::var(INCUS_INSECURE_TLS_ENV)
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        openclaw_guest_ipv4_cidr: non_empty_env_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV),
+        openclaw_proxy_host: non_empty_env_var(INCUS_OPENCLAW_PROXY_HOST_ENV),
     }
+}
+
+fn should_probe_incus_canary_health() -> bool {
+    incus_params_provided(&default_incus_params_from_env())
+}
+
+fn build_incus_http_client(resolved: &ResolvedIncusParams) -> anyhow::Result<reqwest::Client> {
+    let tls = resolved_incus_tls_config(resolved)?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(INCUS_HTTP_TIMEOUT)
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(resolved.insecure_tls);
+
+    if let Some(server_cert_path) = tls.server_cert_path.as_deref() {
+        let server_cert_pem = fs::read(server_cert_path)
+            .with_context(|| format!("read incus server certificate from {server_cert_path}"))?;
+        let server_cert = reqwest::Certificate::from_pem(&server_cert_pem)
+            .with_context(|| format!("parse incus server certificate from {server_cert_path}"))?;
+        builder = builder.add_root_certificate(server_cert);
+    }
+
+    if let (Some(client_cert_path), Some(client_key_path)) = (
+        tls.client_cert_path.as_deref(),
+        tls.client_key_path.as_deref(),
+    ) {
+        let mut identity_pem = fs::read(client_cert_path)
+            .with_context(|| format!("read incus client certificate from {client_cert_path}"))?;
+        if !identity_pem.ends_with(b"\n") {
+            identity_pem.push(b'\n');
+        }
+        let client_key_pem = fs::read(client_key_path)
+            .with_context(|| format!("read incus client key from {client_key_path}"))?;
+        identity_pem.extend_from_slice(&client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem).with_context(|| {
+            format!(
+                "parse incus client identity from {} and {}",
+                client_cert_path, client_key_path
+            )
+        })?;
+        builder = builder.identity(identity);
+    }
+
+    builder.build().context("build incus client")
+}
+
+fn resolved_incus_tls_config(
+    resolved: &ResolvedIncusParams,
+) -> anyhow::Result<ResolvedIncusTlsConfig> {
+    let client_cert_path = non_empty_env_var(INCUS_CLIENT_CERT_PATH_ENV);
+    let client_key_path = non_empty_env_var(INCUS_CLIENT_KEY_PATH_ENV);
+    anyhow::ensure!(
+        client_cert_path.is_some() == client_key_path.is_some(),
+        "{INCUS_CLIENT_CERT_PATH_ENV} and {INCUS_CLIENT_KEY_PATH_ENV} must either both be set or both be unset"
+    );
+    anyhow::ensure!(
+        client_cert_path.is_some() || !resolved.endpoint.starts_with("https://"),
+        "incus https endpoint {} requires both {INCUS_CLIENT_CERT_PATH_ENV} and {INCUS_CLIENT_KEY_PATH_ENV}",
+        resolved.endpoint
+    );
+    Ok(ResolvedIncusTlsConfig {
+        client_cert_path,
+        client_key_path,
+        server_cert_path: non_empty_env_var(INCUS_SERVER_CERT_PATH_ENV),
+    })
 }
 
 fn microvm_params_provided(params: &MicrovmProvisionParams) -> bool {
@@ -732,6 +904,8 @@ fn incus_params_provided(params: &IncusProvisionParams) -> bool {
     .map(str::trim)
     .any(|value| !value.is_empty())
         || params.insecure_tls.is_some()
+        || params.openclaw_guest_ipv4_cidr.is_some()
+        || params.openclaw_proxy_host.is_some()
 }
 
 fn required_non_empty_field(
@@ -749,24 +923,20 @@ impl ManagedVmProvider {
     fn ensure_customer_openclaw_flow_supported(&self) -> anyhow::Result<()> {
         match self {
             Self::Microvm(_) => Ok(()),
-            Self::Incus(provider) => {
-                anyhow::bail!(
-                    "managed VM provider incus passed infrastructure checks but customer-facing OpenClaw launch/proxy is not implemented yet (endpoint={})",
-                    provider.resolved.endpoint
-                )
-            }
+            Self::Incus(provider) => provider.ensure_customer_openclaw_flow_supported(),
         }
     }
 
-    fn openclaw_proxy_base_url(&self) -> anyhow::Result<&str> {
+    async fn get_openclaw_proxy_target(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<OpenClawProxyTarget> {
         match self {
-            Self::Microvm(provider) => Ok(provider.spawner_base_url()),
-            Self::Incus(provider) => {
-                anyhow::bail!(
-                    "managed VM provider incus does not support OpenClaw proxy base URL yet (endpoint={})",
-                    provider.resolved.endpoint
-                )
-            }
+            Self::Microvm(provider) => Ok(OpenClawProxyTarget {
+                base_url: format!("{}/vms/{vm_id}/openclaw", provider.spawner_base_url()),
+            }),
+            Self::Incus(provider) => provider.get_openclaw_proxy_target(vm_id, request_id).await,
         }
     }
 
@@ -839,23 +1009,14 @@ impl ManagedVmProvider {
     ) -> anyhow::Result<SpawnerOpenClawLaunchAuth> {
         match self {
             Self::Microvm(provider) => provider.get_openclaw_launch_auth(vm_id, request_id).await,
-            Self::Incus(provider) => {
-                anyhow::bail!(
-                    "managed VM provider incus does not support OpenClaw launch auth yet (endpoint={})",
-                    provider.resolved.endpoint
-                )
-            }
+            Self::Incus(provider) => provider.get_openclaw_launch_auth(vm_id, request_id).await,
         }
     }
 }
 
 impl IncusManagedVmProvider {
     fn new(resolved: ResolvedIncusParams) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(INCUS_HTTP_TIMEOUT)
-            .danger_accept_invalid_certs(resolved.insecure_tls)
-            .build()
-            .context("build incus client")?;
+        let client = build_incus_http_client(&resolved)?;
         Ok(Self { client, resolved })
     }
 
@@ -898,7 +1059,450 @@ impl IncusManagedVmProvider {
                 "load configured incus image alias",
             )
             .await?;
+        if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
+            self.ensure_customer_openclaw_flow_supported()
+                .context("validate incus OpenClaw dashboard support")?;
+            self.openclaw_proxy_host_ipv4()
+                .context("validate incus OpenClaw dashboard access plan")?;
+        }
         Ok(())
+    }
+
+    fn ensure_customer_openclaw_flow_supported(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw),
+            "configured Incus customer flow requires the OpenClaw runtime"
+        );
+        self.openclaw_guest_ipv4_network()
+            .context("configured Incus customer flow requires a static guest IPv4 subnet")?;
+        self.openclaw_proxy_host_ipv4()
+            .context("configured Incus customer flow requires an explicit proxy host IPv4")?;
+        Ok(())
+    }
+
+    async fn get_openclaw_launch_auth(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<SpawnerOpenClawLaunchAuth> {
+        let config = self
+            .load_openclaw_config(vm_id, request_id)
+            .await
+            .with_context(|| format!("load incus OpenClaw config for VM {vm_id}"))?;
+        let gateway_auth_token = config
+            .gateway
+            .and_then(|gateway| gateway.auth)
+            .and_then(|auth| auth.token)
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        Ok(SpawnerOpenClawLaunchAuth {
+            vm_id: vm_id.to_string(),
+            gateway_auth_token,
+        })
+    }
+
+    async fn get_openclaw_proxy_target(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<OpenClawProxyTarget> {
+        let (proxy_host, proxy_port) =
+            self.ensure_openclaw_proxy_device(vm_id, request_id)
+                .await
+                .with_context(|| format!("prepare incus OpenClaw proxy target for VM {vm_id}"))?;
+        Ok(OpenClawProxyTarget {
+            base_url: format!("http://{proxy_host}:{proxy_port}"),
+        })
+    }
+
+    async fn load_openclaw_config(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<IncusOpenClawConfigFile> {
+        let path = format!("/{}", pika_agent_control_plane::GUEST_OPENCLAW_CONFIG_PATH);
+        let bytes = self
+            .get_instance_file(vm_id, &path, request_id, "load incus OpenClaw config")
+            .await?
+            .with_context(|| format!("incus OpenClaw config file was missing for VM {vm_id}"))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse incus OpenClaw config for VM {vm_id}"))
+    }
+
+    async fn get_instance_details(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<IncusInstanceDetails> {
+        self.get_json(
+            &["1.0", "instances", vm_id],
+            true,
+            request_id,
+            "load incus instance details",
+        )
+        .await
+        .map_err(|err| self.rewrite_not_found(err, format!("incus vm not found: {vm_id}")))
+    }
+
+    fn openclaw_proxy_host_ipv4(&self) -> anyhow::Result<Ipv4Addr> {
+        let raw = self
+            .resolved
+            .openclaw_proxy_host
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "missing incus.openclaw_proxy_host; set request.incus.openclaw_proxy_host or {INCUS_OPENCLAW_PROXY_HOST_ENV}"
+                )
+            })?;
+        raw.parse::<Ipv4Addr>().with_context(|| {
+            format!("invalid incus.openclaw_proxy_host {raw:?}; expected an IPv4 address")
+        })
+    }
+
+    fn openclaw_guest_ipv4_network(&self) -> anyhow::Result<Ipv4Net> {
+        let cidr = self
+            .resolved
+            .openclaw_guest_ipv4_cidr
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "missing incus.openclaw_guest_ipv4_cidr; set request.incus.openclaw_guest_ipv4_cidr or {INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV}"
+                )
+            })?;
+        let network = cidr
+            .parse::<Ipv4Net>()
+            .with_context(|| format!("invalid incus.openclaw_guest_ipv4_cidr {cidr:?}"))?;
+        let host_start = u32::from(network.network()) + 2;
+        let host_end = u32::from(network.broadcast()) - 1;
+        anyhow::ensure!(
+            host_start <= host_end,
+            "incus.openclaw_guest_ipv4_cidr {cidr:?} must leave at least one guest address after reserving the gateway"
+        );
+        Ok(network)
+    }
+
+    fn deterministic_openclaw_proxy_port(&self, vm_id: &str) -> u16 {
+        let digest = Sha256::digest(vm_id.as_bytes());
+        let offset = u16::from_be_bytes([digest[0], digest[1]]) % INCUS_OPENCLAW_PROXY_PORT_SPAN;
+        INCUS_OPENCLAW_PROXY_PORT_START + offset
+    }
+
+    fn deterministic_openclaw_guest_ipv4(&self, vm_id: &str) -> anyhow::Result<Ipv4Addr> {
+        let network = self.openclaw_guest_ipv4_network()?;
+        let host_start = u32::from(network.network()) + 2;
+        let host_end = u32::from(network.broadcast()) - 1;
+        let host_count = host_end - host_start + 1;
+        let digest = Sha256::digest(vm_id.as_bytes());
+        let offset = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % host_count;
+        Ok(Ipv4Addr::from(host_start + offset))
+    }
+
+    async fn list_project_instances(
+        &self,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<Vec<IncusInstanceDetails>> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &["1.0", "instances"],
+                true,
+                request_id,
+            )?
+            .query(&[("recursion", "1")])
+            .send()
+            .await
+            .context("list incus instances in project")?;
+        self.parse_json_response(response, "list incus instances in project")
+            .await
+    }
+
+    fn openclaw_guest_ipv4_from_details(details: &IncusInstanceDetails) -> Option<Ipv4Addr> {
+        details
+            .config
+            .get(INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY)
+            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            .or_else(|| {
+                details
+                    .devices
+                    .get(INCUS_PRIMARY_NIC_DEVICE_NAME)
+                    .and_then(|device| device.get("ipv4.address"))
+                    .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            })
+    }
+
+    fn openclaw_proxy_port_from_details(details: &IncusInstanceDetails) -> Option<u16> {
+        details
+            .config
+            .get(INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY)
+            .and_then(|value| value.parse::<u16>().ok())
+    }
+
+    fn select_openclaw_guest_ipv4(
+        &self,
+        vm_id: &str,
+        current: Option<Ipv4Addr>,
+        used: &BTreeSet<Ipv4Addr>,
+    ) -> anyhow::Result<Ipv4Addr> {
+        let network = self.openclaw_guest_ipv4_network()?;
+        if current.is_some_and(|address| network.contains(&address) && !used.contains(&address)) {
+            return Ok(current.expect("checked above"));
+        }
+
+        let preferred = self.deterministic_openclaw_guest_ipv4(vm_id)?;
+        let host_start = u32::from(network.network()) + 2;
+        let host_end = u32::from(network.broadcast()) - 1;
+        let host_count = host_end - host_start + 1;
+        let preferred_offset = u32::from(preferred) - host_start;
+        for step in 0..host_count {
+            let candidate = Ipv4Addr::from(host_start + ((preferred_offset + step) % host_count));
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!(
+            "no free guest IPv4 remains in incus.openclaw_guest_ipv4_cidr {}",
+            network
+        )
+    }
+
+    fn select_openclaw_proxy_port(
+        &self,
+        vm_id: &str,
+        current: Option<u16>,
+        used: &BTreeSet<u16>,
+    ) -> anyhow::Result<u16> {
+        let valid_proxy_port_range = INCUS_OPENCLAW_PROXY_PORT_START
+            ..INCUS_OPENCLAW_PROXY_PORT_START + INCUS_OPENCLAW_PROXY_PORT_SPAN;
+        if current
+            .is_some_and(|port| valid_proxy_port_range.contains(&port) && !used.contains(&port))
+        {
+            return Ok(current.expect("checked above"));
+        }
+
+        let preferred = self.deterministic_openclaw_proxy_port(vm_id);
+        let preferred_offset = preferred - INCUS_OPENCLAW_PROXY_PORT_START;
+        for step in 0..INCUS_OPENCLAW_PROXY_PORT_SPAN {
+            let candidate = INCUS_OPENCLAW_PROXY_PORT_START
+                + ((preferred_offset + step) % INCUS_OPENCLAW_PROXY_PORT_SPAN);
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!("no free Incus OpenClaw proxy port remains in the configured host port range")
+    }
+
+    async fn allocate_openclaw_proxy_binding(
+        &self,
+        vm_id: &str,
+        current_proxy_port: Option<u16>,
+        current_guest_ipv4: Option<Ipv4Addr>,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<(u16, Ipv4Addr)> {
+        let instances = self.list_project_instances(request_id).await?;
+        let mut used_guest_ipv4s = BTreeSet::new();
+        let mut used_proxy_ports = BTreeSet::new();
+        for instance in instances {
+            if instance.name == vm_id {
+                continue;
+            }
+            if let Some(address) = Self::openclaw_guest_ipv4_from_details(&instance) {
+                used_guest_ipv4s.insert(address);
+            }
+            if let Some(port) = Self::openclaw_proxy_port_from_details(&instance) {
+                used_proxy_ports.insert(port);
+            }
+        }
+        let proxy_port =
+            self.select_openclaw_proxy_port(vm_id, current_proxy_port, &used_proxy_ports)?;
+        let guest_ipv4 =
+            self.select_openclaw_guest_ipv4(vm_id, current_guest_ipv4, &used_guest_ipv4s)?;
+        Ok((proxy_port, guest_ipv4))
+    }
+
+    async fn load_primary_nic_network_name(
+        &self,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let profile: serde_json::Value = self
+            .get_json(
+                &["1.0", "profiles", &self.resolved.profile],
+                true,
+                request_id,
+                "load configured incus profile for primary nic",
+            )
+            .await?;
+        profile
+            .get("devices")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|devices| {
+                devices.values().find_map(|device| {
+                    (device.get("type").and_then(serde_json::Value::as_str) == Some("nic"))
+                        .then(|| {
+                            device
+                                .get("network")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .flatten()
+                })
+            })
+            .with_context(|| {
+                format!(
+                    "configured incus profile {} in project {} must include a nic device with a managed network",
+                    self.resolved.profile, self.resolved.project
+                )
+            })
+    }
+
+    async fn ensure_openclaw_proxy_device(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<(Ipv4Addr, u16)> {
+        let mut details = self
+            .get_instance_details(vm_id, request_id)
+            .await
+            .with_context(|| format!("load incus instance details for VM {vm_id}"))?;
+        let nic_network = self
+            .load_primary_nic_network_name(request_id)
+            .await
+            .with_context(|| format!("load primary incus nic network for VM {vm_id}"))?;
+        let proxy_host = details
+            .config
+            .get(INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY)
+            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            .unwrap_or(self.openclaw_proxy_host_ipv4()?);
+        let current_guest_ipv4 = self
+            .guest_ipv4_from_instance_state(vm_id, request_id)
+            .await
+            .ok()
+            .filter(|address| {
+                self.openclaw_guest_ipv4_network()
+                    .map(|network| network.contains(address))
+                    .unwrap_or(false)
+            });
+        let current_configured_guest_ipv4 =
+            Self::openclaw_guest_ipv4_from_details(&details).or(current_guest_ipv4);
+        let current_proxy_port = Self::openclaw_proxy_port_from_details(&details);
+        let (proxy_port, guest_ipv4) = self
+            .allocate_openclaw_proxy_binding(
+                vm_id,
+                current_proxy_port,
+                current_configured_guest_ipv4,
+                request_id,
+            )
+            .await?;
+        let expected_nic = BTreeMap::from([
+            ("type".to_string(), "nic".to_string()),
+            ("network".to_string(), nic_network),
+            (
+                "name".to_string(),
+                INCUS_PRIMARY_NIC_DEVICE_NAME.to_string(),
+            ),
+            ("ipv4.address".to_string(), guest_ipv4.to_string()),
+        ]);
+        let expected_device = BTreeMap::from([
+            ("type".to_string(), "proxy".to_string()),
+            ("bind".to_string(), "host".to_string()),
+            (
+                "listen".to_string(),
+                format!("tcp:{proxy_host}:{proxy_port}"),
+            ),
+            (
+                "connect".to_string(),
+                format!(
+                    "tcp:{guest_ipv4}:{}",
+                    pika_agent_microvm::DEFAULT_OPENCLAW_GATEWAY_PORT
+                ),
+            ),
+            ("nat".to_string(), "true".to_string()),
+        ]);
+        let expected_host = proxy_host.to_string();
+        let expected_port = proxy_port.to_string();
+        let expected_guest_ipv4 = guest_ipv4.to_string();
+        let proxy_device_matches = details
+            .devices
+            .get(INCUS_OPENCLAW_PROXY_DEVICE_NAME)
+            .is_some_and(|device| device == &expected_device);
+        let nic_device_matches = details
+            .devices
+            .get(INCUS_PRIMARY_NIC_DEVICE_NAME)
+            .is_some_and(|device| device == &expected_nic);
+        let proxy_metadata_matches = details
+            .config
+            .get(INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY)
+            .is_some_and(|value| value == &expected_host)
+            && details
+                .config
+                .get(INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY)
+                .is_some_and(|value| value == &expected_port)
+            && details
+                .config
+                .get(INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY)
+                .is_some_and(|value| value == &expected_guest_ipv4);
+        if proxy_device_matches && proxy_metadata_matches && nic_device_matches {
+            return Ok((proxy_host, proxy_port));
+        }
+
+        details
+            .devices
+            .insert(INCUS_PRIMARY_NIC_DEVICE_NAME.to_string(), expected_nic);
+        details.devices.insert(
+            INCUS_OPENCLAW_PROXY_DEVICE_NAME.to_string(),
+            expected_device,
+        );
+        details.config.insert(
+            INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY.to_string(),
+            expected_host,
+        );
+        details.config.insert(
+            INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY.to_string(),
+            expected_port,
+        );
+        details.config.insert(
+            INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY.to_string(),
+            expected_guest_ipv4,
+        );
+        let body = serde_json::json!({
+            "config": details.config,
+            "devices": details.devices,
+        });
+        self.patch_expect_operation(
+            &["1.0", "instances", vm_id],
+            true,
+            &body,
+            request_id,
+            "update incus OpenClaw proxy device",
+        )
+        .await?;
+        Ok((proxy_host, proxy_port))
+    }
+
+    async fn guest_ipv4_from_instance_state(
+        &self,
+        vm_id: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<Ipv4Addr> {
+        let state: IncusInstanceState = self
+            .get_json(
+                &["1.0", "instances", vm_id, "state"],
+                true,
+                request_id,
+                "load incus instance state for OpenClaw proxy",
+            )
+            .await
+            .map_err(|err| self.rewrite_not_found(err, format!("incus vm not found: {vm_id}")))?;
+        state
+            .network
+            .unwrap_or_default()
+            .values()
+            .flat_map(|interface| interface.addresses.iter())
+            .find_map(|address| {
+                (address.family == "inet" && address.scope == "global")
+                    .then(|| address.address.parse::<Ipv4Addr>().ok())
+                    .flatten()
+            })
+            .with_context(|| format!("incus VM {vm_id} did not report a global IPv4 address"))
     }
 
     async fn create_managed_vm(
@@ -1001,29 +1605,138 @@ impl IncusManagedVmProvider {
     async fn get_vm_backup_status(
         &self,
         vm_id: &str,
-        _request_id: Option<&str>,
+        request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmBackupStatus> {
-        anyhow::bail!("managed VM provider incus does not support backup status yet for VM {vm_id}")
+        let volume_name = self.persistent_volume_name(vm_id);
+        let backup_target = format!("{}/{}", self.resolved.storage_pool, volume_name);
+        let snapshots = self
+            .list_persistent_volume_snapshots(&volume_name, request_id)
+            .await
+            .with_context(|| format!("list incus state-volume snapshots for VM {vm_id}"))?;
+        let Some(latest_snapshot) = latest_incus_snapshot(&snapshots) else {
+            return Ok(SpawnerVmBackupStatus {
+                vm_id: vm_id.to_string(),
+                backup_unit_kind: VmBackupUnitKind::PersistentStateVolume,
+                backup_target,
+                recovery_point_kind: VmRecoveryPointKind::VolumeSnapshot,
+                freshness: VmBackupFreshness::Missing,
+                latest_recovery_point_name: None,
+                latest_successful_backup_at: None,
+                observed_at: Some(chrono::Utc::now().to_rfc3339()),
+            });
+        };
+
+        let latest_at = latest_snapshot.created_at.clone().with_context(|| {
+            format!("latest incus snapshot for VM {vm_id} did not include created_at metadata")
+        })?;
+        let latest_parsed = chrono::DateTime::parse_from_rfc3339(&latest_at)
+            .with_context(|| format!("parse incus snapshot created_at for VM {vm_id}"))?
+            .with_timezone(&chrono::Utc);
+        let freshness = if chrono::Utc::now().signed_duration_since(latest_parsed)
+            <= chrono::Duration::hours(INCUS_BACKUP_HEALTHY_MAX_AGE_HOURS)
+        {
+            VmBackupFreshness::Healthy
+        } else {
+            VmBackupFreshness::Stale
+        };
+
+        Ok(SpawnerVmBackupStatus {
+            vm_id: vm_id.to_string(),
+            backup_unit_kind: VmBackupUnitKind::PersistentStateVolume,
+            backup_target,
+            recovery_point_kind: VmRecoveryPointKind::VolumeSnapshot,
+            freshness,
+            latest_recovery_point_name: Some(incus_snapshot_leaf_name(&latest_snapshot.name)),
+            latest_successful_backup_at: Some(latest_at),
+            observed_at: Some(chrono::Utc::now().to_rfc3339()),
+        })
     }
 
     async fn recover_vm(
         &self,
         vm_id: &str,
-        _request_id: Option<&str>,
+        request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
-        anyhow::bail!("managed VM provider incus does not support recover yet for VM {vm_id}")
+        let state: IncusInstanceState = self
+            .get_json(
+                &["1.0", "instances", vm_id, "state"],
+                true,
+                request_id,
+                "load incus instance state for recover",
+            )
+            .await
+            .map_err(|err| self.rewrite_not_found(err, format!("incus vm not found: {vm_id}")))?;
+
+        let action = if state.status.trim() == "Running" {
+            "restart"
+        } else {
+            "start"
+        };
+        self.change_instance_state(vm_id, action, request_id)
+            .await
+            .with_context(|| format!("recover incus VM {vm_id}"))?;
+        self.get_vm_status(vm_id, request_id).await
     }
 
     async fn restore_vm(
         &self,
         vm_id: &str,
-        _request_id: Option<&str>,
+        request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
-        anyhow::bail!("managed VM provider incus does not support restore yet for VM {vm_id}")
+        let state: IncusInstanceState = self
+            .get_json(
+                &["1.0", "instances", vm_id, "state"],
+                true,
+                request_id,
+                "load incus instance state for restore",
+            )
+            .await
+            .map_err(|err| self.rewrite_not_found(err, format!("incus vm not found: {vm_id}")))?;
+        let volume_name = self.persistent_volume_name(vm_id);
+        let snapshots = self
+            .list_persistent_volume_snapshots(&volume_name, request_id)
+            .await
+            .with_context(|| format!("list incus state-volume snapshots for VM {vm_id}"))?;
+        let latest_snapshot = latest_incus_snapshot(&snapshots).ok_or_else(|| {
+            anyhow!("incus restore requires at least one state-volume snapshot for VM {vm_id}")
+        })?;
+        let snapshot_name = incus_snapshot_leaf_name(&latest_snapshot.name);
+
+        if !matches!(state.status.trim(), "Stopped" | "Frozen") {
+            self.stop_instance(vm_id, request_id)
+                .await
+                .with_context(|| format!("stop incus VM {vm_id} before restore"))?;
+        }
+        self.restore_persistent_volume(&volume_name, &snapshot_name, request_id)
+            .await
+            .with_context(|| format!("restore incus state volume for VM {vm_id}"))?;
+        self.start_instance(vm_id, request_id)
+            .await
+            .with_context(|| format!("start incus VM {vm_id} after restore"))?;
+        self.get_vm_status(vm_id, request_id).await
     }
 
     async fn delete_vm(&self, vm_id: &str, request_id: Option<&str>) -> anyhow::Result<()> {
         let volume_name = self.persistent_volume_name(vm_id);
+        let state = self
+            .get_json::<IncusInstanceState>(
+                &["1.0", "instances", vm_id, "state"],
+                true,
+                request_id,
+                "load incus instance state for delete",
+            )
+            .await;
+        if let Ok(state) = state {
+            if !matches!(state.status.trim(), "Stopped" | "Frozen") {
+                self.stop_instance(vm_id, request_id)
+                    .await
+                    .with_context(|| format!("stop incus VM {vm_id} before delete"))?;
+            }
+        } else if !state.as_ref().err().is_some_and(is_incus_not_found_error) {
+            return Err(state
+                .expect_err("incus delete state probe should fail")
+                .context(format!("load incus instance state for delete {vm_id}")));
+        }
         let instance_delete = self.delete_instance(vm_id, request_id).await;
         let volume_delete = self
             .delete_persistent_volume(&volume_name, request_id)
@@ -1061,7 +1774,6 @@ impl IncusManagedVmProvider {
     ) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "name": volume_name,
-            "type": INCUS_PERSISTENT_VOLUME_TYPE,
             "content_type": INCUS_PERSISTENT_VOLUME_CONTENT_TYPE,
             "description": format!("Persistent managed-agent state volume for {volume_name}"),
         });
@@ -1106,10 +1818,73 @@ impl IncusManagedVmProvider {
                 "path": INCUS_PERSISTENT_VOLUME_PATH,
             }),
         );
+        let openclaw_nic_network =
+            if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
+                Some(self.load_primary_nic_network_name(request_id).await?)
+            } else {
+                None
+            };
 
         let cloud_init_user_data = self
             .cloud_init_user_data(input)
             .context("build incus bootstrap user-data")?;
+        let mut instance_config = serde_json::Map::from_iter([
+            (
+                INCUS_CLOUD_INIT_USER_DATA_KEY.to_string(),
+                serde_json::Value::String(cloud_init_user_data),
+            ),
+            (
+                "limits.memory".to_string(),
+                serde_json::Value::String(INCUS_DEV_VM_MEMORY_LIMIT.to_string()),
+            ),
+            (
+                "user.pika.provider".to_string(),
+                serde_json::Value::String("incus".to_string()),
+            ),
+            (
+                "user.pika.state_volume".to_string(),
+                serde_json::Value::String(volume_name.to_string()),
+            ),
+            (
+                "user.pika.agent_kind".to_string(),
+                serde_json::Value::String(
+                    match self.resolved.agent_kind {
+                        ResolvedMicrovmAgentKind::Pi => "pi",
+                        ResolvedMicrovmAgentKind::Openclaw => "openclaw",
+                    }
+                    .to_string(),
+                ),
+            ),
+        ]);
+        if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
+            let proxy_host = self.openclaw_proxy_host_ipv4()?;
+            let (proxy_port, guest_ipv4) = self
+                .allocate_openclaw_proxy_binding(vm_id, None, None, request_id)
+                .await?;
+            instance_config.insert(
+                INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY.to_string(),
+                serde_json::Value::String(proxy_host.to_string()),
+            );
+            instance_config.insert(
+                INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY.to_string(),
+                serde_json::Value::String(proxy_port.to_string()),
+            );
+            instance_config.insert(
+                INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY.to_string(),
+                serde_json::Value::String(guest_ipv4.to_string()),
+            );
+            devices.insert(
+                INCUS_PRIMARY_NIC_DEVICE_NAME.to_string(),
+                serde_json::json!({
+                    "type": "nic",
+                    "network": openclaw_nic_network
+                        .as_deref()
+                        .expect("OpenClaw create must resolve a primary nic network"),
+                    "name": INCUS_PRIMARY_NIC_DEVICE_NAME,
+                    "ipv4.address": guest_ipv4.to_string(),
+                }),
+            );
+        }
         let body = serde_json::json!({
             "name": vm_id,
             "type": INCUS_VM_KIND,
@@ -1120,15 +1895,7 @@ impl IncusManagedVmProvider {
                 "alias": self.resolved.image_alias.as_str(),
             },
             "devices": devices,
-            "config": {
-                INCUS_CLOUD_INIT_USER_DATA_KEY: cloud_init_user_data,
-                "user.pika.provider": "incus",
-                "user.pika.state_volume": volume_name,
-                "user.pika.agent_kind": match self.resolved.agent_kind {
-                    ResolvedMicrovmAgentKind::Pi => "pi",
-                    ResolvedMicrovmAgentKind::Openclaw => "openclaw",
-                },
-            },
+            "config": instance_config,
         });
         self.post_expect_operation(
             &["1.0", "instances"],
@@ -1178,6 +1945,89 @@ impl IncusManagedVmProvider {
         })
     }
 
+    async fn list_persistent_volume_snapshots(
+        &self,
+        volume_name: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<Vec<IncusStorageVolumeSnapshot>> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &[
+                    "1.0",
+                    "storage-pools",
+                    &self.resolved.storage_pool,
+                    "volumes",
+                    INCUS_PERSISTENT_VOLUME_TYPE,
+                    volume_name,
+                    "snapshots",
+                ],
+                true,
+                request_id,
+            )?
+            .query(&[("recursion", "1")])
+            .send()
+            .await
+            .context("load incus storage volume snapshots")?;
+        self.parse_json_response(response, "load incus storage volume snapshots")
+            .await
+    }
+
+    async fn restore_persistent_volume(
+        &self,
+        volume_name: &str,
+        snapshot_name: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "restore": snapshot_name,
+        });
+        self.put_expect_empty(
+            &[
+                "1.0",
+                "storage-pools",
+                &self.resolved.storage_pool,
+                "volumes",
+                INCUS_PERSISTENT_VOLUME_TYPE,
+                volume_name,
+            ],
+            true,
+            &body,
+            request_id,
+            format!("restore incus persistent volume {volume_name} from snapshot {snapshot_name}"),
+        )
+        .await
+    }
+
+    async fn change_instance_state(
+        &self,
+        vm_id: &str,
+        action: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "action": action,
+            "force": true,
+            "timeout": INCUS_OPERATION_WAIT_TIMEOUT_SECS,
+        });
+        self.put_expect_operation(
+            &["1.0", "instances", vm_id, "state"],
+            true,
+            &body,
+            request_id,
+            &format!("set incus VM {vm_id} state to {action}"),
+        )
+        .await
+    }
+
+    async fn start_instance(&self, vm_id: &str, request_id: Option<&str>) -> anyhow::Result<()> {
+        self.change_instance_state(vm_id, "start", request_id).await
+    }
+
+    async fn stop_instance(&self, vm_id: &str, request_id: Option<&str>) -> anyhow::Result<()> {
+        self.change_instance_state(vm_id, "stop", request_id).await
+    }
+
     fn instance_name_for_input(&self, input: &ManagedVmCreateInput<'_>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(input.bot_pubkey_hex.as_bytes());
@@ -1202,6 +2052,12 @@ impl IncusManagedVmProvider {
             },
         );
         let guest_autostart = bootstrap_request.guest_autostart;
+        let mut launcher_env = guest_autostart.env.clone();
+        if let Ok(value) = std::env::var(ANTHROPIC_API_KEY_ENV) {
+            if !value.trim().is_empty() {
+                launcher_env.insert(ANTHROPIC_API_KEY_ENV.to_string(), value);
+            }
+        }
         let mut files = BTreeMap::new();
         for (path, content) in guest_autostart.files {
             files.insert(
@@ -1213,16 +2069,12 @@ impl IncusManagedVmProvider {
             INCUS_BOOTSTRAP_LAUNCHER_PATH.to_string(),
             (
                 "0755",
-                incus_bootstrap_launcher_script(&guest_autostart.env, &guest_autostart.command),
+                incus_bootstrap_launcher_script(&launcher_env, &guest_autostart.command),
             ),
         );
         files.insert(
             INCUS_STATE_VOLUME_SETUP_PATH.to_string(),
             ("0755", incus_state_volume_setup_script()),
-        );
-        files.insert(
-            INCUS_SYSTEMD_SERVICE_PATH.to_string(),
-            ("0644", incus_systemd_service_unit()),
         );
 
         let mut cloud_init = String::from("#cloud-config\nwrite_files:\n");
@@ -1239,13 +2091,7 @@ impl IncusManagedVmProvider {
             cloud_init.push('\n');
         }
         cloud_init.push_str("runcmd:\n");
-        cloud_init.push_str("  - [bash, ");
-        cloud_init.push_str(INCUS_STATE_VOLUME_SETUP_PATH);
-        cloud_init.push_str("]\n");
-        cloud_init.push_str("  - [systemctl, daemon-reload]\n");
-        cloud_init.push_str("  - [systemctl, enable, --now, ");
-        cloud_init.push_str(INCUS_SYSTEMD_SERVICE_NAME);
-        cloud_init.push_str("]\n");
+        cloud_init.push_str("  - [systemctl, --no-block, restart, pika-managed-agent.service]\n");
         Ok(cloud_init)
     }
 
@@ -1306,6 +2152,66 @@ impl IncusManagedVmProvider {
             tracing::warn!(
                 vm_id = %vm_id,
                 "incus guest ready marker omitted probe detail; reporting guest as not ready"
+            );
+            return false;
+        }
+        let marker_boot_id = match marker
+            .boot_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|boot_id| !boot_id.is_empty())
+        {
+            Some(boot_id) => boot_id,
+            None => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    "incus guest ready marker omitted boot_id; reporting guest as not ready"
+                );
+                return false;
+            }
+        };
+        let current_boot_id = match self
+            .get_instance_file(
+                vm_id,
+                INCUS_GUEST_BOOT_ID_PATH,
+                request_id,
+                "load incus guest boot id",
+            )
+            .await
+        {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    tracing::warn!(
+                        vm_id = %vm_id,
+                        error = %err,
+                        "incus guest boot id was not valid utf-8; reporting guest as not ready"
+                    );
+                    return false;
+                }
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    "incus guest boot id file was missing; reporting guest as not ready"
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    error = %err,
+                    "failed to load incus guest boot id; reporting guest as not ready"
+                );
+                return false;
+            }
+        };
+        if current_boot_id.is_empty() || current_boot_id != marker_boot_id {
+            tracing::warn!(
+                vm_id = %vm_id,
+                marker_boot_id,
+                current_boot_id,
+                "incus guest ready marker boot_id did not match current boot; reporting guest as not ready"
             );
             return false;
         }
@@ -1375,7 +2281,7 @@ impl IncusManagedVmProvider {
         let response = self
             .request(
                 reqwest::Method::GET,
-                &["1.0", "instances", vm_id, "file"],
+                &["1.0", "instances", vm_id, "files"],
                 true,
                 request_id,
             )?
@@ -1443,6 +2349,52 @@ impl IncusManagedVmProvider {
             .await
     }
 
+    async fn put_expect_operation(
+        &self,
+        path_segments: &[&str],
+        include_project: bool,
+        body: &serde_json::Value,
+        request_id: Option<&str>,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        let response = self
+            .request(
+                reqwest::Method::PUT,
+                path_segments,
+                include_project,
+                request_id,
+            )?
+            .json(body)
+            .send()
+            .await
+            .with_context(|| context.to_string())?;
+        self.finish_operation_response(response, request_id, context)
+            .await
+    }
+
+    async fn patch_expect_operation(
+        &self,
+        path_segments: &[&str],
+        include_project: bool,
+        body: &serde_json::Value,
+        request_id: Option<&str>,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        let response = self
+            .request(
+                reqwest::Method::PATCH,
+                path_segments,
+                include_project,
+                request_id,
+            )?
+            .json(body)
+            .send()
+            .await
+            .with_context(|| context.to_string())?;
+        self.finish_mutating_response(response, request_id, context)
+            .await
+    }
+
     async fn delete_expect_operation(
         &self,
         path_segments: &[&str],
@@ -1480,6 +2432,30 @@ impl IncusManagedVmProvider {
                 include_project,
                 request_id,
             )?
+            .send()
+            .await
+            .with_context(|| context.clone())?;
+        self.finish_mutating_response(response, request_id, &context)
+            .await
+    }
+
+    async fn put_expect_empty(
+        &self,
+        path_segments: &[&str],
+        include_project: bool,
+        body: &serde_json::Value,
+        request_id: Option<&str>,
+        context: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        let context = context.into();
+        let response = self
+            .request(
+                reqwest::Method::PUT,
+                path_segments,
+                include_project,
+                request_id,
+            )?
+            .json(body)
             .send()
             .await
             .with_context(|| context.clone())?;
@@ -1677,7 +2653,22 @@ fn incus_bootstrap_launcher_script(env: &BTreeMap<String, String>, command: &str
         script.push_str(&shell_single_quote(value));
         script.push('\n');
     }
-    script.push_str("export PIKA_VM_IP=\"${PIKA_VM_IP:-127.0.0.1}\"\n");
+    script.push_str("export PIKA_ENABLE_OPENCLAW_PRIVATE_PROXY=1\n");
+    script.push_str("export PIKACHAT_SKIP_RELAY_READY_CHECK=1\n");
+    script.push_str(
+        "if [[ -z \"${PIKA_VM_IP:-}\" ]]; then\n\
+PIKA_VM_IP=\"$(python3 - <<'PY'\n\
+import socket\n\
+\n\
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+try:\n    sock.connect((\"1.1.1.1\", 80))\n    print(sock.getsockname()[0])\n\
+except OSError:\n    pass\n\
+finally:\n    sock.close()\n\
+PY\n\
+)\"\n\
+fi\n\
+export PIKA_VM_IP=\"${PIKA_VM_IP:-127.0.0.1}\"\n",
+    );
     script.push_str("exec ");
     script.push_str(command);
     script.push('\n');
@@ -1724,13 +2715,41 @@ link_state_dir "$agent_root/openclaw" "$openclaw_state_target"
     )
 }
 
-fn incus_systemd_service_unit() -> String {
-    format!(
-        "[Unit]\nDescription=Pika Managed Agent Bootstrap\nAfter=network-online.target\nWants=network-online.target\nRequiresMountsFor={state_volume}\n\n[Service]\nType=simple\nExecStartPre=/bin/bash {state_setup}\nExecStart=/bin/bash {launcher}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
-        state_volume = INCUS_PERSISTENT_VOLUME_PATH,
-        state_setup = INCUS_STATE_VOLUME_SETUP_PATH,
-        launcher = INCUS_BOOTSTRAP_LAUNCHER_PATH,
-    )
+fn latest_incus_snapshot(
+    snapshots: &[IncusStorageVolumeSnapshot],
+) -> Option<IncusStorageVolumeSnapshot> {
+    let mut snapshots = snapshots.to_vec();
+    snapshots.sort_by(|left, right| {
+        let left_created = left
+            .created_at
+            .as_deref()
+            .and_then(parse_rfc3339_utc)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        let right_created = right
+            .created_at
+            .as_deref()
+            .and_then(parse_rfc3339_utc)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        right_created
+            .cmp(&left_created)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+    snapshots.into_iter().next()
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn incus_snapshot_leaf_name(name: &str) -> String {
+    name.rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -1849,7 +2868,7 @@ fn managed_environment_status_copy(
             "Managed OpenClaw is running and ready.".to_string()
         }
         (Some(row), Some(AgentStartupPhase::Failed)) if row.vm_id.is_some() => {
-            "Managed OpenClaw needs recovery. Recover first tries to bring the VM back and preserve the durable home; if that VM is gone, Recover provisions a fresh environment instead."
+            "Managed OpenClaw needs recovery. Recover first tries to bring the VM back and preserve the current persistent state; if that VM is gone, Recover provisions a fresh environment instead."
                 .to_string()
         }
         (Some(_), Some(AgentStartupPhase::Failed)) => {
@@ -1870,33 +2889,52 @@ fn managed_environment_backup_status_from_spawner(
         VmBackupFreshness::Missing => ManagedEnvironmentBackupFreshness::Missing,
         VmBackupFreshness::Unavailable => ManagedEnvironmentBackupFreshness::Unavailable,
     };
-    let backup_host = (!backup.backup_host.trim().is_empty()).then_some(backup.backup_host);
+    let backup_target = (!backup.backup_target.trim().is_empty()).then_some(backup.backup_target);
+    let backup_target_label = match backup.backup_unit_kind {
+        VmBackupUnitKind::DurableHome => "Durable Home".to_string(),
+        VmBackupUnitKind::PersistentStateVolume => "State Volume".to_string(),
+    };
+    let recovery_point_label = match backup.recovery_point_kind {
+        VmRecoveryPointKind::MetadataRecord => "durable-home backup record",
+        VmRecoveryPointKind::VolumeSnapshot => "state-volume snapshot",
+    };
     let latest_successful_backup_at = backup
         .latest_successful_backup_at
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let latest_recovery_point_name = backup
+        .latest_recovery_point_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let status_copy = match freshness {
         ManagedEnvironmentBackupFreshness::Healthy => {
-            "Recent durable-home backup protection is in place for this managed environment."
-                .to_string()
+            format!("A recent {recovery_point_label} is available for this managed environment.")
         }
         ManagedEnvironmentBackupFreshness::Stale => {
-            "Backup protection is stale. The latest successful durable-home backup is older than the healthy window, so destructive reset now requires explicit confirmation.".to_string()
+            format!(
+                "Recovery-point protection is stale. The latest {recovery_point_label} is older than the healthy window, so destructive reset now requires explicit confirmation."
+            )
         }
         ManagedEnvironmentBackupFreshness::Missing => {
-            "No successful durable-home backup is known yet. Treat destructive reset as unsafe until the first backup completes.".to_string()
+            format!(
+                "No {recovery_point_label} is known yet. Treat destructive reset as unsafe until the first recovery point exists."
+            )
         }
         ManagedEnvironmentBackupFreshness::Unavailable => {
-            "Backup protection could not be verified from the control plane right now. Destructive reset now requires explicit confirmation.".to_string()
+            "Recovery-point protection could not be verified from the control plane right now. Destructive reset now requires explicit confirmation."
+                .to_string()
         }
         ManagedEnvironmentBackupFreshness::NotProvisioned => {
-            "No managed environment exists yet, so backup protection is not tracked.".to_string()
+            "No managed environment exists yet, so recovery-point protection is not tracked."
+                .to_string()
         }
     };
 
     ManagedEnvironmentBackupStatus {
         freshness,
-        backup_host,
+        backup_target,
+        backup_target_label,
+        latest_recovery_point_name,
         latest_successful_backup_at,
         reset_requires_confirmation: !matches!(
             freshness,
@@ -1910,7 +2948,9 @@ fn managed_environment_backup_status_from_spawner(
 fn unavailable_backup_status(status_copy: impl Into<String>) -> ManagedEnvironmentBackupStatus {
     ManagedEnvironmentBackupStatus {
         freshness: ManagedEnvironmentBackupFreshness::Unavailable,
-        backup_host: None,
+        backup_target: None,
+        backup_target_label: "Recovery Target".to_string(),
+        latest_recovery_point_name: None,
         latest_successful_backup_at: None,
         reset_requires_confirmation: true,
         status_copy: status_copy.into(),
@@ -2168,17 +3208,20 @@ pub(crate) async fn load_managed_environment_backup_status(
     let Some(row) = status.row.as_ref() else {
         return ManagedEnvironmentBackupStatus {
             freshness: ManagedEnvironmentBackupFreshness::NotProvisioned,
-            backup_host: None,
+            backup_target: None,
+            backup_target_label: "Recovery Target".to_string(),
+            latest_recovery_point_name: None,
             latest_successful_backup_at: None,
             reset_requires_confirmation: false,
-            status_copy: "No managed environment exists yet, so backup protection is not tracked."
-                .to_string(),
+            status_copy:
+                "No managed environment exists yet, so recovery-point protection is not tracked."
+                    .to_string(),
         };
     };
 
     let Some(vm_id) = row.vm_id.as_deref() else {
         return unavailable_backup_status(
-            "No current VM assignment is available, so backup protection cannot be verified from the control plane.",
+            "No current VM assignment is available, so recovery-point protection cannot be verified from the control plane.",
         );
     };
 
@@ -2242,6 +3285,11 @@ pub(crate) async fn load_launchable_managed_environment(
             AgentApiError::from_code(AgentApiErrorCode::InvalidRequest).with_request_id(request_id)
         );
     }
+    if provider_kind_from_db_value(&row.provider).ok() != Some(ProviderKind::Incus) {
+        return Err(
+            AgentApiError::from_code(AgentApiErrorCode::InvalidRequest).with_request_id(request_id)
+        );
+    }
     let managed_vm = managed_vm_params_from_row(&row).map_err(|err| {
         tracing::error!(
             request_id = %request_id,
@@ -2259,17 +3307,31 @@ pub(crate) async fn load_launchable_managed_environment(
     })
 }
 
-pub(crate) fn openclaw_proxy_base_url(
+pub(crate) async fn load_openclaw_proxy_target(
     managed_vm: &ManagedVmProvisionParams,
+    vm_id: &str,
     request_id: &str,
-) -> Result<String, AgentApiError> {
-    managed_vm_provider(Some(managed_vm))
-        .and_then(|provider| provider.openclaw_proxy_base_url().map(str::to_string))
+) -> Result<OpenClawProxyTarget, AgentApiError> {
+    let provider = managed_vm_provider(Some(managed_vm)).map_err(|err| {
+        tracing::error!(
+            request_id = %request_id,
+            vm_id = %vm_id,
+            error = %err,
+            "failed to resolve managed VM provider for OpenClaw proxy target"
+        );
+        AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
+    })?;
+    provider
+        .get_openclaw_proxy_target(vm_id, Some(request_id))
+        .await
         .map_err(|err| {
             tracing::error!(
                 request_id = %request_id,
+                vm_id = %vm_id,
                 error = %err,
-                "failed to resolve managed VM provider openclaw proxy base url"
+                error_chain = %format!("{err:#}"),
+                error_debug = ?err,
+                "failed to resolve managed OpenClaw proxy target"
             );
             AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
         })
@@ -2521,6 +3583,20 @@ fn resolved_incus_params(
             if requested.insecure_tls.is_some() {
                 params.insecure_tls = requested.insecure_tls;
             }
+            if requested
+                .openclaw_guest_ipv4_cidr
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                params.openclaw_guest_ipv4_cidr = requested.openclaw_guest_ipv4_cidr.clone();
+            }
+            if requested
+                .openclaw_proxy_host
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                params.openclaw_proxy_host = requested.openclaw_proxy_host.clone();
+            }
         }
     }
     if provider != ProviderKind::Incus {
@@ -2556,6 +3632,8 @@ fn resolved_incus_params(
             INCUS_IMAGE_ALIAS_ENV,
         )?,
         insecure_tls: params.insecure_tls.unwrap_or(false),
+        openclaw_guest_ipv4_cidr: params.openclaw_guest_ipv4_cidr,
+        openclaw_proxy_host: params.openclaw_proxy_host,
         agent_kind: guest_selection.kind,
         agent_backend: guest_selection.backend,
     })
@@ -2913,7 +3991,7 @@ pub(crate) async fn recover_agent_for_owner(
             Some(&active.agent_id),
             None,
             EVENT_RECOVER_FELL_BACK_TO_FRESH,
-            "Recover could not preserve the previous environment because no recoverable VM was available. Provisioning a fresh Managed OpenClaw environment.",
+            "Recover could not preserve the previous persistent state because no recoverable VM was available. Provisioning a fresh Managed OpenClaw environment.",
             request_id,
         )?;
         drop(conn);
@@ -2941,7 +4019,7 @@ pub(crate) async fn recover_agent_for_owner(
             prepare_agent_for_reprovision(&mut conn, &active)
                 .map_err(|err| err.with_request_id(request_id.to_string()))?;
             let message = format!(
-                "Recover could not preserve the previous environment because VM {vm_id} was missing. Provisioning a fresh Managed OpenClaw environment."
+                "Recover could not preserve the previous persistent state because VM {vm_id} was missing. Provisioning a fresh Managed OpenClaw environment."
             );
             record_managed_environment_event(
                 &mut conn,
@@ -3047,18 +4125,18 @@ pub(crate) async fn reset_agent_for_owner(
     };
 
     if let Some(vm_id) = existing.as_ref().and_then(|row| row.vm_id.as_deref()) {
-        let provider =
-            managed_vm_provider_for_row(existing.as_ref().expect("existing row"), requested)
-                .map_err(|err| {
-                    tracing::error!(
-                        request_id = %request_id,
-                        owner_npub = %owner_npub,
-                        error = %err,
-                        "failed to resolve stored reset managed VM provider"
-                    );
-                    AgentApiError::from_code(AgentApiErrorCode::Internal)
-                        .with_request_id(request_id)
-                })?;
+        // Reset intentionally tears down the existing environment using the row's stored provider
+        // and only then provisions the replacement with the requested provider policy.
+        let provider = managed_vm_provider_for_row(existing.as_ref().expect("existing row"), None)
+            .map_err(|err| {
+                tracing::error!(
+                    request_id = %request_id,
+                    owner_npub = %owner_npub,
+                    error = %err,
+                    "failed to resolve stored reset managed VM provider"
+                );
+                AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
+            })?;
         match provider.delete_vm(vm_id, Some(request_id)).await {
             Ok(()) => {
                 tracing::info!(
@@ -3175,7 +4253,7 @@ pub(crate) async fn restore_managed_environment_from_backup(
     };
 
     let restore_requested_message = format!(
-        "Restore from backup requested for Managed OpenClaw on VM {vm_id}. The durable home will be replaced from the latest backup before the environment is recreated."
+        "Restore from backup requested for Managed OpenClaw on VM {vm_id}. The current state volume will be rolled back to the latest recovery snapshot before the environment is restarted."
     );
     record_managed_environment_event(
         &mut conn,
@@ -3244,7 +4322,7 @@ pub(crate) async fn restore_managed_environment_from_backup(
                 Some(&restored.id),
             )?;
             let message = format!(
-                "Restore from backup succeeded. Managed OpenClaw is starting again on VM {} with restored durable-home contents.",
+                "Restore from backup succeeded. Managed OpenClaw is starting again on VM {} with restored state-volume contents.",
                 restored.id
             );
             insert_managed_environment_event(
@@ -3316,6 +4394,24 @@ pub async fn agent_api_healthcheck() -> anyhow::Result<()> {
         .context("initialize configured managed VM provider")?;
     if let ManagedVmProvider::Incus(incus) = &provider {
         incus.healthcheck().await?;
+    }
+    if should_probe_incus_canary_health() && !matches!(provider, ManagedVmProvider::Incus(_)) {
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: None,
+            incus: None,
+        };
+        let incus = managed_vm_provider(Some(&requested))
+            .context("initialize configured Incus canary provider")?;
+        match incus {
+            ManagedVmProvider::Incus(incus) => incus
+                .healthcheck()
+                .await
+                .context("validate configured Incus canary backend")?,
+            ManagedVmProvider::Microvm(_) => {
+                unreachable!("explicit incus provider must resolve to Incus")
+            }
+        }
     }
     provider
         .ensure_customer_openclaw_flow_supported()
@@ -3481,6 +4577,40 @@ mod tests {
         result
     }
 
+    async fn with_env_overrides_async<T, F, Fut>(vars: &[(&str, Option<&str>)], f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let _guard = serial_test_guard();
+        let prior = vars
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for (name, value) in vars {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(name);
+                },
+            }
+        }
+        let result = f().await;
+        for (name, value) in prior {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(&name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&name);
+                },
+            }
+        }
+        result
+    }
+
     fn requested_microvm_params(params: MicrovmProvisionParams) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: Some(ProviderKind::Microvm),
@@ -3495,6 +4625,68 @@ mod tests {
             microvm: None,
             incus: Some(params),
         }
+    }
+
+    const TEST_INCUS_CLIENT_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDGTCCAgGgAwIBAgIUSLL0u6Or6OhJyD/VqMAFn2AfwxIwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRdGVzdC1pbmN1cy1jbGllbnQwHhcNMjYwMzE3MjE1ODA4
+WhcNMjYwMzE4MjE1ODA4WjAcMRowGAYDVQQDDBF0ZXN0LWluY3VzLWNsaWVudDCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAIcmwlVgzsMaDL7OGIQkJ2Jh
+uPeooE/8TWzlXGygsZ6p7Hr0ldWR6FwhkWqMvxP3DLYtrDulNAlDQvdqXiUvLqNB
+O3jG3QTG+tra98xD2rC6kPX1Br9K4IY/dIlIDt0wRprzVdmTTn58XyoBj5jHiJ6w
+b1uAtVI3sJHEjJSSkZtcFbwe7YveWjLRIugnGLKKXPvRp+lxnSIAygBMroUHwOeP
+RwQ42ay4Uea96oWq/Sj9YGT3GUJkFj5rhHh+Tg7svnTv9sKWE2O3mLTSaCVJCujk
+z62PIVJqmc4DG/7Paju6uBCfc+TbSGaCTawTdk0QnglZXLHYfqBfP91XZosG6LkC
+AwEAAaNTMFEwHQYDVR0OBBYEFIHOohIqdDLl51aC+ORm/SlNmBupMB8GA1UdIwQY
+MBaAFIHOohIqdDLl51aC+ORm/SlNmBupMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBAHGLFSolSFhibpzXeH5ykncCnu9iUs1awhYKGDtWrclSeOKB
+Z23bvWdkHKJVJvrE3nN+VGlLTVNA14MnvK2rmXFBhCx9QBdXqfzbxD6NRNFTxzAS
+BqZ+h1+rHqc0hQN9an2tPXWuMQsE+Zh2gFDAtuOjYybTr+PRqKv2W4sMtMDH7N7k
+xjQ7sRljlkRmzU9pPwgtApJ83/x9+2SO7+tge2ia8oLs3+XvHAf8pEhX+OvQXXPp
++nkb/19iwR7/hNf1gJPKvIF2//tY26XYesM1ORmk0rxiz8bsL/LBmJ0wkv+yy41V
+atWQmMQ8cvpIyjH1YV5cDViWH2OobPHNgA1XOMk=
+-----END CERTIFICATE-----
+"#;
+
+    const TEST_INCUS_CLIENT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCHJsJVYM7DGgy+
+zhiEJCdiYbj3qKBP/E1s5VxsoLGeqex69JXVkehcIZFqjL8T9wy2Law7pTQJQ0L3
+al4lLy6jQTt4xt0Exvra2vfMQ9qwupD19Qa/SuCGP3SJSA7dMEaa81XZk05+fF8q
+AY+Yx4iesG9bgLVSN7CRxIyUkpGbXBW8Hu2L3loy0SLoJxiyilz70afpcZ0iAMoA
+TK6FB8Dnj0cEONmsuFHmveqFqv0o/WBk9xlCZBY+a4R4fk4O7L507/bClhNjt5i0
+0mglSQro5M+tjyFSapnOAxv+z2o7urgQn3Pk20hmgk2sE3ZNEJ4JWVyx2H6gXz/d
+V2aLBui5AgMBAAECggEAOk2OKCbLC3+BYA6opNiz5M0jbjNgdSDyhbesV3A7L6c+
+TQyWVrvK8XPJt51gEMzSvwSU+GYcPKK3kORiGMhx5huN/FxNnHH6Zc9wdr4O6Y6S
+WoiJkJxMn51gOJjNUL4yt0WiE2powkgFBaoGuHHbjhmu8Fpl3kIH+dpAixdvmQVQ
+Hg5BTjsu3Hw2+DUgE8JxNrIc67fHWIgsUzOIulYq0LPLTnM4oFSeAA7s6tSQWnC2
+Kc5sevg3bA1IszoslIwdTYF5g9xTRKfWtuWwUPSYE4++/OssEoB0epqNozn6gf7W
+fXNmEHOhDB6eBwiXZCG4HLxC8r6B2kzsZ/nGfjf6wQKBgQC7AMKAoUzJRV2sRZTp
+ap0C/DdzyY54IvgaN7A/nnxxsU2uq1dee1DpGF4aHgoNdo1546P9PY4LUnifBglj
+Et369RIWFs8wTJ+uJM5wwIlT6UJCsehI6iosS80XgnsjrIvtDRGSTZNbOjb6m3g/
+HIrrt4SztWNj3cWDPqTAe9X0RwKBgQC5BGT6o5wrJ01UQkMmpxbi+Hkje7KVIRWu
+hYifKhFGdQBKhvcmHgPkooEEwy2oItphaWDQ4wlz63i4h7pQ/ZKWEMGQEgIT58M0
+USu+G0BI9kq7OroIYg2oOqZeVJBGmIPnlqk7PFq/P7YCBtbrcqYu7dM21L9ir1fB
+pXN+3qu6/wKBgEUCZcTEQarw7z2Yu/hbgK/OVcRj+DB7byV1sZP4r6HhNXKlBmv2
+hAhRFsD6nukS++ikSis1IQsqlxrQRnyKROLMt6zxI+qGDFNef9R6KPOPXAVy0+68
+g22vV3M6kqi6jzSeowJjoGKFHC7lWr2nkdik89LBuHjtKWtinbfuuykXAoGAA94d
+pkepShWmPi6sbLBtgA0lqyI413k7lMxh0MH2Xnyvpt8vZ3KVLkBfZhQWbj9cRVEI
+nxU/61ZuzZy4vlyupchv420c8gGUSRGxUmYLb/sGEOfnX6l9E5k2RR6LbY5eo4a4
+vu5CD2FrkptF/uIEq1J5adoErjFwKjIlOe+5s00CgYBPiSt15PUz83TcNXcn6BHL
+Fm+QL4t+94HlkGR3BXyrNJ0kdKxM0kgDodXXDhzWdcsape1TUcubzHC90FbXC5NY
+eaWH/THQo6Z7ayz1/fqyCldZbdtdEt+JM5lGrRqSSz8MM1+iAAu3w1RON6DDQ/ZL
+GFs2pW5hEhS7cCO0qXaa5g==
+-----END PRIVATE KEY-----
+"#;
+
+    fn write_temp_test_file(prefix: &str, contents: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        path.push(format!("{prefix}-{suffix}-{}.pem", std::process::id()));
+        std::fs::write(&path, contents).expect("write temp test file");
+        path
     }
 
     fn cloud_init_write_file_content(user_data: &str, path: &str) -> Option<String> {
@@ -3551,7 +4743,12 @@ mod tests {
         prior_incus_profile: Option<String>,
         prior_incus_storage_pool: Option<String>,
         prior_incus_image_alias: Option<String>,
+        prior_incus_openclaw_guest_ipv4_cidr: Option<String>,
+        prior_incus_openclaw_proxy_host: Option<String>,
         prior_incus_insecure_tls: Option<String>,
+        prior_incus_client_cert_path: Option<String>,
+        prior_incus_client_key_path: Option<String>,
+        prior_incus_server_cert_path: Option<String>,
     }
 
     impl ServerMicrovmEnvGuard {
@@ -3564,7 +4761,13 @@ mod tests {
             let prior_incus_profile = std::env::var(INCUS_PROFILE_ENV).ok();
             let prior_incus_storage_pool = std::env::var(INCUS_STORAGE_POOL_ENV).ok();
             let prior_incus_image_alias = std::env::var(INCUS_IMAGE_ALIAS_ENV).ok();
+            let prior_incus_openclaw_guest_ipv4_cidr =
+                std::env::var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV).ok();
+            let prior_incus_openclaw_proxy_host = std::env::var(INCUS_OPENCLAW_PROXY_HOST_ENV).ok();
             let prior_incus_insecure_tls = std::env::var(INCUS_INSECURE_TLS_ENV).ok();
+            let prior_incus_client_cert_path = std::env::var(INCUS_CLIENT_CERT_PATH_ENV).ok();
+            let prior_incus_client_key_path = std::env::var(INCUS_CLIENT_KEY_PATH_ENV).ok();
+            let prior_incus_server_cert_path = std::env::var(INCUS_SERVER_CERT_PATH_ENV).ok();
             unsafe {
                 std::env::set_var(MICROVM_SPAWNER_URL_ENV, spawner_url);
                 std::env::set_var(VM_PROVIDER_ENV, "microvm");
@@ -3573,7 +4776,12 @@ mod tests {
                 std::env::remove_var(INCUS_PROFILE_ENV);
                 std::env::remove_var(INCUS_STORAGE_POOL_ENV);
                 std::env::remove_var(INCUS_IMAGE_ALIAS_ENV);
+                std::env::remove_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV);
+                std::env::remove_var(INCUS_OPENCLAW_PROXY_HOST_ENV);
                 std::env::remove_var(INCUS_INSECURE_TLS_ENV);
+                std::env::remove_var(INCUS_CLIENT_CERT_PATH_ENV);
+                std::env::remove_var(INCUS_CLIENT_KEY_PATH_ENV);
+                std::env::remove_var(INCUS_SERVER_CERT_PATH_ENV);
             }
             match kind {
                 Some(kind) => unsafe {
@@ -3592,7 +4800,12 @@ mod tests {
                 prior_incus_profile,
                 prior_incus_storage_pool,
                 prior_incus_image_alias,
+                prior_incus_openclaw_guest_ipv4_cidr,
+                prior_incus_openclaw_proxy_host,
                 prior_incus_insecure_tls,
+                prior_incus_client_cert_path,
+                prior_incus_client_key_path,
+                prior_incus_server_cert_path,
             }
         }
     }
@@ -3663,12 +4876,52 @@ mod tests {
                     std::env::remove_var(INCUS_IMAGE_ALIAS_ENV);
                 },
             }
+            match self.prior_incus_openclaw_guest_ipv4_cidr.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV);
+                },
+            }
+            match self.prior_incus_openclaw_proxy_host.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_OPENCLAW_PROXY_HOST_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_OPENCLAW_PROXY_HOST_ENV);
+                },
+            }
             match self.prior_incus_insecure_tls.as_deref() {
                 Some(prior) => unsafe {
                     std::env::set_var(INCUS_INSECURE_TLS_ENV, prior);
                 },
                 None => unsafe {
                     std::env::remove_var(INCUS_INSECURE_TLS_ENV);
+                },
+            }
+            match self.prior_incus_client_cert_path.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_CLIENT_CERT_PATH_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_CLIENT_CERT_PATH_ENV);
+                },
+            }
+            match self.prior_incus_client_key_path.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_CLIENT_KEY_PATH_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_CLIENT_KEY_PATH_ENV);
+                },
+            }
+            match self.prior_incus_server_cert_path.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_SERVER_CERT_PATH_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_SERVER_CERT_PATH_ENV);
                 },
             }
         }
@@ -3865,6 +5118,8 @@ mod tests {
                 storage_pool: None,
                 image_alias: None,
                 insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
 
@@ -3886,64 +5141,216 @@ mod tests {
                 storage_pool: None,
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
-
-        let err =
-            resolved_incus_params(Some(&requested)).expect_err("missing storage pool must fail");
-        assert!(err.to_string().contains("incus.storage_pool"));
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let err = resolved_incus_params(Some(&requested))
+                    .expect_err("missing storage pool must fail");
+                assert!(err.to_string().contains("incus.storage_pool"));
+            },
+        );
     }
 
     #[test]
     fn resolved_managed_vm_provider_config_accepts_incus_request_params() {
-        let requested = ManagedVmProvisionParams {
-            provider: Some(ProviderKind::Incus),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: None,
-                kind: Some(MicrovmAgentKind::Openclaw),
-                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
-            }),
-            incus: Some(IncusProvisionParams {
-                endpoint: Some("https://incus.internal:8443".to_string()),
-                project: Some("managed-agents".to_string()),
-                profile: Some("pika-agent".to_string()),
-                storage_pool: Some("managed-agents-zfs".to_string()),
-                image_alias: Some("pika-agent/dev".to_string()),
-                insecure_tls: Some(true),
-            }),
+        let _guard = serial_test_guard();
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let requested = ManagedVmProvisionParams {
+                    provider: Some(ProviderKind::Incus),
+                    microvm: Some(MicrovmProvisionParams {
+                        spawner_url: None,
+                        kind: Some(MicrovmAgentKind::Openclaw),
+                        backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+                    }),
+                    incus: Some(IncusProvisionParams {
+                        endpoint: Some("https://incus.internal:8443".to_string()),
+                        project: Some("managed-agents".to_string()),
+                        profile: Some("pika-agent".to_string()),
+                        storage_pool: Some("managed-agents-zfs".to_string()),
+                        image_alias: Some("pika-agent/dev".to_string()),
+                        insecure_tls: Some(true),
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                    }),
+                };
+
+                let resolved = resolve_managed_vm_provider_config(Some(&requested))
+                    .expect("resolve incus config");
+                assert_eq!(
+                    resolved,
+                    ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
+                        endpoint: "https://incus.internal:8443".to_string(),
+                        project: "managed-agents".to_string(),
+                        profile: "pika-agent".to_string(),
+                        storage_pool: "managed-agents-zfs".to_string(),
+                        image_alias: "pika-agent/dev".to_string(),
+                        insecure_tls: true,
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                        agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+                        agent_backend: ResolvedMicrovmAgentBackend::Native,
+                    })
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_incus_tls_config_requires_cert_and_key_together() {
+        let resolved = ResolvedIncusParams {
+            endpoint: "http://127.0.0.1:8443".to_string(),
+            project: "managed-agents".to_string(),
+            profile: "pika-agent".to_string(),
+            storage_pool: "managed-agents-zfs".to_string(),
+            image_alias: "pika-agent/dev".to_string(),
+            insecure_tls: false,
+            openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
+            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+            agent_backend: ResolvedMicrovmAgentBackend::Native,
         };
 
-        let resolved =
-            resolve_managed_vm_provider_config(Some(&requested)).expect("resolve incus config");
-        assert_eq!(
-            resolved,
-            ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
-                endpoint: "https://incus.internal:8443".to_string(),
-                project: "managed-agents".to_string(),
-                profile: "pika-agent".to_string(),
-                storage_pool: "managed-agents-zfs".to_string(),
-                image_alias: "pika-agent/dev".to_string(),
-                insecure_tls: true,
-                agent_kind: ResolvedMicrovmAgentKind::Openclaw,
-                agent_backend: ResolvedMicrovmAgentBackend::Native,
-            })
+        with_env_overrides(
+            &[
+                (INCUS_CLIENT_CERT_PATH_ENV, Some("/tmp/incus-client.crt")),
+                (INCUS_CLIENT_KEY_PATH_ENV, None),
+                (INCUS_SERVER_CERT_PATH_ENV, None),
+            ],
+            || {
+                let err = resolved_incus_tls_config(&resolved)
+                    .expect_err("missing key should fail validation");
+                assert!(err.to_string().contains(INCUS_CLIENT_KEY_PATH_ENV));
+            },
         );
+    }
+
+    #[test]
+    fn resolved_incus_tls_config_requires_client_identity_for_https() {
+        let resolved = ResolvedIncusParams {
+            endpoint: "https://incus.internal:8443".to_string(),
+            project: "managed-agents".to_string(),
+            profile: "pika-agent".to_string(),
+            storage_pool: "managed-agents-zfs".to_string(),
+            image_alias: "pika-agent/dev".to_string(),
+            insecure_tls: true,
+            openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
+            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+            agent_backend: ResolvedMicrovmAgentBackend::Native,
+        };
+
+        with_env_overrides(
+            &[
+                (INCUS_CLIENT_CERT_PATH_ENV, None),
+                (INCUS_CLIENT_KEY_PATH_ENV, None),
+                (INCUS_SERVER_CERT_PATH_ENV, None),
+            ],
+            || {
+                let err = resolved_incus_tls_config(&resolved)
+                    .expect_err("https endpoint should require client identity");
+                assert!(err.to_string().contains(INCUS_CLIENT_CERT_PATH_ENV));
+            },
+        );
+    }
+
+    #[test]
+    fn build_incus_http_client_accepts_valid_client_identity_paths() {
+        let cert_path = write_temp_test_file("incus-client-cert", TEST_INCUS_CLIENT_CERT_PEM);
+        let key_path = write_temp_test_file("incus-client-key", TEST_INCUS_CLIENT_KEY_PEM);
+        let server_cert_path =
+            write_temp_test_file("incus-server-cert", TEST_INCUS_CLIENT_CERT_PEM);
+        let resolved = ResolvedIncusParams {
+            endpoint: "https://incus.internal:8443".to_string(),
+            project: "managed-agents".to_string(),
+            profile: "pika-agent".to_string(),
+            storage_pool: "managed-agents-zfs".to_string(),
+            image_alias: "pika-agent/dev".to_string(),
+            insecure_tls: true,
+            openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
+            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+            agent_backend: ResolvedMicrovmAgentBackend::Native,
+        };
+
+        with_env_overrides(
+            &[
+                (
+                    INCUS_CLIENT_CERT_PATH_ENV,
+                    Some(cert_path.to_str().expect("cert path utf8")),
+                ),
+                (
+                    INCUS_CLIENT_KEY_PATH_ENV,
+                    Some(key_path.to_str().expect("key path utf8")),
+                ),
+                (
+                    INCUS_SERVER_CERT_PATH_ENV,
+                    Some(server_cert_path.to_str().expect("server cert path utf8")),
+                ),
+            ],
+            || {
+                build_incus_http_client(&resolved).expect("valid client identity should build");
+            },
+        );
+
+        std::fs::remove_file(cert_path).ok();
+        std::fs::remove_file(key_path).ok();
+        std::fs::remove_file(server_cert_path).ok();
     }
 
     #[test]
     fn resolved_incus_params_require_image_alias() {
         let _guard = serial_test_guard();
-        let requested = requested_incus_params(IncusProvisionParams {
-            endpoint: Some("https://incus.internal:8443".to_string()),
-            project: Some("managed-agents".to_string()),
-            profile: Some("pika-agent".to_string()),
-            storage_pool: Some("managed-agents-zfs".to_string()),
-            image_alias: None,
-            insecure_tls: None,
-        });
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let requested = requested_incus_params(IncusProvisionParams {
+                    endpoint: Some("https://incus.internal:8443".to_string()),
+                    project: Some("managed-agents".to_string()),
+                    profile: Some("pika-agent".to_string()),
+                    storage_pool: Some("managed-agents-zfs".to_string()),
+                    image_alias: None,
+                    insecure_tls: None,
+                    openclaw_guest_ipv4_cidr: None,
+                    openclaw_proxy_host: None,
+                });
 
-        let err = resolved_incus_params(Some(&requested)).expect_err("missing image alias");
-        assert!(err.to_string().contains("incus.image_alias"));
+                let err = resolved_incus_params(Some(&requested)).expect_err("missing image alias");
+                assert!(err.to_string().contains("incus.image_alias"));
+            },
+        );
     }
 
     #[test]
@@ -4179,6 +5586,11 @@ mod tests {
         let (base_url, rx) = spawn_response_sequence_server(vec![
             ("200 OK", r#"{"type":"sync","metadata":{}}"#),
             (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
+            (
                 "202 Accepted",
                 r#"{"type":"async","operation":"/1.0/operations/op-create","metadata":{"err":""}}"#,
             ),
@@ -4202,24 +5614,33 @@ mod tests {
                 profile: Some("pika-agent".to_string()),
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };
-        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
         let owner_keys = Keys::generate();
         let bot_keys = Keys::generate();
-        let created = provider
-            .create_managed_vm(
-                ManagedVmCreateInput {
-                    owner_pubkey: &owner_keys.public_key(),
-                    relay_urls: &default_message_relays(),
-                    bot_secret_hex: &bot_keys.secret_key().to_secret_hex(),
-                    bot_pubkey_hex: &bot_keys.public_key().to_hex(),
-                },
-                Some("req-incus-create"),
-            )
-            .await
-            .expect("incus create should succeed");
+        let created = with_env_overrides_async(
+            &[(ANTHROPIC_API_KEY_ENV, Some("sk-ant-test-incus"))],
+            || async {
+                let provider =
+                    managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+                provider
+                    .create_managed_vm(
+                        ManagedVmCreateInput {
+                            owner_pubkey: &owner_keys.public_key(),
+                            relay_urls: &default_message_relays(),
+                            bot_secret_hex: &bot_keys.secret_key().to_secret_hex(),
+                            bot_pubkey_hex: &bot_keys.public_key().to_hex(),
+                        },
+                        Some("req-incus-create"),
+                    )
+                    .await
+                    .expect("incus create should succeed")
+            },
+        )
+        .await;
         assert_eq!(created.status, "running");
         assert_eq!(created.agent_kind, Some(MicrovmAgentKind::Openclaw));
         assert!(!created.guest_ready);
@@ -4236,6 +5657,19 @@ mod tests {
             .get("name")
             .and_then(serde_json::Value::as_str)
             .expect("volume name");
+
+        let profile_request = rx.recv().expect("captured profile request");
+        assert_eq!(profile_request.method, "GET");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
+        );
 
         let instance_request = rx.recv().expect("captured instance create request");
         assert_eq!(instance_request.method, "POST");
@@ -4261,12 +5695,37 @@ mod tests {
         assert_eq!(instance_body["type"], "virtual-machine");
         assert_eq!(instance_body["source"]["alias"], "pika-agent/dev");
         assert_eq!(
+            instance_body["config"]["limits.memory"],
+            INCUS_DEV_VM_MEMORY_LIMIT
+        );
+        assert_eq!(
             instance_body["devices"][INCUS_PERSISTENT_VOLUME_DEVICE_NAME]["path"],
             INCUS_PERSISTENT_VOLUME_PATH
         );
         assert_eq!(
             instance_body["devices"][INCUS_PERSISTENT_VOLUME_DEVICE_NAME]["source"],
             volume_name
+        );
+        assert!(instance_body["devices"]
+            .get(INCUS_OPENCLAW_PROXY_DEVICE_NAME)
+            .is_none());
+        assert_eq!(instance_body["devices"]["eth0"]["type"], "nic");
+        assert_eq!(instance_body["devices"]["eth0"]["network"], "incusbr0");
+        assert_eq!(instance_body["devices"]["eth0"]["name"], "eth0");
+        assert_eq!(
+            instance_body["devices"]["eth0"]["ipv4.address"],
+            instance_body["config"][INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY]
+        );
+        assert_eq!(
+            instance_body["config"][INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY],
+            "100.81.250.67"
+        );
+        assert!(
+            instance_body["config"][INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY]
+                .as_str()
+                .expect("proxy port")
+                .parse::<u16>()
+                .is_ok()
         );
         let user_data = instance_body["config"][INCUS_CLOUD_INIT_USER_DATA_KEY]
             .as_str()
@@ -4276,7 +5735,16 @@ mod tests {
         assert!(launcher.contains("export PIKA_OWNER_PUBKEY="));
         assert!(launcher.contains("export PIKA_RELAY_URLS="));
         assert!(launcher.contains("export PIKA_BOT_PUBKEY="));
+        assert!(launcher.contains("export ANTHROPIC_API_KEY='sk-ant-test-incus'"));
+        assert!(launcher.contains("export PIKA_ENABLE_OPENCLAW_PRIVATE_PROXY=1"));
+        assert!(launcher.contains("export PIKACHAT_SKIP_RELAY_READY_CHECK=1"));
+        assert!(launcher.contains("sock.connect((\"1.1.1.1\", 80))"));
+        assert!(launcher.contains("    print(sock.getsockname()[0])"));
+        assert!(launcher.contains("    pass"));
+        assert!(launcher.contains("    sock.close()"));
         assert!(launcher.contains("exec bash /workspace/pika-agent/start-agent.sh"));
+        assert!(user_data.contains("runcmd:"));
+        assert!(user_data.contains("systemctl, --no-block, restart, pika-managed-agent.service"));
         let state_setup = cloud_init_write_file_content(user_data, INCUS_STATE_VOLUME_SETUP_PATH)
             .expect("state-volume setup script in cloud-init");
         assert!(state_setup.contains(INCUS_PERSISTENT_DAEMON_STATE_DIR));
@@ -4289,14 +5757,19 @@ mod tests {
         )
         .expect("startup plan in cloud-init");
         assert!(startup_plan.contains("\"agent_kind\": \"openclaw\""));
-        let service_unit = cloud_init_write_file_content(user_data, INCUS_SYSTEMD_SERVICE_PATH)
-            .expect("service unit in cloud-init");
-        assert!(service_unit.contains("RequiresMountsFor=/mnt/pika-state"));
-        assert!(service_unit.contains(&format!(
-            "ExecStartPre=/bin/bash {INCUS_STATE_VOLUME_SETUP_PATH}"
-        )));
-        assert!(user_data.contains(INCUS_SYSTEMD_SERVICE_NAME));
+        assert!(
+            !user_data.contains("/etc/systemd/system/pika-managed-agent.service"),
+            "service unit should be baked into the Incus guest image, not written by cloud-init"
+        );
         assert_eq!(instance_body["config"]["user.pika.agent_kind"], "openclaw");
+        assert!(
+            instance_body["config"][INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY]
+                .as_str()
+                .expect("proxy port")
+                .parse::<u16>()
+                .expect("proxy port parses")
+                >= INCUS_OPENCLAW_PROXY_PORT_START
+        );
 
         let wait_request = rx.recv().expect("captured operation wait request");
         assert_eq!(wait_request.method, "GET");
@@ -4316,7 +5789,7 @@ mod tests {
         assert_eq!(
             ready_request.path,
             format!(
-                "/1.0/instances/{instance_name}/file?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+                "/1.0/instances/{instance_name}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
             )
         );
     }
@@ -4328,6 +5801,7 @@ mod tests {
             "ready": true,
             "agent_kind": "openclaw",
             "probe": "openclaw_gateway_health",
+            "boot_id": "boot-ready-1",
         });
         let (base_url, rx) = spawn_response_sequence_server(vec![
             (
@@ -4335,6 +5809,7 @@ mod tests {
                 r#"{"type":"sync","metadata":{"status":"Running"}}"#,
             ),
             ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-ready-1\n"),
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
@@ -4350,6 +5825,8 @@ mod tests {
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -4370,8 +5847,239 @@ mod tests {
         assert_eq!(
             ready_request.path,
             format!(
-                "/1.0/instances/{vm_id}/file?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
             )
+        );
+        let boot_id_request = rx.recv().expect("captured boot-id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_loads_incus_openclaw_launch_auth_from_guest_config() {
+        let vm_id = "pika-agent-launch-auth";
+        let (base_url, rx) = spawn_response_sequence_server(vec![(
+            "200 OK",
+            r#"{"gateway":{"auth":{"token":"guest-launch-token"}}}"#,
+        )]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                insecure_tls: Some(true),
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let launch_auth = provider
+            .get_openclaw_launch_auth(vm_id, Some("req-incus-launch-auth"))
+            .await
+            .expect("load incus OpenClaw launch auth");
+        assert_eq!(launch_auth.vm_id, vm_id);
+        assert_eq!(
+            launch_auth.gateway_auth_token.as_deref(),
+            Some("guest-launch-token")
+        );
+
+        let request = rx.recv().expect("captured launch auth request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fopenclaw%2Fopenclaw.json"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_loads_incus_openclaw_proxy_target_from_instance_state() {
+        let vm_id = "pika-agent-openclaw-target";
+        let (base_url, rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"config":{"user.pika.openclaw_proxy_host":"100.81.250.67","user.pika.openclaw_proxy_port":"24123"},"devices":{"pikastate":{"type":"disk","path":"/mnt/pika-state"}}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running","network":{"enp5s0":{"addresses":[{"address":"10.193.52.24","family":"inet","scope":"global"}]}}}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-proxy","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                insecure_tls: Some(true),
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let target = provider
+            .get_openclaw_proxy_target(vm_id, Some("req-incus-openclaw-target"))
+            .await
+            .expect("load incus OpenClaw proxy target");
+        assert_eq!(target.base_url, "http://100.81.250.67:24123");
+
+        let request = rx.recv().expect("captured instance details request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            format!("/1.0/instances/{vm_id}?project=managed-agents")
+        );
+        let profile_request = rx.recv().expect("captured profile request");
+        assert_eq!(profile_request.method, "GET");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+        let state_request = rx.recv().expect("captured instance state request");
+        assert_eq!(state_request.method, "GET");
+        assert_eq!(
+            state_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
+        );
+        let patch_request = rx.recv().expect("captured proxy patch request");
+        assert_eq!(patch_request.method, "PATCH");
+        assert_eq!(
+            patch_request.path,
+            format!("/1.0/instances/{vm_id}?project=managed-agents")
+        );
+        let patch_body: serde_json::Value =
+            serde_json::from_str(&patch_request.body).expect("parse proxy patch body");
+        assert_eq!(
+            patch_body["devices"]["eth0"]["ipv4.address"],
+            "10.193.52.24"
+        );
+        assert_eq!(patch_body["devices"]["eth0"]["network"], "incusbr0");
+        assert_eq!(
+            patch_body["devices"][INCUS_OPENCLAW_PROXY_DEVICE_NAME]["type"],
+            "proxy"
+        );
+        assert_eq!(
+            patch_body["devices"][INCUS_OPENCLAW_PROXY_DEVICE_NAME]["connect"],
+            format!(
+                "tcp:10.193.52.24:{}",
+                pika_agent_microvm::DEFAULT_OPENCLAW_GATEWAY_PORT
+            )
+        );
+        assert_eq!(
+            patch_body["devices"][INCUS_OPENCLAW_PROXY_DEVICE_NAME]["listen"],
+            "tcp:100.81.250.67:24123"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_loads_incus_openclaw_proxy_target_when_patch_returns_sync() {
+        let vm_id = "pika-agent-openclaw-target-sync";
+        let (base_url, rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"config":{"user.pika.openclaw_proxy_host":"100.81.250.67","user.pika.openclaw_proxy_port":"24123"},"devices":{"pikastate":{"type":"disk","path":"/mnt/pika-state"}}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running","network":{"enp5s0":{"addresses":[{"address":"10.193.52.24","family":"inet","scope":"global"}]}}}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                insecure_tls: Some(true),
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let target = provider
+            .get_openclaw_proxy_target(vm_id, Some("req-incus-openclaw-target-sync"))
+            .await
+            .expect("load incus OpenClaw proxy target with sync patch");
+        assert_eq!(target.base_url, "http://100.81.250.67:24123");
+
+        let request = rx.recv().expect("captured instance details request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            format!("/1.0/instances/{vm_id}?project=managed-agents")
+        );
+        let profile_request = rx.recv().expect("captured profile request");
+        assert_eq!(profile_request.method, "GET");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+        let state_request = rx.recv().expect("captured instance state request");
+        assert_eq!(state_request.method, "GET");
+        assert_eq!(
+            state_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
+        );
+        let patch_request = rx.recv().expect("captured proxy patch request");
+        assert_eq!(patch_request.method, "PATCH");
+        assert_eq!(
+            patch_request.path,
+            format!("/1.0/instances/{vm_id}?project=managed-agents")
         );
     }
 
@@ -4399,6 +6107,8 @@ mod tests {
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -4409,6 +6119,330 @@ mod tests {
         assert_eq!(status.status, "running");
         assert!(!status.startup_probe_satisfied);
         assert!(!status.guest_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_status_keeps_guest_unready_when_ready_signal_boot_id_is_stale() {
+        let vm_id = "pika-agent-stale-boot";
+        let ready_marker = serde_json::json!({
+            "ready": true,
+            "agent_kind": "openclaw",
+            "probe": "openclaw_gateway_health",
+            "boot_id": "boot-old",
+        });
+        let (base_url, _rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-current\n"),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let status = provider
+            .get_vm_status(vm_id, Some("req-incus-stale-boot"))
+            .await
+            .expect("load incus status");
+        assert_eq!(status.status, "running");
+        assert!(!status.startup_probe_satisfied);
+        assert!(!status.guest_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_backup_status_uses_latest_incus_volume_snapshot() {
+        let vm_id = "pika-agent-backup";
+        let volume_name = format!("{vm_id}-state");
+        let (base_url, rx) = spawn_response_sequence_server(vec![(
+            "200 OK",
+            r#"{"type":"sync","metadata":[{"name":"custom/pika-agent-backup-state/snapshots/daily-20260317","created_at":"2026-03-17T04:00:00Z"},{"name":"custom/pika-agent-backup-state/snapshots/daily-20260318","created_at":"2026-03-18T04:00:00Z"}]}"#,
+        )]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let status = provider
+            .get_vm_backup_status(vm_id, Some("req-incus-backup"))
+            .await
+            .expect("load incus backup status");
+
+        assert_eq!(status.vm_id, vm_id);
+        assert_eq!(
+            status.backup_unit_kind,
+            VmBackupUnitKind::PersistentStateVolume
+        );
+        assert_eq!(
+            status.backup_target,
+            format!("managed-agents-zfs/{volume_name}")
+        );
+        assert_eq!(
+            status.recovery_point_kind,
+            VmRecoveryPointKind::VolumeSnapshot
+        );
+        assert_eq!(
+            status.latest_recovery_point_name.as_deref(),
+            Some("daily-20260318")
+        );
+        assert_eq!(
+            status.latest_successful_backup_at.as_deref(),
+            Some("2026-03-18T04:00:00Z")
+        );
+
+        let request = rx.recv().expect("captured backup request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            format!(
+                "/1.0/storage-pools/managed-agents-zfs/volumes/custom/{volume_name}/snapshots?project=managed-agents&recursion=1"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_recover_uses_incus_backend() {
+        let vm_id = "pika-agent-recover";
+        let ready_marker = serde_json::json!({
+            "ready": true,
+            "agent_kind": "openclaw",
+            "probe": "openclaw_gateway_health",
+            "boot_id": "boot-recover-1",
+        });
+        let (base_url, rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Stopped"}}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-recover","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-recover-1\n"),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let status = provider
+            .recover_vm(vm_id, Some("req-incus-recover"))
+            .await
+            .expect("recover incus VM");
+        assert_eq!(status.id, vm_id);
+        assert_eq!(status.status, "running");
+        assert!(status.guest_ready);
+
+        let state_request = rx.recv().expect("captured initial state request");
+        assert_eq!(
+            state_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let recover_request = rx.recv().expect("captured recover request");
+        assert_eq!(recover_request.method, "PUT");
+        assert_eq!(
+            recover_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        assert!(recover_request.body.contains(r#""action":"start""#));
+        let wait_request = rx.recv().expect("captured operation wait request");
+        assert_eq!(
+            wait_request.path,
+            "/1.0/operations/op-recover/wait?timeout=60"
+        );
+        let status_request = rx.recv().expect("captured post-recover status request");
+        assert_eq!(
+            status_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let ready_request = rx.recv().expect("captured ready marker request");
+        assert_eq!(
+            ready_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            )
+        );
+        let boot_id_request = rx.recv().expect("captured guest boot id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_restore_uses_latest_incus_snapshot_and_restarts_vm() {
+        let vm_id = "pika-agent-restore";
+        let volume_name = format!("{vm_id}-state");
+        let ready_marker = serde_json::json!({
+            "ready": true,
+            "agent_kind": "openclaw",
+            "probe": "openclaw_gateway_health",
+            "boot_id": "boot-restore-1",
+        });
+        let (base_url, rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":[{"name":"custom/pika-agent-restore-state/snapshots/daily-20260317","created_at":"2026-03-17T04:00:00Z"},{"name":"custom/pika-agent-restore-state/snapshots/daily-20260318","created_at":"2026-03-18T04:00:00Z"}]}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-stop","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-start","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-restore-1\n"),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let status = provider
+            .restore_vm(vm_id, Some("req-incus-restore"))
+            .await
+            .expect("restore incus VM");
+        assert_eq!(status.id, vm_id);
+        assert_eq!(status.status, "running");
+        assert!(status.guest_ready);
+
+        let initial_state_request = rx.recv().expect("captured initial state request");
+        assert_eq!(
+            initial_state_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let snapshots_request = rx.recv().expect("captured snapshots request");
+        assert_eq!(
+            snapshots_request.path,
+            format!(
+                "/1.0/storage-pools/managed-agents-zfs/volumes/custom/{volume_name}/snapshots?project=managed-agents&recursion=1"
+            )
+        );
+        let stop_request = rx.recv().expect("captured stop request");
+        assert_eq!(stop_request.method, "PUT");
+        assert!(stop_request.body.contains(r#""action":"stop""#));
+        let stop_wait_request = rx.recv().expect("captured stop wait request");
+        assert_eq!(
+            stop_wait_request.path,
+            "/1.0/operations/op-stop/wait?timeout=60"
+        );
+        let restore_request = rx.recv().expect("captured restore request");
+        assert_eq!(restore_request.method, "PUT");
+        assert_eq!(
+            restore_request.path,
+            format!(
+                "/1.0/storage-pools/managed-agents-zfs/volumes/custom/{volume_name}?project=managed-agents"
+            )
+        );
+        assert!(restore_request
+            .body
+            .contains(r#""restore":"daily-20260318""#));
+        let start_request = rx.recv().expect("captured start request");
+        assert_eq!(start_request.method, "PUT");
+        assert!(start_request.body.contains(r#""action":"start""#));
+        let start_wait_request = rx.recv().expect("captured start wait request");
+        assert_eq!(
+            start_wait_request.path,
+            "/1.0/operations/op-start/wait?timeout=60"
+        );
+        let status_request = rx.recv().expect("captured post-restore status request");
+        assert_eq!(
+            status_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let ready_request = rx.recv().expect("captured ready marker request");
+        assert_eq!(
+            ready_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            )
+        );
+        let boot_id_request = rx.recv().expect("captured guest boot id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
+            )
+        );
     }
 
     #[tokio::test]
@@ -4447,6 +6481,8 @@ mod tests {
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -4466,11 +6502,24 @@ mod tests {
             .expect_err("incus create should fail after operation error");
         assert!(err.to_string().contains("instance failed to start"));
 
-        let _volume_create = rx.recv().expect("captured volume create");
+        let volume_create = rx.recv().expect("captured volume create");
+        let volume_body: serde_json::Value =
+            serde_json::from_str(&volume_create.body).expect("parse volume body");
+        assert_eq!(
+            volume_create.path,
+            "/1.0/storage-pools/managed-agents-zfs/volumes/custom?project=managed-agents"
+        );
+        assert_eq!(volume_body["content_type"], "filesystem");
+        assert!(volume_body.get("type").is_none());
         let instance_create = rx.recv().expect("captured instance create");
         let instance_body: serde_json::Value =
             serde_json::from_str(&instance_create.body).expect("parse instance body");
         let instance_name = instance_body["name"].as_str().expect("instance name");
+        assert_eq!(volume_body["name"], format!("{instance_name}-state"));
+        assert_eq!(
+            volume_body["description"],
+            format!("Persistent managed-agent state volume for {instance_name}-state")
+        );
         let _create_wait = rx.recv().expect("captured create wait");
         let cleanup_delete = rx.recv().expect("captured cleanup delete");
         assert_eq!(
@@ -4492,6 +6541,15 @@ mod tests {
         let vm_id = "pika-agent-testdelete";
         let (base_url, rx) = spawn_response_sequence_server(vec![
             (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-stop","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            (
                 "202 Accepted",
                 r#"{"type":"async","operation":"/1.0/operations/op-delete","metadata":{"err":""}}"#,
             ),
@@ -4505,12 +6563,32 @@ mod tests {
             storage_pool: Some("managed-agents-zfs".to_string()),
             image_alias: Some("pika-agent/dev".to_string()),
             insecure_tls: None,
+            openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
         });
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
         provider
             .delete_vm(vm_id, Some("req-incus-delete"))
             .await
             .expect("incus delete should succeed");
+
+        let state_request = rx.recv().expect("captured delete state request");
+        assert_eq!(state_request.method, "GET");
+        assert_eq!(
+            state_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+
+        let stop_request = rx.recv().expect("captured stop request");
+        assert_eq!(stop_request.method, "PUT");
+        assert_eq!(
+            stop_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        assert!(stop_request.body.contains(r#""action":"stop""#));
+
+        let stop_wait = rx.recv().expect("captured stop wait request");
+        assert_eq!(stop_wait.path, "/1.0/operations/op-stop/wait?timeout=60");
 
         let instance_delete = rx.recv().expect("captured instance delete request");
         assert_eq!(instance_delete.method, "DELETE");
@@ -4559,6 +6637,8 @@ mod tests {
                 storage_pool: "managed-agents-zfs".to_string(),
                 image_alias: "pika-agent/dev".to_string(),
                 insecure_tls: true,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
                 agent_kind: ResolvedMicrovmAgentKind::Openclaw,
                 agent_backend: ResolvedMicrovmAgentBackend::Native,
             }),
@@ -4607,12 +6687,12 @@ mod tests {
         let ready_request = rx.recv().expect("captured row ready-marker request");
         assert_eq!(
             ready_request.path,
-            "/1.0/instances/vm-incus-row/file?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            "/1.0/instances/vm-incus-row/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
         );
     }
 
     #[test]
-    fn agent_api_healthcheck_rejects_incus_when_customer_openclaw_flow_is_unimplemented() {
+    fn agent_api_healthcheck_accepts_incus_when_customer_openclaw_flow_is_supported() {
         let (base_url, rx) = spawn_response_sequence_server(vec![
             ("200 OK", r#"{"type":"sync","metadata":{}}"#),
             (
@@ -4630,19 +6710,19 @@ mod tests {
                 (INCUS_PROFILE_ENV, Some("pika-agent")),
                 (INCUS_STORAGE_POOL_ENV, Some("managed-agents-zfs")),
                 (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, Some("10.193.52.0/24")),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, Some("100.81.250.67")),
                 (INCUS_INSECURE_TLS_ENV, Some("true")),
+                ("PIKA_AGENT_MICROVM_KIND", Some("openclaw")),
             ],
             || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("build runtime");
-                let err = runtime
+                runtime
                     .block_on(agent_api_healthcheck())
-                    .expect_err("incus healthcheck should reject unsupported customer flow");
-                assert!(err
-                    .to_string()
-                    .contains("validate managed-agent customer OpenClaw flow"));
+                    .expect("incus healthcheck should accept supported customer flow");
             },
         );
 
@@ -4679,6 +6759,7 @@ mod tests {
                 (INCUS_PROFILE_ENV, Some("pika-agent")),
                 (INCUS_STORAGE_POOL_ENV, Some("managed-agents-zfs")),
                 (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, Some("10.193.52.0/24")),
                 (INCUS_INSECURE_TLS_ENV, Some("true")),
             ],
             || {
@@ -4701,6 +6782,64 @@ mod tests {
         assert_eq!(
             profile_request.path,
             "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+    }
+
+    #[test]
+    fn agent_api_healthcheck_probes_configured_incus_canary_backend_when_microvm_is_default() {
+        let (base_url, rx) = spawn_response_sequence_server(vec![
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0"}}}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+        ]);
+        with_env_overrides(
+            &[
+                (VM_PROVIDER_ENV, Some("microvm")),
+                (MICROVM_SPAWNER_URL_ENV, Some("http://127.0.0.1:8080")),
+                (INCUS_ENDPOINT_ENV, Some(base_url.as_str())),
+                (INCUS_PROJECT_ENV, Some("managed-agents")),
+                (INCUS_PROFILE_ENV, Some("pika-agent")),
+                (INCUS_STORAGE_POOL_ENV, Some("managed-agents-zfs")),
+                (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, Some("10.193.52.0/24")),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, Some("100.81.250.67")),
+                (INCUS_INSECURE_TLS_ENV, None),
+                (INCUS_CLIENT_CERT_PATH_ENV, None),
+                (INCUS_CLIENT_KEY_PATH_ENV, None),
+                (INCUS_SERVER_CERT_PATH_ENV, None),
+                ("PIKA_AGENT_MICROVM_KIND", Some("openclaw")),
+            ],
+            || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime");
+                runtime
+                    .block_on(agent_api_healthcheck())
+                    .expect("microvm-default healthcheck should probe configured incus canary");
+            },
+        );
+
+        let project_request = rx.recv().expect("project probe");
+        assert_eq!(project_request.path, "/1.0/projects/managed-agents");
+        let profile_request = rx.recv().expect("profile probe");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+        let pool_request = rx.recv().expect("storage pool probe");
+        assert_eq!(
+            pool_request.path,
+            "/1.0/storage-pools/managed-agents-zfs?project=managed-agents"
+        );
+        let image_request = rx.recv().expect("image alias probe");
+        assert_eq!(
+            image_request.path,
+            "/1.0/images/aliases/pika-agent%2Fdev?project=managed-agents"
         );
     }
 
@@ -4936,7 +7075,7 @@ mod tests {
 
         let copy = managed_environment_status_copy(Some(&row), Some(AgentStartupPhase::Failed));
 
-        assert!(copy.contains("preserve the durable home"));
+        assert!(copy.contains("preserve the current persistent state"));
         assert!(copy.contains("provisions a fresh environment instead"));
     }
 
@@ -5171,6 +7310,157 @@ mod tests {
         assert_eq!(latest.agent_id, existing.agent_id);
         assert_eq!(latest.phase, AGENT_PHASE_CREATING);
         assert_eq!(latest.vm_id, None);
+
+        clear_test_database(&mut conn);
+    }
+
+    #[tokio::test]
+    async fn reset_agent_for_owner_deletes_legacy_microvm_and_reprovisions_on_requested_incus() {
+        let _guard = serial_test_guard();
+        let Some(db_pool) = init_test_db_pool() else {
+            return;
+        };
+        let state = test_state(db_pool.clone());
+        let owner_npub = "npub1resetlegacytoincus";
+        let mut conn = db_pool.get().expect("get test connection");
+        clear_test_database(&mut conn);
+        let existing = AgentInstance::create(
+            &mut conn,
+            owner_npub,
+            "agent-reset-legacy",
+            Some("vm-reset-legacy"),
+            AGENT_PHASE_READY,
+        )
+        .expect("seed legacy microvm row");
+        drop(conn);
+
+        let (microvm_base_url, microvm_rx) = spawn_one_shot_server("204 No Content", "");
+        let (incus_base_url, incus_rx) = spawn_response_sequence_server(vec![
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-create","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("404 Not Found", ""),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(incus_base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                insecure_tls: Some(true),
+            }),
+        };
+
+        with_env_overrides(
+            &[
+                (VM_PROVIDER_ENV, Some("microvm")),
+                (MICROVM_SPAWNER_URL_ENV, Some(microvm_base_url.as_str())),
+            ],
+            || async {
+                let action = reset_agent_for_owner(
+                    &state,
+                    owner_npub,
+                    "req-reset-legacy-to-incus",
+                    Some(&requested),
+                )
+                .await
+                .expect("reset should delete legacy microvm and reprovision on incus");
+                assert_eq!(action.startup_phase, AgentStartupPhase::ProvisioningVm);
+                assert_eq!(action.row.provider, "incus");
+                assert_eq!(action.row.phase, AGENT_PHASE_CREATING);
+                assert!(action.row.vm_id.is_some());
+            },
+        )
+        .await;
+
+        let delete_request = microvm_rx.recv().expect("captured legacy microvm delete");
+        assert_eq!(delete_request.method, "DELETE");
+        assert_eq!(delete_request.path, "/vms/vm-reset-legacy");
+        assert_eq!(
+            delete_request
+                .headers
+                .get("x-request-id")
+                .map(String::as_str),
+            Some("req-reset-legacy-to-incus")
+        );
+
+        let volume_request = incus_rx.recv().expect("captured incus volume create");
+        assert_eq!(volume_request.method, "POST");
+        assert_eq!(
+            volume_request.path,
+            "/1.0/storage-pools/managed-agents-zfs/volumes/custom?project=managed-agents"
+        );
+
+        let profile_request = incus_rx.recv().expect("captured incus profile lookup");
+        assert_eq!(profile_request.method, "GET");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+
+        let instance_request = incus_rx.recv().expect("captured incus instance create");
+        assert_eq!(instance_request.method, "POST");
+        assert_eq!(
+            instance_request.path,
+            "/1.0/instances?project=managed-agents"
+        );
+
+        let operation_request = incus_rx.recv().expect("captured incus operation poll");
+        assert_eq!(operation_request.method, "GET");
+        assert_eq!(
+            operation_request.path,
+            "/1.0/operations/op-create?project=managed-agents"
+        );
+
+        let status_request = incus_rx.recv().expect("captured incus status request");
+        assert_eq!(status_request.method, "GET");
+        let created_vm_id = status_request
+            .path
+            .strip_prefix("/1.0/instances/")
+            .and_then(|rest| rest.strip_suffix("/state?project=managed-agents"))
+            .expect("status request path should contain vm id")
+            .to_string();
+        assert!(!created_vm_id.is_empty());
+
+        let ready_marker_request = incus_rx.recv().expect("captured incus ready-marker lookup");
+        assert_eq!(ready_marker_request.method, "GET");
+        assert_eq!(
+            ready_marker_request.path,
+            format!(
+                "/1.0/instances/{created_vm_id}/files?path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json&project=managed-agents"
+            )
+        );
+
+        let mut conn = db_pool.get().expect("get verify connection");
+        let latest = AgentInstance::find_latest_by_owner(&mut conn, owner_npub)
+            .expect("query latest row")
+            .expect("latest row");
+        assert_eq!(latest.provider, "incus");
+        assert_eq!(latest.vm_id.as_deref(), Some(created_vm_id.as_str()));
+        let stale = AgentInstance::find_by_agent_id(&mut conn, &existing.agent_id)
+            .expect("query legacy row")
+            .expect("legacy row");
+        assert_eq!(stale.phase, AGENT_PHASE_ERROR);
 
         clear_test_database(&mut conn);
     }

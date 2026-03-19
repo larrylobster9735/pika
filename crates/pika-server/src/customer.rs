@@ -15,6 +15,10 @@ use crate::models::agent_allowlist::AgentAllowlistEntry;
 use crate::models::managed_environment_event::ManagedEnvironmentEvent;
 use crate::nostr_auth::{expected_host_from_headers, verify_nip98_event};
 use crate::{RequestContext, State};
+use pika_agent_control_plane::{
+    IncusProvisionParams, ManagedVmProvisionParams, MicrovmAgentBackend, MicrovmAgentKind,
+    MicrovmProvisionParams, ProviderKind,
+};
 
 mod openclaw;
 
@@ -96,20 +100,24 @@ struct DashboardTemplate {
     can_provision: bool,
     can_recover: bool,
     can_reset: bool,
-    control_loop_notice: &'static str,
+    control_loop_notice: String,
     has_control_loop_notice: bool,
     recover_action_label: &'static str,
-    recover_semantics_copy: &'static str,
+    recover_semantics_copy: String,
     backup_state_label: &'static str,
     backup_state_tone: &'static str,
     backup_status_copy: String,
     backup_last_successful_at: String,
-    backup_host: String,
-    has_backup_host: bool,
+    backup_latest_recovery_point_name: String,
+    has_backup_latest_recovery_point_name: bool,
+    backup_target_label: String,
+    backup_target: String,
+    has_backup_target: bool,
     reset_requires_confirmation: bool,
     reset_safety_copy: String,
     can_launch_openclaw: bool,
     launch_status_copy: &'static str,
+    substrate_label: String,
     recent_activity: Vec<DashboardActivityItem>,
     has_recent_activity: bool,
 }
@@ -117,6 +125,7 @@ struct DashboardTemplate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OpenClawLaunchability {
     Launchable,
+    LegacySubstrate,
     UnexpectedRuntime,
     NotProvisioned,
     Provisioning,
@@ -134,12 +143,18 @@ impl OpenClawLaunchability {
             })
             .unwrap_or(false);
         let recoverable_vm_exists = row.and_then(|row| row.vm_id.as_deref()).is_some();
+        let is_incus_row = row
+            .map(|row| row.provider.eq_ignore_ascii_case("incus"))
+            .unwrap_or(false);
         if status.app_state == Some(crate::agent_api_v1_contract::AgentAppState::Ready)
             && status.startup_phase == Some(pika_agent_control_plane::AgentStartupPhase::Ready)
             && status.runtime_kind == Some(pika_agent_control_plane::MicrovmAgentKind::Openclaw)
+            && is_incus_row
             && recoverable_vm_exists
         {
             Self::Launchable
+        } else if row.is_some() && !is_incus_row {
+            Self::LegacySubstrate
         } else if status.runtime_kind == Some(pika_agent_control_plane::MicrovmAgentKind::Pi) {
             Self::UnexpectedRuntime
         } else if row.is_none() {
@@ -162,6 +177,9 @@ impl OpenClawLaunchability {
             Self::Launchable => {
                 "Open the built-in OpenClaw UI on its own platform-managed origin. Launch uses a short-lived platform ticket and a scoped UI session rather than the dashboard cookie."
             }
+            Self::LegacySubstrate => {
+                "This dashboard now launches OpenClaw only from Incus-backed managed environments. Reset this legacy environment to replace it with a fresh Incus-backed Managed OpenClaw runtime."
+            }
             Self::UnexpectedRuntime => {
                 "This managed environment was provisioned with the Pi runtime instead of OpenClaw. Reset or reprovision it before using the built-in OpenClaw UI."
             }
@@ -181,6 +199,18 @@ impl OpenClawLaunchability {
     }
 }
 
+fn customer_dashboard_managed_vm_policy() -> ManagedVmProvisionParams {
+    ManagedVmProvisionParams {
+        provider: Some(ProviderKind::Incus),
+        microvm: Some(MicrovmProvisionParams {
+            spawner_url: None,
+            kind: Some(MicrovmAgentKind::Openclaw),
+            backend: Some(MicrovmAgentBackend::Native),
+        }),
+        incus: Some(IncusProvisionParams::default()),
+    }
+}
+
 #[derive(Template)]
 #[template(path = "customer/reset_confirm.html")]
 struct ResetConfirmTemplate {
@@ -191,8 +221,11 @@ struct ResetConfirmTemplate {
     backup_state_tone: &'static str,
     backup_status_copy: String,
     backup_last_successful_at: String,
-    backup_host: String,
-    has_backup_host: bool,
+    backup_latest_recovery_point_name: String,
+    has_backup_latest_recovery_point_name: bool,
+    backup_target_label: String,
+    backup_target: String,
+    has_backup_target: bool,
 }
 
 fn browser_auth(state: &State) -> &BrowserAuthConfig {
@@ -369,7 +402,7 @@ fn verify_reset_confirmation_ticket(
     let token = token.ok_or_else(|| {
         (
             StatusCode::CONFLICT,
-            "destructive reset requires confirmation because backup protection is not healthy"
+            "destructive reset requires confirmation because recovery-point protection is not healthy"
                 .to_string(),
         )
     })?;
@@ -416,6 +449,10 @@ fn dashboard_template(
     let launchability = OpenClawLaunchability::from_status(&status);
     let row = status.row;
     let runtime_kind = status.runtime_kind;
+    let is_incus_row = row
+        .as_ref()
+        .map(|row| row.provider.eq_ignore_ascii_case("incus"))
+        .unwrap_or(false);
     let inflight_without_vm = row
         .as_ref()
         .map(|row| {
@@ -423,9 +460,13 @@ fn dashboard_template(
         })
         .unwrap_or(false);
     let recoverable_vm_exists = row.as_ref().and_then(|row| row.vm_id.as_deref()).is_some();
-    let has_backup_host = backup.backup_host.is_some();
-    let backup_host = backup
-        .backup_host
+    let has_backup_target = backup.backup_target.is_some();
+    let backup_target = backup
+        .backup_target
+        .unwrap_or_else(|| "not_available".to_string());
+    let has_backup_latest_recovery_point_name = backup.latest_recovery_point_name.is_some();
+    let backup_latest_recovery_point_name = backup
+        .latest_recovery_point_name
         .unwrap_or_else(|| "not_available".to_string());
     DashboardTemplate {
         owner_npub: authenticated.npub,
@@ -456,25 +497,29 @@ fn dashboard_template(
         created_at: format_timestamp(row.as_ref().map(|row| row.created_at)),
         updated_at: format_timestamp(row.as_ref().map(|row| row.updated_at)),
         can_provision: row.is_none(),
-        can_recover: row.is_some() && !inflight_without_vm,
+        can_recover: row.is_some() && !inflight_without_vm && is_incus_row,
         can_reset: row.is_some() && !inflight_without_vm,
         control_loop_notice: if inflight_without_vm {
-            "Provisioning is already in flight. Recovery and reset stay locked until the current VM assignment finishes."
+            "Provisioning is already in flight. Recovery and reset stay locked until the current VM assignment finishes.".to_string()
+        } else if row.is_some() && !is_incus_row {
+            "This dashboard now manages Incus-backed environments. Destructive reset replaces the current legacy microVM environment with a fresh Incus-backed Managed OpenClaw runtime.".to_string()
         } else {
-            ""
+            String::new()
         },
-        has_control_loop_notice: inflight_without_vm,
+        has_control_loop_notice: inflight_without_vm || (row.is_some() && !is_incus_row),
         recover_action_label: if recoverable_vm_exists {
             "Recover Managed Environment"
         } else {
             "Provision Fresh Managed Environment"
         },
         recover_semantics_copy: if inflight_without_vm {
-            "stays locked while the initial VM assignment is still in flight. Wait for the current create request to finish before retrying any destructive action."
+            "stays locked while the initial VM assignment is still in flight. Wait for the current create request to finish before retrying any destructive action.".to_string()
+        } else if row.is_some() && !is_incus_row {
+            "is unavailable for legacy microVM rows. Use Destructive Reset to replace the current environment with a new Incus-backed Managed OpenClaw runtime.".to_string()
         } else if recoverable_vm_exists {
-            "asks the control plane to bring the managed environment back. If that VM is still recoverable, this path preserves the durable home. If the VM is already gone, Recover falls back to provisioning a fresh environment."
+            "asks the control plane to restart the current Incus appliance around the same persistent state volume. If that VM is already gone, Recover falls back to provisioning a fresh Incus environment.".to_string()
         } else {
-            "will provision a fresh Managed OpenClaw environment instead of restoring prior durable state because no recoverable VM is available."
+            "will provision a fresh Incus-backed Managed OpenClaw environment because no recoverable VM is available.".to_string()
         },
         backup_state_label: backup_state_label(backup.freshness),
         backup_state_tone: backup_state_tone(backup.freshness),
@@ -482,18 +527,28 @@ fn dashboard_template(
         backup_last_successful_at: format_rfc3339_timestamp(
             backup.latest_successful_backup_at.as_deref(),
         ),
-        backup_host,
-        has_backup_host,
+        backup_latest_recovery_point_name,
+        has_backup_latest_recovery_point_name,
+        backup_target_label: backup.backup_target_label,
+        backup_target,
+        has_backup_target,
         reset_requires_confirmation: backup.reset_requires_confirmation,
         reset_safety_copy: if backup.reset_requires_confirmation {
-            "Because backup protection is stale, missing, or unavailable, destructive reset now requires an explicit confirmation step."
+            "Because recovery-point protection is stale, missing, or unavailable, destructive reset now requires an explicit confirmation step."
                 .to_string()
         } else {
-            "Recent backup protection is healthy, so destructive reset remains available directly from the dashboard."
+            "Recent recovery-point protection is healthy, so destructive reset remains available directly from the dashboard."
                 .to_string()
         },
         can_launch_openclaw: launchability.can_launch(),
         launch_status_copy: launchability.status_copy(),
+        substrate_label: if is_incus_row {
+            "Incus".to_string()
+        } else if row.is_some() {
+            "Legacy microVM".to_string()
+        } else {
+            "Incus".to_string()
+        },
         has_recent_activity: !recent_activity.is_empty(),
         recent_activity,
     }
@@ -504,9 +559,13 @@ fn reset_confirm_template(
     backup: ManagedEnvironmentBackupStatus,
     confirmation_token: String,
 ) -> ResetConfirmTemplate {
-    let has_backup_host = backup.backup_host.is_some();
-    let backup_host = backup
-        .backup_host
+    let has_backup_target = backup.backup_target.is_some();
+    let backup_target = backup
+        .backup_target
+        .unwrap_or_else(|| "not_available".to_string());
+    let has_backup_latest_recovery_point_name = backup.latest_recovery_point_name.is_some();
+    let backup_latest_recovery_point_name = backup
+        .latest_recovery_point_name
         .unwrap_or_else(|| "not_available".to_string());
     ResetConfirmTemplate {
         owner_npub: authenticated.npub.clone(),
@@ -518,8 +577,11 @@ fn reset_confirm_template(
         backup_last_successful_at: format_rfc3339_timestamp(
             backup.latest_successful_backup_at.as_deref(),
         ),
-        backup_host,
-        has_backup_host,
+        backup_latest_recovery_point_name,
+        has_backup_latest_recovery_point_name,
+        backup_target_label: backup.backup_target_label,
+        backup_target,
+        has_backup_target,
     }
 }
 
@@ -695,12 +757,13 @@ pub async fn provision(
         return redirect_to_login(&state, true);
     };
     verify_action_csrf(&authenticated, &form)?;
+    let requested = customer_dashboard_managed_vm_policy();
 
     provision_managed_environment_if_missing(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;
@@ -717,12 +780,13 @@ pub async fn recover(
         return redirect_to_login(&state, true);
     };
     verify_action_csrf(&authenticated, &form)?;
+    let requested = customer_dashboard_managed_vm_policy();
 
     recover_agent_for_owner(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;
@@ -768,12 +832,13 @@ pub async fn reset(
             form.confirmation_token.as_deref(),
         )?;
     }
+    let requested = customer_dashboard_managed_vm_policy();
 
     reset_agent_for_owner(
         &state,
         &authenticated.npub,
         &request_context.request_id,
-        None,
+        Some(&requested),
     )
     .await
     .map_err(map_agent_api_error)?;
@@ -1415,7 +1480,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-backup-healthy","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-backup-healthy/home","successful_backup_known":true,"freshness":"healthy","latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-backup-healthy","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-backup-healthy/home","recovery_point_kind":"metadata_record","freshness":"healthy","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
             ),
         ]);
         let _env = MicrovmEnvGuard::set(&base_url);
@@ -1424,10 +1489,10 @@ mod tests {
             .await
             .expect("dashboard response");
         let body = response_body_string(response).await;
-        assert!(body.contains("Backup Protection"));
+        assert!(body.contains("Recovery Protection"));
         assert!(body.contains("healthy"));
-        assert!(body.contains("Recent durable-home backup protection is in place"));
-        assert!(body.contains("pika-build"));
+        assert!(body.contains("A recent durable-home backup record is available"));
+        assert!(body.contains("/var/lib/microvms/vm-backup-healthy/home"));
         assert!(body.contains("Destructive Reset"));
         assert!(!body.contains("Review Destructive Reset"));
 
@@ -1461,7 +1526,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-backup-stale","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-backup-stale/home","successful_backup_known":true,"freshness":"stale","latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-backup-stale","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-backup-stale/home","recovery_point_kind":"metadata_record","freshness":"stale","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
             ),
         ]);
         let _env = MicrovmEnvGuard::set(&base_url);
@@ -1471,7 +1536,7 @@ mod tests {
             .expect("dashboard response");
         let body = response_body_string(response).await;
         assert!(body.contains("stale"));
-        assert!(body.contains("Backup protection is stale"));
+        assert!(body.contains("Recovery-point protection is stale"));
         assert!(body.contains("Review Destructive Reset"));
         assert!(body.contains("/dashboard/reset/confirm"));
 
@@ -2473,7 +2538,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-old","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-old/home","successful_backup_known":true,"freshness":"healthy","latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-old","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-old/home","recovery_point_kind":"metadata_record","freshness":"healthy","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-11T00:00:00Z","observed_at":"2026-03-11T00:00:00Z"}"#,
             ),
             ("204 No Content", ""),
             ("200 OK", r#"{"id":"vm-fresh","status":"starting"}"#),
@@ -2557,7 +2622,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-reset-weak","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-reset-weak/home","successful_backup_known":true,"freshness":"stale","latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-reset-weak","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-reset-weak/home","recovery_point_kind":"metadata_record","freshness":"stale","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
             ),
         ]);
         let _env = MicrovmEnvGuard::set(&base_url);
@@ -2659,7 +2724,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-reset-confirm","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-reset-confirm/home","successful_backup_known":false,"freshness":"missing","latest_successful_backup_at":null,"observed_at":null}"#,
+                r#"{"vm_id":"vm-reset-confirm","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-reset-confirm/home","recovery_point_kind":"metadata_record","freshness":"missing","latest_recovery_point_name":null,"latest_successful_backup_at":null,"observed_at":null}"#,
             ),
         ]);
         let _env = MicrovmEnvGuard::set(&base_url);
@@ -2669,8 +2734,8 @@ mod tests {
             .expect("confirm page response");
         let body = response_body_string(response).await;
         assert!(body.contains("Confirm Destructive Reset"));
-        assert!(body.contains("Reset Without Recent Backup"));
-        assert!(body.contains("No successful durable-home backup is known yet"));
+        assert!(body.contains("Reset Without Recent Recovery Point"));
+        assert!(body.contains("No durable-home backup record is known yet"));
 
         clear_test_database(&db_pool);
     }
@@ -2713,7 +2778,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-reset-confirmed","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-reset-confirmed/home","successful_backup_known":true,"freshness":"stale","latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-reset-confirmed","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-reset-confirmed/home","recovery_point_kind":"metadata_record","freshness":"stale","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
             ),
             ("204 No Content", ""),
             ("200 OK", r#"{"id":"vm-reset-fresh","status":"starting"}"#),
@@ -2793,7 +2858,7 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"vm_id":"vm-reset-replacement","backup_host":"pika-build","durable_home_path":"/var/lib/microvms/vm-reset-replacement/home","successful_backup_known":true,"freshness":"stale","latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
+                r#"{"vm_id":"vm-reset-replacement","backup_unit_kind":"durable_home","backup_target":"/var/lib/microvms/vm-reset-replacement/home","recovery_point_kind":"metadata_record","freshness":"stale","latest_recovery_point_name":null,"latest_successful_backup_at":"2026-03-09T00:00:00Z","observed_at":"2026-03-09T00:00:00Z"}"#,
             ),
         ]);
         let _env = MicrovmEnvGuard::set(&base_url);

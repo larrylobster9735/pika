@@ -22,6 +22,20 @@ remote_host="pika-build"
 project_name="pika-managed-agents"
 alias_name="pika-agent/dev"
 artifact_path="result"
+ssh_opts=()
+
+if [[ -n "${PIKA_BUILD_SSH_KEY:-}" ]]; then
+  ssh_opts+=(-i "${PIKA_BUILD_SSH_KEY}")
+fi
+ssh_opts+=(-o StrictHostKeyChecking=accept-new)
+
+ssh_remote() {
+  ssh "${ssh_opts[@]}" "$remote_host" "$@"
+}
+
+scp_remote() {
+  scp "${ssh_opts[@]}" "$@"
+}
 
 subcommand="${1:-}"
 if [[ -z "$subcommand" ]]; then
@@ -61,7 +75,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 build_image() {
-  nix build .#pika-agent-incus-dev-image
+  nix build .#packages.x86_64-linux.pika-agent-incus-dev-image
 }
 
 import_image() {
@@ -75,13 +89,38 @@ import_image() {
   fi
 
   local remote_tmp
-  remote_tmp="$(ssh "$remote_host" 'mktemp -d /tmp/pika-incus-image.XXXXXX')"
-  scp "$metadata_path" "$disk_path" "$remote_host:$remote_tmp/"
-  ssh "$remote_host" "
+  remote_tmp="$(ssh_remote 'mktemp -d /tmp/pika-incus-image.XXXXXX')"
+  scp_remote "$metadata_path" "$disk_path" "$remote_host:$remote_tmp/"
+  ssh_remote "
     set -euo pipefail
-    incus image delete --project '$project_name' '$alias_name' >/dev/null 2>&1 || true
-    incus image import --project '$project_name' '$remote_tmp/$(basename "$metadata_path")' '$remote_tmp/$(basename "$disk_path")' --alias '$alias_name'
+    incus_cmd='incus'
+    if [[ \$(id -u) -ne 0 ]]; then
+      incus_cmd='sudo incus'
+    fi
+    \${incus_cmd} image delete --project '$project_name' '$alias_name' >/dev/null 2>&1 || true
+    \${incus_cmd} image import --project '$project_name' '$remote_tmp/$(basename "$metadata_path")' '$remote_tmp/$(basename "$disk_path")' --alias '$alias_name'
     rm -rf '$remote_tmp'
+  "
+}
+
+build_and_import_on_remote() {
+  local remote_tmp
+  remote_tmp="$(ssh_remote 'mktemp -d /tmp/pika-incus-src.XXXXXX')"
+  trap 'ssh_remote "rm -rf '\''${remote_tmp}'\''" >/dev/null 2>&1 || true' RETURN
+
+  git archive --format=tar HEAD \
+    | ssh_remote "mkdir -p '$remote_tmp' && tar -xf - -C '$remote_tmp'"
+
+  ssh_remote "
+    set -euo pipefail
+    cd '$remote_tmp'
+    nix build .#packages.x86_64-linux.pika-agent-incus-dev-image --out-link result
+    incus_cmd='incus'
+    if [[ \$(id -u) -ne 0 ]]; then
+      incus_cmd='sudo incus'
+    fi
+    \${incus_cmd} image delete --project '$project_name' '$alias_name' >/dev/null 2>&1 || true
+    \${incus_cmd} image import --project '$project_name' result/metadata.tar.xz result/disk.qcow2 --alias '$alias_name'
   "
 }
 
@@ -93,8 +132,7 @@ case "$subcommand" in
     import_image "$artifact_path"
     ;;
   build-import)
-    build_image
-    import_image "$artifact_path"
+    build_and_import_on_remote
     ;;
   *)
     echo "unknown subcommand: $subcommand" >&2

@@ -78,6 +78,10 @@ pub struct IncusProvisionParams {
     pub image_alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insecure_tls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openclaw_guest_ipv4_cidr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openclaw_proxy_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
@@ -442,6 +446,20 @@ pub enum VmBackupFreshness {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmBackupUnitKind {
+    DurableHome,
+    PersistentStateVolume,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmRecoveryPointKind {
+    MetadataRecord,
+    VolumeSnapshot,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VmBackupStatusRecord {
     pub schema_version: String,
@@ -454,10 +472,12 @@ pub struct VmBackupStatusRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SpawnerVmBackupStatus {
     pub vm_id: String,
-    pub backup_host: String,
-    pub durable_home_path: String,
-    pub successful_backup_known: bool,
+    pub backup_unit_kind: VmBackupUnitKind,
+    pub backup_target: String,
+    pub recovery_point_kind: VmRecoveryPointKind,
     pub freshness: VmBackupFreshness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_recovery_point_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_successful_backup_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -912,6 +932,24 @@ mod tests {
     }
 
     #[test]
+    fn spawner_vm_backup_status_round_trips() {
+        let status = SpawnerVmBackupStatus {
+            vm_id: "vm-00000000".to_string(),
+            backup_unit_kind: VmBackupUnitKind::PersistentStateVolume,
+            backup_target: "default/vm-00000000-state".to_string(),
+            recovery_point_kind: VmRecoveryPointKind::VolumeSnapshot,
+            freshness: VmBackupFreshness::Healthy,
+            latest_recovery_point_name: Some("daily-20260318".to_string()),
+            latest_successful_backup_at: Some("2026-03-18T12:00:00Z".to_string()),
+            observed_at: Some("2026-03-18T12:00:00Z".to_string()),
+        };
+        let encoded = serde_json::to_string(&status).expect("encode backup status");
+        let decoded: SpawnerVmBackupStatus =
+            serde_json::from_str(&encoded).expect("decode backup status");
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
     fn spawner_vm_response_accepts_legacy_guest_service_ready_field() {
         let decoded: SpawnerVmResponse = serde_json::from_value(serde_json::json!({
             "id": "vm-123",
@@ -1196,6 +1234,8 @@ mod tests {
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: Some(true),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
             }),
         };
         let encoded = serde_json::to_string(&request).expect("encode request");

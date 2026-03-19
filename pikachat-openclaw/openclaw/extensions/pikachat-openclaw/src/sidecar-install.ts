@@ -472,16 +472,21 @@ export async function resolvePikachatDaemonCommand(params: {
   pinnedVersion?: string;
 }): Promise<string> {
   const log: PikachatLog = params.log ?? {};
+  const existing = await resolveExistingCommand(params.requestedCmd);
 
   // If a custom daemonCmd was explicitly configured (not the default "pikachat"),
   // resolve it directly — the user is in control.
   if (params.requestedCmd !== DEFAULT_BINARY_NAME) {
-    const existing = await resolveExistingCommand(params.requestedCmd);
     if (existing) {
       log.info?.(`[pikachat] using configured daemon command: ${existing}`);
       return existing;
     }
     log.warn?.(`[pikachat] configured daemon command not found: ${params.requestedCmd}, falling back to auto-install`);
+  }
+
+  if (existing) {
+    log.info?.(`[pikachat] using existing daemon command from PATH: ${existing}`);
+    return existing;
   }
 
   // Always use the managed binary location — download/update as needed.

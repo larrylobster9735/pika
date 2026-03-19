@@ -30,12 +30,21 @@ This lane is meant to prove:
 - `pika-server` reads that signal through Incus and reports `guest_ready=true`
 - Incus-backed rows keep routing to Incus later through the persisted provider config
 
-It does not yet prove:
+This lane now also proves the internal coworker dashboard path:
 
-- Incus recover
-- Incus restore
-- Incus backup status
-- customer-facing OpenClaw launch or proxy flows
+- the allowlisted `/dashboard` flow provisions, recovers, and resets explicitly on Incus
+- the built-in OpenClaw launch/auth/proxy flow works for Incus-backed rows through the real dashboard
+- a public API delete flow is still not present
+
+This lane now also proves the first Incus operational lifecycle model:
+
+- backup status is derived from snapshots on the persistent custom volume
+- recover restarts or starts the current appliance around that same volume
+- restore rolls the persistent custom volume back to its latest snapshot, then restarts the appliance
+
+What it still does not yet prove:
+
+- automated snapshot creation policy
 - a public API delete flow
 
 ## Build The Guest Image
@@ -58,17 +67,30 @@ The image is a NixOS VM image for the Incus dev lane. It includes:
 - `pikachat`
 - the OpenClaw gateway runtime dependency currently used by the managed-agent bootstrap bundle
 - the base directories expected by the managed-agent service
+- guest firewall allowance for the OpenClaw gateway port used by the host-side Incus proxy device
 
 ## Deploy `pika-build` With Incus Enabled
 
-Deploy the dedicated Incus dev host shape:
+Deploy the canonical `pika-build` host shape:
 
 ```bash
-just build-deploy-incus-dev
+nix develop .#infra -c just -f infra/justfile build-deploy
 ```
 
-This uses `.#pika-build-incus-dev`, which keeps the normal builder base but swaps in the Incus dev
-host module instead of the current microVM host module.
+That entrypoint now uploads a clean repo snapshot and runs `nixos-rebuild` on `pika-build`
+itself, so operators do not need local `x86_64-linux` build support to deploy the canonical host.
+
+`pika-build` now runs both host roles side by side:
+
+- the existing microVM host stack and `vm-spawner`
+- the Incus dev lane with `incusd` listening on `:8443`
+
+The canonical host config now also carries the Incus bridge firewall allowances needed for:
+
+- guest DHCP and DNS on `incusbr0`
+- guest egress through the host uplink
+- per-instance OpenClaw proxy ports on `tailscale0` for the internal dashboard flow
+- without broadly trusting `incusbr0` for host ingress
 
 Expected host-side prerequisites:
 
@@ -80,7 +102,9 @@ Expected host-side prerequisites:
 Current one-time setup is still operator-managed:
 
 ```bash
-ssh pika-build
+ssh root@pika-build
+incus network create incusbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none
+incus storage create default dir
 incus project create pika-managed-agents
 incus --project pika-managed-agents profile create pika-agent-dev
 incus --project pika-managed-agents profile device add pika-agent-dev eth0 nic network=incusbr0 name=eth0
@@ -89,9 +113,46 @@ incus --project pika-managed-agents profile device add pika-agent-dev eth0 nic n
 Notes:
 
 - import the managed-agent image into the same project that `pika-server` will target
+- the dev Incus host shape does not create `incusbr0` or the `default` storage pool for you; do
+  that in the one-time setup before using the provider
 - the provider already injects the root disk and the persistent state disk, so this profile must at
   minimum provide a NIC
 - if your Incus host does not use `incusbr0`, replace it with the correct network from `incus network list`
+- off-host `pika-server` canaries now require a trusted Incus TLS client certificate
+- the internal dashboard OpenClaw flow uses Incus-managed host proxy ports in the `24000-33999`
+  range on `pika-build`
+- `PIKA_AGENT_INCUS_OPENCLAW_PROXY_HOST` must be set to the IPv4 address that dashboard clients
+  should use for those proxy ports; it is no longer inferred from the Incus API endpoint host
+
+## Trust A `pika-server` Incus Client Certificate
+
+The Incus provider now authenticates to remote `https://pika-build:8443` using a trusted TLS
+client certificate.
+
+Generate a client keypair for `pika-server`:
+
+```bash
+openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
+  -subj '/CN=pika-server-incus-client' \
+  -keyout pika-server-incus-client.key \
+  -out pika-server-incus-client.crt
+```
+
+Trust it on `pika-build`, restricted to the managed-agent project:
+
+```bash
+scp pika-server-incus-client.crt root@pika-build:/root/
+ssh root@pika-build \
+  incus config trust add-certificate /root/pika-server-incus-client.crt \
+    --projects pika-managed-agents \
+    --restricted
+```
+
+For an ad hoc local `pika-server` canary process, set:
+
+- `PIKA_AGENT_INCUS_CLIENT_CERT_PATH`
+- `PIKA_AGENT_INCUS_CLIENT_KEY_PATH`
+- either `PIKA_AGENT_INCUS_SERVER_CERT_PATH` or `PIKA_AGENT_INCUS_INSECURE_TLS=true`
 
 ## Import The Image Into Incus
 
@@ -126,6 +187,7 @@ The Incus provider expects these settings for request-scoped provisioning:
 - Incus profile
 - Incus storage pool
 - Incus image alias
+- an explicit OpenClaw proxy host IPv4 for the dashboard-facing proxy target
 
 Use the smoke helper:
 
@@ -148,7 +210,17 @@ Expected results:
 4. A matching custom volume named `<vm_id>-state` appears.
 5. Inside the guest, bootstrap re-homes managed-agent state onto `/mnt/pika-state`.
 6. The guest writes `/workspace/pika-agent/service-ready.json`.
-7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
+7. The ready marker `boot_id` matches the guest's current `/proc/sys/kernel/random/boot_id`.
+8. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
+
+The first authenticated canary for this flow now succeeds on the canonical `pika-build` host shape.
+The deployed internal dashboard flow on `api.pikachat.org/dashboard` now also succeeds end to end:
+
+- login with the normal dashboard flow
+- reset/reprovision an Incus-backed environment
+- wait for `state=ready` and `startup_phase=ready`
+- click OpenClaw
+- load the OpenClaw UI and its static assets through `openclaw.api.pikachat.org`
 
 Operator checks:
 
@@ -158,6 +230,34 @@ ssh pika-build incus storage volume list default --project pika-managed-agents
 ssh pika-build incus file pull --project pika-managed-agents <vm_id>/workspace/pika-agent/service-ready.json -
 ```
 
+## Incus Operational Lifecycle Model
+
+The first Incus operational model is intentionally narrow and volume-centric.
+
+- backup unit: the persistent custom storage volume attached at `/mnt/pika-state`
+- recovery point: an Incus snapshot of that custom volume
+- recover: bring the current instance back around the existing state volume by starting or restarting it
+- restore: roll the state volume back to its latest snapshot, then start the appliance again
+
+This differs from the old microVM model:
+
+- there is no host-local mutable root to preserve
+- there is no host-specific durable-home path as the primary contract
+- the appliance root stays disposable
+- only the attached state volume is treated as durable product state
+
+Current support:
+
+- `backup-status` reports the freshness of the latest state-volume snapshot
+- `recover` starts or restarts the current Incus instance in place
+- `restore` restores the latest state-volume snapshot and then restarts the current Incus instance
+
+Current limitations:
+
+- this lane does not yet automate snapshot creation
+- restore only uses the latest available snapshot, not an operator-selected one
+- if there are no state-volume snapshots yet, `backup-status` reports `missing` and restore is rejected
+
 ## `pika-server` Canary Mode
 
 Deploy the code with Incus configuration present, but keep the global default provider unchanged:
@@ -166,6 +266,13 @@ Deploy the code with Incus configuration present, but keep the global default pr
 - keep the existing microVM environment working as the default path
 - use request-scoped Incus provisioning only for internal validation
 
+The real internal dashboard path is now Incus-only:
+
+- `/dashboard` provision, recover, and reset actions explicitly request `provider=incus`
+- built-in OpenClaw launch and proxying only unlock for Incus-backed rows
+- legacy microVM rows remain visible but the dashboard will only offer destructive reset to replace
+  them with a fresh Incus-backed environment
+
 Recommended server env for canarying:
 
 - `PIKA_AGENT_INCUS_ENDPOINT`
@@ -173,11 +280,36 @@ Recommended server env for canarying:
 - `PIKA_AGENT_INCUS_PROFILE`
 - `PIKA_AGENT_INCUS_STORAGE_POOL`
 - `PIKA_AGENT_INCUS_IMAGE_ALIAS`
+- `PIKA_AGENT_INCUS_CLIENT_CERT_PATH`
+- `PIKA_AGENT_INCUS_CLIENT_KEY_PATH`
+- `PIKA_AGENT_INCUS_SERVER_CERT_PATH` for an explicit trusted server cert
 - `PIKA_AGENT_INCUS_INSECURE_TLS=true` only if the dev endpoint uses self-signed TLS
+
+The normal repo-managed `pika-server` Nix module now supports the same canary env through host
+config plus either direct file paths or sops-managed file secrets:
+
+- `incusEndpoint`
+- `incusProject`
+- `incusProfile`
+- `incusStoragePool`
+- `incusImageAlias`
+- `incusInsecureTls`
+- `incusClientCertPath`
+- `incusClientKeyPath`
+- `incusServerCertPath`
+- `incusClientCertSecret`
+- `incusClientKeySecret`
+- `incusServerCertSecret`
+
+Use that path for a real deployed canary instead of only running a local process.
+
+For the current `pika-server -> pika-build` canary, the deployed server must use an Incus endpoint
+that is reachable from `pika-server` itself. In practice that means the private tailnet address on
+`pika-build` rather than `https://pika-build:8443`, unless the server host can resolve that name.
 
 This lets operators verify:
 
-- startup health can initialize the Incus client path honestly
+- startup health can authenticate and probe the Incus client path honestly when Incus canary env is present
 - Incus requests can create and observe real managed guests
 - existing microVM-backed rows still route to the microVM backend
 - the smoke helper is provisioning a fresh Incus environment, not just re-reading an existing owner state

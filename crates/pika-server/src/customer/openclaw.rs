@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tracing::warn;
 
 use crate::agent_api::{
-    load_launchable_managed_environment, load_openclaw_launch_auth, openclaw_proxy_base_url,
+    load_launchable_managed_environment, load_openclaw_launch_auth, load_openclaw_proxy_target,
 };
 use crate::nostr_auth::expected_host_from_headers;
 
@@ -624,23 +624,22 @@ pub(crate) async fn openclaw_proxy(
     let websocket_request = request_is_websocket_upgrade(&method, &headers);
     let internal_path = uri.path();
     let upstream_path = openclaw_proxy_upstream_path(internal_path, websocket_request);
-    let spawner_url = openclaw_proxy_base_url(&current.managed_vm, &request_context.request_id)
-        .map_err(map_agent_api_error)?;
-    let spawner_proxy_path = if websocket_request && upstream_path == "/" {
-        ""
+    let proxy_target = load_openclaw_proxy_target(
+        &current.managed_vm,
+        &current.vm_id,
+        &request_context.request_id,
+    )
+    .await
+    .map_err(map_agent_api_error)?;
+    let upstream_path = if websocket_request && upstream_path == "/" {
+        String::new()
     } else {
-        upstream_path
+        upstream_path.to_string()
     };
     let upstream_url = if let Some(query) = uri.query() {
-        format!(
-            "{spawner_url}/vms/{}/openclaw{spawner_proxy_path}?{query}",
-            current.vm_id
-        )
+        format!("{}{upstream_path}?{query}", proxy_target.base_url)
     } else {
-        format!(
-            "{spawner_url}/vms/{}/openclaw{spawner_proxy_path}",
-            current.vm_id
-        )
+        format!("{}{upstream_path}", proxy_target.base_url)
     };
 
     if websocket_request {
