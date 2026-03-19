@@ -104,6 +104,11 @@ require_value "PIKACI_APPLE_KEEP_RUNS" "${PIKACI_APPLE_KEEP_RUNS:-}"
 
 if [[ "$secret_set" == "all" || "$secret_set" == "tailscale" ]]; then
   require_value "PIKACI_APPLE_TAILSCALE_AUTHKEY" "${PIKACI_APPLE_TAILSCALE_AUTHKEY:-}"
+  if [[ "${PIKACI_APPLE_TAILSCALE_AUTHKEY:-}" != tskey-auth-* ]]; then
+    echo "error: PIKACI_APPLE_TAILSCALE_AUTHKEY must be a tailscale auth key (expected prefix tskey-auth-)" >&2
+    echo "hint: update secrets/pikaci-apple.env.age via ./scripts/encrypt-pikaci-apple-secrets using an auth key from the tailnet auth keys page" >&2
+    exit 1
+  fi
   mask_value "${PIKACI_APPLE_TAILSCALE_AUTHKEY:-}"
   export PIKACI_APPLE_TAILSCALE_AUTHKEY
 fi
