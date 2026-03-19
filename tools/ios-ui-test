@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IOS_DIR="$ROOT/ios"
+PROJECT_PATH="$IOS_DIR/Pika.xcodeproj"
+SCHEME="Pika"
+DERIVED_DATA_PATH="${PIKA_IOS_DERIVED_DATA_PATH:-ios/build}"
+APP_BUNDLE_ID="${PIKA_IOS_BUNDLE_ID:-org.pikachat.pika.dev}"
+URL_SCHEME="${PIKA_IOS_URL_SCHEME:-pika}"
+PREPARE_TIMEOUT_SEC="${PIKA_IOS_UI_TEST_PREPARE_TIMEOUT_SEC:-1800}"
+RUN_TIMEOUT_SEC="${PIKA_IOS_UI_TEST_RUN_TIMEOUT_SEC:-1800}"
+RESET_SIMULATOR_ON_RUN="${PIKA_IOS_UI_TEST_RESET_SIMULATOR:-1}"
+ONLY_TESTING="${PIKA_IOS_UI_TEST_ONLY_TESTING:-}"
+SKIP_TESTING="${PIKA_IOS_UI_TEST_SKIP_TESTING:-}"
+INCLUDE_OPENCLAW_E2E="${PIKA_IOS_UI_TEST_INCLUDE_OPENCLAW_E2E:-0}"
+
+usage() {
+  cat <<'EOF'
+usage: ./tools/ios-ui-test <prepare|run>
+
+prepare   Build the iOS UITest bundle for testing without executing tests
+run       Execute the iOS UITest bundle (uses test-without-building when prepared outputs exist)
+EOF
+}
+
+command="${1:-}"
+case "$command" in
+  prepare|run)
+    ;;
+  -h|--help|"")
+    usage
+    exit 0
+    ;;
+  *)
+    echo "error: unknown command: $command" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+find_xctestrun_file() {
+  local marker_path="$ROOT/$DERIVED_DATA_PATH/last-ios-ui-test-xctestrun.txt"
+  if [[ -f "$marker_path" ]]; then
+    local marked_file
+    marked_file="$(<"$marker_path")"
+    if [[ -n "$marked_file" && -f "$marked_file" ]]; then
+      printf '%s\n' "$marked_file"
+      return
+    fi
+  fi
+
+  python3 - "$ROOT/$DERIVED_DATA_PATH/Build/Products" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+if not root.exists():
+    raise SystemExit(0)
+
+files = [path for path in root.rglob("*.xctestrun") if path.is_file()]
+if not files:
+    raise SystemExit(0)
+
+files.sort(key=lambda path: (path.stat().st_mtime_ns, str(path)), reverse=True)
+print(files[0])
+PY
+}
+
+clear_old_xctestrun_files() {
+  local products_dir="$ROOT/$DERIVED_DATA_PATH/Build/Products"
+  if [[ -d "$products_dir" ]]; then
+    find "$products_dir" -name '*.xctestrun' -type f -delete
+  fi
+  rm -f "$ROOT/$DERIVED_DATA_PATH/last-ios-ui-test-xctestrun.txt"
+}
+
+record_xctestrun_file() {
+  local xctestrun_file
+  xctestrun_file="$(find_xctestrun_file)"
+  if [[ -z "$xctestrun_file" ]]; then
+    echo "error: build-for-testing did not produce an .xctestrun file" >&2
+    exit 1
+  fi
+  printf '%s\n' "$xctestrun_file" > "$ROOT/$DERIVED_DATA_PATH/last-ios-ui-test-xctestrun.txt"
+}
+
+resolve_sim_udid() {
+  local ensure_args=()
+  if [[ "${1:-}" == "--reset" ]]; then
+    ensure_args+=(--reset)
+  fi
+  ./tools/ios-sim-ensure "${ensure_args[@]}" | sed -n 's/^ok: ios simulator ready (udid=\(.*\))$/\1/p'
+}
+
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+
+  python3 - "$timeout_sec" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout = int(sys.argv[1])
+cmd = sys.argv[2:]
+
+proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+try:
+    raise SystemExit(proc.wait(timeout=timeout))
+except subprocess.TimeoutExpired:
+    sys.stderr.write(
+        f"error: command timed out after {timeout}s: {' '.join(cmd)}\n"
+    )
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+    raise SystemExit(124)
+PY
+}
+
+ensure_base_artifacts() {
+  # The standalone human/local path should always regenerate these checked-in
+  # artifacts so the suite never runs against a stale Xcode project or stale
+  # Rust-generated xcframeworks. The prepared remote fast path bypasses this by
+  # using a recorded .xctestrun from the current prepare step.
+  just ios-xcframework ios-xcodeproj
+}
+
+run_xcodebuild() {
+  local action="$1"
+  local timeout_sec="$2"
+  local udid="$3"
+  shift 3
+
+  run_with_timeout "$timeout_sec" ./tools/xcode-run xcodebuild \
+    -project "$PROJECT_PATH" \
+    -scheme "$SCHEME" \
+    -derivedDataPath "$DERIVED_DATA_PATH" \
+    -destination "id=$udid" \
+    "$action" \
+    -skipMacroValidation \
+    ARCHS=arm64 \
+    ONLY_ACTIVE_ARCH=YES \
+    CODE_SIGNING_ALLOWED=NO \
+    PIKA_APP_BUNDLE_ID="$APP_BUNDLE_ID" \
+    PIKA_IOS_URL_SCHEME="$URL_SCHEME" \
+    "$@"
+}
+
+skip_args=(
+  -skip-testing:PikaUITests/PikaUITests/testE2E_deployedRustBot_pingPong
+  -skip-testing:PikaUITests/PikaUITests/testE2E_hypernoteDetailsAndCodeBlock
+  -skip-testing:PikaUITests/PikaUITests/testE2E_multiImageGrid
+)
+if [[ "$INCLUDE_OPENCLAW_E2E" != "1" ]]; then
+  skip_args+=(-skip-testing:PikaUITests/PikaUITests/testE2E_openclawAgent_createAndReply)
+fi
+
+if [[ -n "$ONLY_TESTING" ]]; then
+  skip_args+=("-only-testing:$ONLY_TESTING")
+fi
+if [[ -n "$SKIP_TESTING" ]]; then
+  skip_args+=("-skip-testing:$SKIP_TESTING")
+fi
+
+ensure_arg=""
+if [[ "$command" == "run" && "$RESET_SIMULATOR_ON_RUN" == "1" ]]; then
+  ensure_arg="--reset"
+fi
+
+udid="$(resolve_sim_udid "$ensure_arg")"
+if [ -z "$udid" ]; then
+  echo "error: could not determine simulator udid" >&2
+  exit 1
+fi
+
+mkdir -p "$ROOT/$DERIVED_DATA_PATH"
+printf '%s\n' "$udid" > "$ROOT/$DERIVED_DATA_PATH/last-ios-ui-test-udid.txt"
+
+case "$command" in
+  prepare)
+    ensure_base_artifacts
+    clear_old_xctestrun_files
+    run_xcodebuild build-for-testing "$PREPARE_TIMEOUT_SEC" "$udid" "${skip_args[@]}"
+    record_xctestrun_file
+    ;;
+  run)
+    xctestrun_file="$(find_xctestrun_file)"
+    if [ -n "${PIKACI_IOS_UI_TEST_USE_PREPARED:-}" ] && [ -n "$xctestrun_file" ]; then
+      run_with_timeout "$RUN_TIMEOUT_SEC" ./tools/xcode-run xcodebuild \
+        test-without-building \
+        -xctestrun "$xctestrun_file" \
+        -destination "id=$udid" \
+        -skipMacroValidation \
+        ARCHS=arm64 \
+        ONLY_ACTIVE_ARCH=YES \
+        CODE_SIGNING_ALLOWED=NO \
+        PIKA_APP_BUNDLE_ID="$APP_BUNDLE_ID" \
+        PIKA_IOS_URL_SCHEME="$URL_SCHEME" \
+        "${skip_args[@]}"
+    else
+      ensure_base_artifacts
+      run_xcodebuild test "$RUN_TIMEOUT_SEC" "$udid" "${skip_args[@]}"
+    fi
+    ;;
+esac
