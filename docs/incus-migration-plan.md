@@ -318,6 +318,13 @@ Current transition status:
   `/dashboard` provision, recover, reset, launch, and same-origin OpenClaw proxying all route
   through the Incus provider seam rather than the default backend
 - the Incus OpenClaw UI path currently uses Incus-managed host proxy ports on `pika-build`
+- the Incus OpenClaw dashboard path now requires an explicit proxy-host IPv4 in config rather than
+  deriving it from the Incus API endpoint, which keeps tunneled and split-horizon control-plane
+  access from corrupting the user-facing proxy target
+- the provider now allocates OpenClaw guest IPv4s and host proxy ports by scanning live project
+  instances for collisions instead of relying on a hash-derived static assignment
+- Incus readiness now rejects stale markers from a previous boot by requiring the ready marker
+  `boot_id` to match the guest's current `/proc/sys/kernel/random/boot_id`
 - the Incus guest image now explicitly opens the OpenClaw gateway port inside the guest so the
   host-side Incus proxy device can reach the gateway over the guest VM IP
 - server startup should remain on the microVM default provider for now, but the allowlisted

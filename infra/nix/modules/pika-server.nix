@@ -9,6 +9,7 @@
 , incusStoragePool ? null
 , incusImageAlias ? null
 , incusOpenclawGuestIpv4Cidr ? null
+, incusOpenclawProxyHost ? null
 , incusInsecureTls ? false
 , incusClientCertPath ? null
 , incusClientKeyPath ? null
@@ -37,6 +38,7 @@ let
     || incusStoragePool != null
     || incusImageAlias != null
     || incusOpenclawGuestIpv4Cidr != null
+    || incusOpenclawProxyHost != null
     || incusClientCertPath != null
     || incusClientKeyPath != null
     || incusServerCertPath != null
@@ -98,8 +100,9 @@ in
           incusStoragePool
           incusImageAlias
           incusOpenclawGuestIpv4Cidr
+          incusOpenclawProxyHost
         ];
-      message = "Incus canary config on pika-server requires endpoint, project, profile, storage pool, image alias, and openclaw guest IPv4 CIDR together.";
+      message = "Incus canary config on pika-server requires endpoint, project, profile, storage pool, image alias, openclaw guest IPv4 CIDR, and openclaw proxy host together.";
     }
     {
       assertion = !(anthropicApiKeyPath != null && anthropicApiKeySecret != null);
@@ -276,6 +279,7 @@ in
       PIKA_AGENT_INCUS_STORAGE_POOL=${incusStoragePool}
       PIKA_AGENT_INCUS_IMAGE_ALIAS=${incusImageAlias}
       PIKA_AGENT_INCUS_OPENCLAW_GUEST_IPV4_CIDR=${incusOpenclawGuestIpv4Cidr}
+      PIKA_AGENT_INCUS_OPENCLAW_PROXY_HOST=${incusOpenclawProxyHost}
       ${lib.optionalString incusInsecureTls "PIKA_AGENT_INCUS_INSECURE_TLS=true"}
       ${lib.optionalString (resolvedIncusClientCertPath != null) "PIKA_AGENT_INCUS_CLIENT_CERT_PATH=${resolvedIncusClientCertPath}"}
       ${lib.optionalString (resolvedIncusClientKeyPath != null) "PIKA_AGENT_INCUS_CLIENT_KEY_PATH=${resolvedIncusClientKeyPath}"}

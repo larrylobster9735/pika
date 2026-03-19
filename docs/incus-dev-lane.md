@@ -121,6 +121,8 @@ Notes:
 - off-host `pika-server` canaries now require a trusted Incus TLS client certificate
 - the internal dashboard OpenClaw flow uses Incus-managed host proxy ports in the `24000-33999`
   range on `pika-build`
+- `PIKA_AGENT_INCUS_OPENCLAW_PROXY_HOST` must be set to the IPv4 address that dashboard clients
+  should use for those proxy ports; it is no longer inferred from the Incus API endpoint host
 
 ## Trust A `pika-server` Incus Client Certificate
 
@@ -185,6 +187,7 @@ The Incus provider expects these settings for request-scoped provisioning:
 - Incus profile
 - Incus storage pool
 - Incus image alias
+- an explicit OpenClaw proxy host IPv4 for the dashboard-facing proxy target
 
 Use the smoke helper:
 
@@ -207,7 +210,8 @@ Expected results:
 4. A matching custom volume named `<vm_id>-state` appears.
 5. Inside the guest, bootstrap re-homes managed-agent state onto `/mnt/pika-state`.
 6. The guest writes `/workspace/pika-agent/service-ready.json`.
-7. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
+7. The ready marker `boot_id` matches the guest's current `/proc/sys/kernel/random/boot_id`.
+8. `GET /v1/agents/me` transitions to `state=ready` and `startup_phase=ready`.
 
 The first authenticated canary for this flow now succeeds on the canonical `pika-build` host shape.
 The deployed internal dashboard flow on `api.pikachat.org/dashboard` now also succeeds end to end:

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -58,6 +58,7 @@ const INCUS_CLIENT_CERT_PATH_ENV: &str = "PIKA_AGENT_INCUS_CLIENT_CERT_PATH";
 const INCUS_CLIENT_KEY_PATH_ENV: &str = "PIKA_AGENT_INCUS_CLIENT_KEY_PATH";
 const INCUS_SERVER_CERT_PATH_ENV: &str = "PIKA_AGENT_INCUS_SERVER_CERT_PATH";
 const INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV: &str = "PIKA_AGENT_INCUS_OPENCLAW_GUEST_IPV4_CIDR";
+const INCUS_OPENCLAW_PROXY_HOST_ENV: &str = "PIKA_AGENT_INCUS_OPENCLAW_PROXY_HOST";
 const INCUS_VM_KIND: &str = "virtual-machine";
 const INCUS_PERSISTENT_VOLUME_TYPE: &str = "custom";
 const INCUS_PERSISTENT_VOLUME_CONTENT_TYPE: &str = "filesystem";
@@ -80,6 +81,7 @@ const INCUS_PERSISTENT_OPENCLAW_STATE_DIR: &str = "/mnt/pika-state/pika-agent/op
 const INCUS_OPERATION_WAIT_TIMEOUT_SECS: i64 = 60;
 const INCUS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const INCUS_BACKUP_HEALTHY_MAX_AGE_HOURS: i64 = 24;
+const INCUS_GUEST_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const EVENT_PROVISION_REQUESTED: &str = "provision_requested";
 const EVENT_PROVISION_ACCEPTED: &str = "provision_accepted";
 const EVENT_RECOVER_REQUESTED: &str = "recover_requested";
@@ -227,6 +229,7 @@ struct ResolvedIncusParams {
     image_alias: String,
     insecure_tls: bool,
     openclaw_guest_ipv4_cidr: Option<String>,
+    openclaw_proxy_host: Option<String>,
     agent_kind: ResolvedMicrovmAgentKind,
     agent_backend: ResolvedMicrovmAgentBackend,
 }
@@ -308,6 +311,8 @@ struct IncusInstanceNetworkAddress {
 #[derive(Debug, Default, Deserialize)]
 struct IncusInstanceDetails {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     config: BTreeMap<String, String>,
     #[serde(default)]
     devices: BTreeMap<String, BTreeMap<String, String>>,
@@ -320,6 +325,8 @@ struct IncusGuestReadyMarker {
     agent_kind: Option<String>,
     #[serde(default)]
     probe: Option<String>,
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -411,6 +418,7 @@ fn materialized_managed_vm_params(
                 image_alias: Some(resolved.image_alias.clone()),
                 insecure_tls: Some(resolved.insecure_tls),
                 openclaw_guest_ipv4_cidr: resolved.openclaw_guest_ipv4_cidr.clone(),
+                openclaw_proxy_host: resolved.openclaw_proxy_host.clone(),
             }),
         },
     }
@@ -536,6 +544,14 @@ fn merge_incus_provision_params(
             merged.openclaw_guest_ipv4_cidr = requested.openclaw_guest_ipv4_cidr.clone();
             changed = true;
         }
+        if requested
+            .openclaw_proxy_host
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            merged.openclaw_proxy_host = requested.openclaw_proxy_host.clone();
+            changed = true;
+        }
     }
     if changed
         || merged.endpoint.is_some()
@@ -544,6 +560,7 @@ fn merge_incus_provision_params(
         || merged.storage_pool.is_some()
         || merged.image_alias.is_some()
         || merged.insecure_tls.is_some()
+        || merged.openclaw_proxy_host.is_some()
     {
         Some(merged)
     } else {
@@ -786,6 +803,7 @@ fn default_incus_params_from_env() -> IncusProvisionParams {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         openclaw_guest_ipv4_cidr: non_empty_env_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV),
+        openclaw_proxy_host: non_empty_env_var(INCUS_OPENCLAW_PROXY_HOST_ENV),
     }
 }
 
@@ -887,6 +905,7 @@ fn incus_params_provided(params: &IncusProvisionParams) -> bool {
     .any(|value| !value.is_empty())
         || params.insecure_tls.is_some()
         || params.openclaw_guest_ipv4_cidr.is_some()
+        || params.openclaw_proxy_host.is_some()
 }
 
 fn required_non_empty_field(
@@ -1043,8 +1062,7 @@ impl IncusManagedVmProvider {
         if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
             self.ensure_customer_openclaw_flow_supported()
                 .context("validate incus OpenClaw dashboard support")?;
-            self.resolve_proxy_host_ipv4()
-                .await
+            self.openclaw_proxy_host_ipv4()
                 .context("validate incus OpenClaw dashboard access plan")?;
         }
         Ok(())
@@ -1057,6 +1075,8 @@ impl IncusManagedVmProvider {
         );
         self.openclaw_guest_ipv4_network()
             .context("configured Incus customer flow requires a static guest IPv4 subnet")?;
+        self.openclaw_proxy_host_ipv4()
+            .context("configured Incus customer flow requires an explicit proxy host IPv4")?;
         Ok(())
     }
 
@@ -1124,30 +1144,19 @@ impl IncusManagedVmProvider {
         .map_err(|err| self.rewrite_not_found(err, format!("incus vm not found: {vm_id}")))
     }
 
-    async fn resolve_proxy_host_ipv4(&self) -> anyhow::Result<Ipv4Addr> {
-        let endpoint = Url::parse(&self.resolved.endpoint)
-            .with_context(|| format!("parse incus endpoint URL {}", self.resolved.endpoint))?;
-        let host = endpoint.host_str().with_context(|| {
-            format!(
-                "incus endpoint {} is missing a host",
-                self.resolved.endpoint
-            )
-        })?;
-        if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            return Ok(ip);
-        }
-        let mut candidates =
-            tokio::net::lookup_host((host, endpoint.port_or_known_default().unwrap_or(443)))
-                .await
-                .with_context(|| format!("resolve incus endpoint host {host}"))?;
-        candidates
-            .find_map(|addr| match addr.ip() {
-                std::net::IpAddr::V4(ip) => Some(ip),
-                std::net::IpAddr::V6(_) => None,
-            })
+    fn openclaw_proxy_host_ipv4(&self) -> anyhow::Result<Ipv4Addr> {
+        let raw = self
+            .resolved
+            .openclaw_proxy_host
+            .as_deref()
             .with_context(|| {
-                format!("incus endpoint host {host} did not resolve to an IPv4 address")
-            })
+                format!(
+                    "missing incus.openclaw_proxy_host; set request.incus.openclaw_proxy_host or {INCUS_OPENCLAW_PROXY_HOST_ENV}"
+                )
+            })?;
+        raw.parse::<Ipv4Addr>().with_context(|| {
+            format!("invalid incus.openclaw_proxy_host {raw:?}; expected an IPv4 address")
+        })
     }
 
     fn openclaw_guest_ipv4_network(&self) -> anyhow::Result<Ipv4Net> {
@@ -1186,6 +1195,128 @@ impl IncusManagedVmProvider {
         let digest = Sha256::digest(vm_id.as_bytes());
         let offset = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % host_count;
         Ok(Ipv4Addr::from(host_start + offset))
+    }
+
+    async fn list_project_instances(
+        &self,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<Vec<IncusInstanceDetails>> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &["1.0", "instances"],
+                true,
+                request_id,
+            )?
+            .query(&[("recursion", "1")])
+            .send()
+            .await
+            .context("list incus instances in project")?;
+        self.parse_json_response(response, "list incus instances in project")
+            .await
+    }
+
+    fn openclaw_guest_ipv4_from_details(details: &IncusInstanceDetails) -> Option<Ipv4Addr> {
+        details
+            .config
+            .get(INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY)
+            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            .or_else(|| {
+                details
+                    .devices
+                    .get(INCUS_PRIMARY_NIC_DEVICE_NAME)
+                    .and_then(|device| device.get("ipv4.address"))
+                    .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            })
+    }
+
+    fn openclaw_proxy_port_from_details(details: &IncusInstanceDetails) -> Option<u16> {
+        details
+            .config
+            .get(INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY)
+            .and_then(|value| value.parse::<u16>().ok())
+    }
+
+    fn select_openclaw_guest_ipv4(
+        &self,
+        vm_id: &str,
+        current: Option<Ipv4Addr>,
+        used: &BTreeSet<Ipv4Addr>,
+    ) -> anyhow::Result<Ipv4Addr> {
+        let network = self.openclaw_guest_ipv4_network()?;
+        if current.is_some_and(|address| network.contains(&address) && !used.contains(&address)) {
+            return Ok(current.expect("checked above"));
+        }
+
+        let preferred = self.deterministic_openclaw_guest_ipv4(vm_id)?;
+        let host_start = u32::from(network.network()) + 2;
+        let host_end = u32::from(network.broadcast()) - 1;
+        let host_count = host_end - host_start + 1;
+        let preferred_offset = u32::from(preferred) - host_start;
+        for step in 0..host_count {
+            let candidate = Ipv4Addr::from(host_start + ((preferred_offset + step) % host_count));
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!(
+            "no free guest IPv4 remains in incus.openclaw_guest_ipv4_cidr {}",
+            network
+        )
+    }
+
+    fn select_openclaw_proxy_port(
+        &self,
+        vm_id: &str,
+        current: Option<u16>,
+        used: &BTreeSet<u16>,
+    ) -> anyhow::Result<u16> {
+        let valid_proxy_port_range = INCUS_OPENCLAW_PROXY_PORT_START
+            ..INCUS_OPENCLAW_PROXY_PORT_START + INCUS_OPENCLAW_PROXY_PORT_SPAN;
+        if current
+            .is_some_and(|port| valid_proxy_port_range.contains(&port) && !used.contains(&port))
+        {
+            return Ok(current.expect("checked above"));
+        }
+
+        let preferred = self.deterministic_openclaw_proxy_port(vm_id);
+        let preferred_offset = preferred - INCUS_OPENCLAW_PROXY_PORT_START;
+        for step in 0..INCUS_OPENCLAW_PROXY_PORT_SPAN {
+            let candidate = INCUS_OPENCLAW_PROXY_PORT_START
+                + ((preferred_offset + step) % INCUS_OPENCLAW_PROXY_PORT_SPAN);
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!("no free Incus OpenClaw proxy port remains in the configured host port range")
+    }
+
+    async fn allocate_openclaw_proxy_binding(
+        &self,
+        vm_id: &str,
+        current_proxy_port: Option<u16>,
+        current_guest_ipv4: Option<Ipv4Addr>,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<(u16, Ipv4Addr)> {
+        let instances = self.list_project_instances(request_id).await?;
+        let mut used_guest_ipv4s = BTreeSet::new();
+        let mut used_proxy_ports = BTreeSet::new();
+        for instance in instances {
+            if instance.name == vm_id {
+                continue;
+            }
+            if let Some(address) = Self::openclaw_guest_ipv4_from_details(&instance) {
+                used_guest_ipv4s.insert(address);
+            }
+            if let Some(port) = Self::openclaw_proxy_port_from_details(&instance) {
+                used_proxy_ports.insert(port);
+            }
+        }
+        let proxy_port =
+            self.select_openclaw_proxy_port(vm_id, current_proxy_port, &used_proxy_ports)?;
+        let guest_ipv4 =
+            self.select_openclaw_guest_ipv4(vm_id, current_guest_ipv4, &used_guest_ipv4s)?;
+        Ok((proxy_port, guest_ipv4))
     }
 
     async fn load_primary_nic_network_name(
@@ -1240,12 +1371,7 @@ impl IncusManagedVmProvider {
             .config
             .get(INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY)
             .and_then(|value| value.parse::<Ipv4Addr>().ok())
-            .unwrap_or(self.resolve_proxy_host_ipv4().await?);
-        let proxy_port = details
-            .config
-            .get(INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY)
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or_else(|| self.deterministic_openclaw_proxy_port(vm_id));
+            .unwrap_or(self.openclaw_proxy_host_ipv4()?);
         let current_guest_ipv4 = self
             .guest_ipv4_from_instance_state(vm_id, request_id)
             .await
@@ -1255,19 +1381,17 @@ impl IncusManagedVmProvider {
                     .map(|network| network.contains(address))
                     .unwrap_or(false)
             });
-        let guest_ipv4 = details
-            .config
-            .get(INCUS_OPENCLAW_GUEST_IPV4_CONFIG_KEY)
-            .and_then(|value| value.parse::<Ipv4Addr>().ok())
-            .or_else(|| {
-                details
-                    .devices
-                    .get(INCUS_PRIMARY_NIC_DEVICE_NAME)
-                    .and_then(|device| device.get("ipv4.address"))
-                    .and_then(|value| value.parse::<Ipv4Addr>().ok())
-            })
-            .or(current_guest_ipv4)
-            .unwrap_or(self.deterministic_openclaw_guest_ipv4(vm_id)?);
+        let current_configured_guest_ipv4 =
+            Self::openclaw_guest_ipv4_from_details(&details).or(current_guest_ipv4);
+        let current_proxy_port = Self::openclaw_proxy_port_from_details(&details);
+        let (proxy_port, guest_ipv4) = self
+            .allocate_openclaw_proxy_binding(
+                vm_id,
+                current_proxy_port,
+                current_configured_guest_ipv4,
+                request_id,
+            )
+            .await?;
         let expected_nic = BTreeMap::from([
             ("type".to_string(), "nic".to_string()),
             ("network".to_string(), nic_network),
@@ -1733,9 +1857,10 @@ impl IncusManagedVmProvider {
             ),
         ]);
         if matches!(self.resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw) {
-            let proxy_host = self.resolve_proxy_host_ipv4().await?;
-            let proxy_port = self.deterministic_openclaw_proxy_port(vm_id);
-            let guest_ipv4 = self.deterministic_openclaw_guest_ipv4(vm_id)?;
+            let proxy_host = self.openclaw_proxy_host_ipv4()?;
+            let (proxy_port, guest_ipv4) = self
+                .allocate_openclaw_proxy_binding(vm_id, None, None, request_id)
+                .await?;
             instance_config.insert(
                 INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY.to_string(),
                 serde_json::Value::String(proxy_host.to_string()),
@@ -2027,6 +2152,66 @@ impl IncusManagedVmProvider {
             tracing::warn!(
                 vm_id = %vm_id,
                 "incus guest ready marker omitted probe detail; reporting guest as not ready"
+            );
+            return false;
+        }
+        let marker_boot_id = match marker
+            .boot_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|boot_id| !boot_id.is_empty())
+        {
+            Some(boot_id) => boot_id,
+            None => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    "incus guest ready marker omitted boot_id; reporting guest as not ready"
+                );
+                return false;
+            }
+        };
+        let current_boot_id = match self
+            .get_instance_file(
+                vm_id,
+                INCUS_GUEST_BOOT_ID_PATH,
+                request_id,
+                "load incus guest boot id",
+            )
+            .await
+        {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(value) => value.trim().to_string(),
+                Err(err) => {
+                    tracing::warn!(
+                        vm_id = %vm_id,
+                        error = %err,
+                        "incus guest boot id was not valid utf-8; reporting guest as not ready"
+                    );
+                    return false;
+                }
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    "incus guest boot id file was missing; reporting guest as not ready"
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    error = %err,
+                    "failed to load incus guest boot id; reporting guest as not ready"
+                );
+                return false;
+            }
+        };
+        if current_boot_id.is_empty() || current_boot_id != marker_boot_id {
+            tracing::warn!(
+                vm_id = %vm_id,
+                marker_boot_id,
+                current_boot_id,
+                "incus guest ready marker boot_id did not match current boot; reporting guest as not ready"
             );
             return false;
         }
@@ -3405,6 +3590,13 @@ fn resolved_incus_params(
             {
                 params.openclaw_guest_ipv4_cidr = requested.openclaw_guest_ipv4_cidr.clone();
             }
+            if requested
+                .openclaw_proxy_host
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                params.openclaw_proxy_host = requested.openclaw_proxy_host.clone();
+            }
         }
     }
     if provider != ProviderKind::Incus {
@@ -3441,6 +3633,7 @@ fn resolved_incus_params(
         )?,
         insecure_tls: params.insecure_tls.unwrap_or(false),
         openclaw_guest_ipv4_cidr: params.openclaw_guest_ipv4_cidr,
+        openclaw_proxy_host: params.openclaw_proxy_host,
         agent_kind: guest_selection.kind,
         agent_backend: guest_selection.backend,
     })
@@ -4551,6 +4744,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
         prior_incus_storage_pool: Option<String>,
         prior_incus_image_alias: Option<String>,
         prior_incus_openclaw_guest_ipv4_cidr: Option<String>,
+        prior_incus_openclaw_proxy_host: Option<String>,
         prior_incus_insecure_tls: Option<String>,
         prior_incus_client_cert_path: Option<String>,
         prior_incus_client_key_path: Option<String>,
@@ -4569,6 +4763,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             let prior_incus_image_alias = std::env::var(INCUS_IMAGE_ALIAS_ENV).ok();
             let prior_incus_openclaw_guest_ipv4_cidr =
                 std::env::var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV).ok();
+            let prior_incus_openclaw_proxy_host = std::env::var(INCUS_OPENCLAW_PROXY_HOST_ENV).ok();
             let prior_incus_insecure_tls = std::env::var(INCUS_INSECURE_TLS_ENV).ok();
             let prior_incus_client_cert_path = std::env::var(INCUS_CLIENT_CERT_PATH_ENV).ok();
             let prior_incus_client_key_path = std::env::var(INCUS_CLIENT_KEY_PATH_ENV).ok();
@@ -4582,6 +4777,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 std::env::remove_var(INCUS_STORAGE_POOL_ENV);
                 std::env::remove_var(INCUS_IMAGE_ALIAS_ENV);
                 std::env::remove_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV);
+                std::env::remove_var(INCUS_OPENCLAW_PROXY_HOST_ENV);
                 std::env::remove_var(INCUS_INSECURE_TLS_ENV);
                 std::env::remove_var(INCUS_CLIENT_CERT_PATH_ENV);
                 std::env::remove_var(INCUS_CLIENT_KEY_PATH_ENV);
@@ -4605,6 +4801,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 prior_incus_storage_pool,
                 prior_incus_image_alias,
                 prior_incus_openclaw_guest_ipv4_cidr,
+                prior_incus_openclaw_proxy_host,
                 prior_incus_insecure_tls,
                 prior_incus_client_cert_path,
                 prior_incus_client_key_path,
@@ -4685,6 +4882,14 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 },
                 None => unsafe {
                     std::env::remove_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV);
+                },
+            }
+            match self.prior_incus_openclaw_proxy_host.as_deref() {
+                Some(prior) => unsafe {
+                    std::env::set_var(INCUS_OPENCLAW_PROXY_HOST_ENV, prior);
+                },
+                None => unsafe {
+                    std::env::remove_var(INCUS_OPENCLAW_PROXY_HOST_ENV);
                 },
             }
             match self.prior_incus_insecure_tls.as_deref() {
@@ -4914,6 +5119,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: None,
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
 
@@ -4936,49 +5142,80 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
-
-        let err =
-            resolved_incus_params(Some(&requested)).expect_err("missing storage pool must fail");
-        assert!(err.to_string().contains("incus.storage_pool"));
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let err = resolved_incus_params(Some(&requested))
+                    .expect_err("missing storage pool must fail");
+                assert!(err.to_string().contains("incus.storage_pool"));
+            },
+        );
     }
 
     #[test]
     fn resolved_managed_vm_provider_config_accepts_incus_request_params() {
-        let requested = ManagedVmProvisionParams {
-            provider: Some(ProviderKind::Incus),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: None,
-                kind: Some(MicrovmAgentKind::Openclaw),
-                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
-            }),
-            incus: Some(IncusProvisionParams {
-                endpoint: Some("https://incus.internal:8443".to_string()),
-                project: Some("managed-agents".to_string()),
-                profile: Some("pika-agent".to_string()),
-                storage_pool: Some("managed-agents-zfs".to_string()),
-                image_alias: Some("pika-agent/dev".to_string()),
-                insecure_tls: Some(true),
-                openclaw_guest_ipv4_cidr: None,
-            }),
-        };
+        let _guard = serial_test_guard();
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let requested = ManagedVmProvisionParams {
+                    provider: Some(ProviderKind::Incus),
+                    microvm: Some(MicrovmProvisionParams {
+                        spawner_url: None,
+                        kind: Some(MicrovmAgentKind::Openclaw),
+                        backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+                    }),
+                    incus: Some(IncusProvisionParams {
+                        endpoint: Some("https://incus.internal:8443".to_string()),
+                        project: Some("managed-agents".to_string()),
+                        profile: Some("pika-agent".to_string()),
+                        storage_pool: Some("managed-agents-zfs".to_string()),
+                        image_alias: Some("pika-agent/dev".to_string()),
+                        insecure_tls: Some(true),
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                    }),
+                };
 
-        let resolved =
-            resolve_managed_vm_provider_config(Some(&requested)).expect("resolve incus config");
-        assert_eq!(
-            resolved,
-            ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
-                endpoint: "https://incus.internal:8443".to_string(),
-                project: "managed-agents".to_string(),
-                profile: "pika-agent".to_string(),
-                storage_pool: "managed-agents-zfs".to_string(),
-                image_alias: "pika-agent/dev".to_string(),
-                insecure_tls: true,
-                openclaw_guest_ipv4_cidr: None,
-                agent_kind: ResolvedMicrovmAgentKind::Openclaw,
-                agent_backend: ResolvedMicrovmAgentBackend::Native,
-            })
+                let resolved = resolve_managed_vm_provider_config(Some(&requested))
+                    .expect("resolve incus config");
+                assert_eq!(
+                    resolved,
+                    ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
+                        endpoint: "https://incus.internal:8443".to_string(),
+                        project: "managed-agents".to_string(),
+                        profile: "pika-agent".to_string(),
+                        storage_pool: "managed-agents-zfs".to_string(),
+                        image_alias: "pika-agent/dev".to_string(),
+                        insecure_tls: true,
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                        agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+                        agent_backend: ResolvedMicrovmAgentBackend::Native,
+                    })
+                );
+            },
         );
     }
 
@@ -4992,6 +5229,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             image_alias: "pika-agent/dev".to_string(),
             insecure_tls: false,
             openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
             agent_kind: ResolvedMicrovmAgentKind::Openclaw,
             agent_backend: ResolvedMicrovmAgentBackend::Native,
         };
@@ -5020,6 +5258,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             image_alias: "pika-agent/dev".to_string(),
             insecure_tls: true,
             openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
             agent_kind: ResolvedMicrovmAgentKind::Openclaw,
             agent_backend: ResolvedMicrovmAgentBackend::Native,
         };
@@ -5052,6 +5291,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             image_alias: "pika-agent/dev".to_string(),
             insecure_tls: true,
             openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
             agent_kind: ResolvedMicrovmAgentKind::Openclaw,
             agent_backend: ResolvedMicrovmAgentBackend::Native,
         };
@@ -5084,18 +5324,33 @@ GFs2pW5hEhS7cCO0qXaa5g==
     #[test]
     fn resolved_incus_params_require_image_alias() {
         let _guard = serial_test_guard();
-        let requested = requested_incus_params(IncusProvisionParams {
-            endpoint: Some("https://incus.internal:8443".to_string()),
-            project: Some("managed-agents".to_string()),
-            profile: Some("pika-agent".to_string()),
-            storage_pool: Some("managed-agents-zfs".to_string()),
-            image_alias: None,
-            insecure_tls: None,
-            openclaw_guest_ipv4_cidr: None,
-        });
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let requested = requested_incus_params(IncusProvisionParams {
+                    endpoint: Some("https://incus.internal:8443".to_string()),
+                    project: Some("managed-agents".to_string()),
+                    profile: Some("pika-agent".to_string()),
+                    storage_pool: Some("managed-agents-zfs".to_string()),
+                    image_alias: None,
+                    insecure_tls: None,
+                    openclaw_guest_ipv4_cidr: None,
+                    openclaw_proxy_host: None,
+                });
 
-        let err = resolved_incus_params(Some(&requested)).expect_err("missing image alias");
-        assert!(err.to_string().contains("incus.image_alias"));
+                let err = resolved_incus_params(Some(&requested)).expect_err("missing image alias");
+                assert!(err.to_string().contains("incus.image_alias"));
+            },
+        );
     }
 
     #[test]
@@ -5334,6 +5589,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 "200 OK",
                 r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
             ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
             (
                 "202 Accepted",
                 r#"{"type":"async","operation":"/1.0/operations/op-create","metadata":{"err":""}}"#,
@@ -5359,6 +5615,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };
@@ -5406,6 +5663,12 @@ GFs2pW5hEhS7cCO0qXaa5g==
         assert_eq!(
             profile_request.path,
             "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
         );
 
         let instance_request = rx.recv().expect("captured instance create request");
@@ -5455,7 +5718,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
         );
         assert_eq!(
             instance_body["config"][INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY],
-            "127.0.0.1"
+            "100.81.250.67"
         );
         assert!(
             instance_body["config"][INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY]
@@ -5499,10 +5762,6 @@ GFs2pW5hEhS7cCO0qXaa5g==
             "service unit should be baked into the Incus guest image, not written by cloud-init"
         );
         assert_eq!(instance_body["config"]["user.pika.agent_kind"], "openclaw");
-        assert_eq!(
-            instance_body["config"][INCUS_OPENCLAW_PROXY_HOST_CONFIG_KEY],
-            "127.0.0.1"
-        );
         assert!(
             instance_body["config"][INCUS_OPENCLAW_PROXY_PORT_CONFIG_KEY]
                 .as_str()
@@ -5542,6 +5801,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             "ready": true,
             "agent_kind": "openclaw",
             "probe": "openclaw_gateway_health",
+            "boot_id": "boot-ready-1",
         });
         let (base_url, rx) = spawn_response_sequence_server(vec![
             (
@@ -5549,6 +5809,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 r#"{"type":"sync","metadata":{"status":"Running"}}"#,
             ),
             ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-ready-1\n"),
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
@@ -5565,6 +5826,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -5586,6 +5848,13 @@ GFs2pW5hEhS7cCO0qXaa5g==
             ready_request.path,
             format!(
                 "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            )
+        );
+        let boot_id_request = rx.recv().expect("captured boot-id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
             )
         );
     }
@@ -5611,6 +5880,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };
@@ -5651,6 +5921,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 "200 OK",
                 r#"{"type":"sync","metadata":{"status":"Running","network":{"enp5s0":{"addresses":[{"address":"10.193.52.24","family":"inet","scope":"global"}]}}}}"#,
             ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
             (
                 "202 Accepted",
                 r#"{"type":"async","operation":"/1.0/operations/op-proxy","metadata":{"err":""}}"#,
@@ -5671,6 +5942,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };
@@ -5698,6 +5970,12 @@ GFs2pW5hEhS7cCO0qXaa5g==
         assert_eq!(
             state_request.path,
             format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
         );
         let patch_request = rx.recv().expect("captured proxy patch request");
         assert_eq!(patch_request.method, "PATCH");
@@ -5745,6 +6023,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 "200 OK",
                 r#"{"type":"sync","metadata":{"status":"Running","network":{"enp5s0":{"addresses":[{"address":"10.193.52.24","family":"inet","scope":"global"}]}}}}"#,
             ),
+            ("200 OK", r#"{"type":"sync","metadata":[]}"#),
             ("200 OK", r#"{"type":"sync","metadata":{}}"#),
         ]);
         let requested = ManagedVmProvisionParams {
@@ -5761,6 +6040,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };
@@ -5788,6 +6068,12 @@ GFs2pW5hEhS7cCO0qXaa5g==
         assert_eq!(
             state_request.path,
             format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let instance_list_request = rx.recv().expect("captured instance list request");
+        assert_eq!(instance_list_request.method, "GET");
+        assert_eq!(
+            instance_list_request.path,
+            "/1.0/instances?project=managed-agents&recursion=1"
         );
         let patch_request = rx.recv().expect("captured proxy patch request");
         assert_eq!(patch_request.method, "PATCH");
@@ -5822,11 +6108,57 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
         let status = provider
             .get_vm_status(vm_id, Some("req-incus-malformed"))
+            .await
+            .expect("load incus status");
+        assert_eq!(status.status, "running");
+        assert!(!status.startup_probe_satisfied);
+        assert!(!status.guest_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_vm_provider_status_keeps_guest_unready_when_ready_signal_boot_id_is_stale() {
+        let vm_id = "pika-agent-stale-boot";
+        let ready_marker = serde_json::json!({
+            "ready": true,
+            "agent_kind": "openclaw",
+            "probe": "openclaw_gateway_health",
+            "boot_id": "boot-old",
+        });
+        let (base_url, _rx) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-current\n"),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                insecure_tls: None,
+                openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
+            }),
+        };
+        let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
+        let status = provider
+            .get_vm_status(vm_id, Some("req-incus-stale-boot"))
             .await
             .expect("load incus status");
         assert_eq!(status.status, "running");
@@ -5857,6 +6189,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -5904,6 +6237,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             "ready": true,
             "agent_kind": "openclaw",
             "probe": "openclaw_gateway_health",
+            "boot_id": "boot-recover-1",
         });
         let (base_url, rx) = spawn_response_sequence_server(vec![
             (
@@ -5920,6 +6254,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 r#"{"type":"sync","metadata":{"status":"Running"}}"#,
             ),
             ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-recover-1\n"),
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
@@ -5936,6 +6271,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -5964,6 +6300,25 @@ GFs2pW5hEhS7cCO0qXaa5g==
             wait_request.path,
             "/1.0/operations/op-recover/wait?timeout=60"
         );
+        let status_request = rx.recv().expect("captured post-recover status request");
+        assert_eq!(
+            status_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let ready_request = rx.recv().expect("captured ready marker request");
+        assert_eq!(
+            ready_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            )
+        );
+        let boot_id_request = rx.recv().expect("captured guest boot id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
+            )
+        );
     }
 
     #[tokio::test]
@@ -5974,6 +6329,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             "ready": true,
             "agent_kind": "openclaw",
             "probe": "openclaw_gateway_health",
+            "boot_id": "boot-restore-1",
         });
         let (base_url, rx) = spawn_response_sequence_server(vec![
             (
@@ -6000,6 +6356,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 r#"{"type":"sync","metadata":{"status":"Running"}}"#,
             ),
             ("200 OK", &ready_marker.to_string()),
+            ("200 OK", "boot-restore-1\n"),
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
@@ -6016,6 +6373,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -6066,6 +6424,25 @@ GFs2pW5hEhS7cCO0qXaa5g==
             start_wait_request.path,
             "/1.0/operations/op-start/wait?timeout=60"
         );
+        let status_request = rx.recv().expect("captured post-restore status request");
+        assert_eq!(
+            status_request.path,
+            format!("/1.0/instances/{vm_id}/state?project=managed-agents")
+        );
+        let ready_request = rx.recv().expect("captured ready marker request");
+        assert_eq!(
+            ready_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json"
+            )
+        );
+        let boot_id_request = rx.recv().expect("captured guest boot id request");
+        assert_eq!(
+            boot_id_request.path,
+            format!(
+                "/1.0/instances/{vm_id}/files?project=managed-agents&path=%2Fproc%2Fsys%2Fkernel%2Frandom%2Fboot_id"
+            )
+        );
     }
 
     #[tokio::test]
@@ -6105,6 +6482,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: None,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             }),
         };
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
@@ -6186,6 +6564,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
             image_alias: Some("pika-agent/dev".to_string()),
             insecure_tls: None,
             openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
         });
         let provider = managed_vm_provider(Some(&requested)).expect("resolve incus provider");
         provider
@@ -6259,6 +6638,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 image_alias: "pika-agent/dev".to_string(),
                 insecure_tls: true,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
                 agent_kind: ResolvedMicrovmAgentKind::Openclaw,
                 agent_backend: ResolvedMicrovmAgentBackend::Native,
             }),
@@ -6331,6 +6711,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 (INCUS_STORAGE_POOL_ENV, Some("managed-agents-zfs")),
                 (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
                 (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, Some("10.193.52.0/24")),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, Some("100.81.250.67")),
                 (INCUS_INSECURE_TLS_ENV, Some("true")),
                 ("PIKA_AGENT_MICROVM_KIND", Some("openclaw")),
             ],
@@ -6425,6 +6806,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 (INCUS_STORAGE_POOL_ENV, Some("managed-agents-zfs")),
                 (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
                 (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, Some("10.193.52.0/24")),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, Some("100.81.250.67")),
                 (INCUS_INSECURE_TLS_ENV, None),
                 (INCUS_CLIENT_CERT_PATH_ENV, None),
                 (INCUS_CLIENT_KEY_PATH_ENV, None),
@@ -6984,6 +7366,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
                 storage_pool: Some("managed-agents-zfs".to_string()),
                 image_alias: Some("pika-agent/dev".to_string()),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                openclaw_proxy_host: Some("100.81.250.67".to_string()),
                 insecure_tls: Some(true),
             }),
         };

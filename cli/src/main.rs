@@ -1834,6 +1834,7 @@ fn agent_provision_request(microvm: &AgentMicrovmArgs) -> Option<AgentProvisionR
                 image_alias: microvm.incus_image_alias.clone(),
                 insecure_tls: microvm.incus_insecure_tls,
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             },
         ),
     })
@@ -3160,6 +3161,7 @@ mod tests {
                 image_alias: Some("pika-agent/dev".to_string()),
                 insecure_tls: Some(true),
                 openclaw_guest_ipv4_cidr: None,
+                openclaw_proxy_host: None,
             })
         );
     }

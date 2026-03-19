@@ -13,6 +13,7 @@
       incusStoragePool = "default";
       incusImageAlias = "pika-agent/dev";
       incusOpenclawGuestIpv4Cidr = "10.193.52.0/24";
+      incusOpenclawProxyHost = "100.81.250.67";
       incusInsecureTls = true;
       incusClientCertPath = "/var/lib/pika-server/incus/pika-server-incus-client.crt";
       incusClientKeyPath = "/var/lib/pika-server/incus/pika-server-incus-client.key";

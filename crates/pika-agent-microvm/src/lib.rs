@@ -910,13 +910,18 @@ fi
 
 write_ready_marker() {{
   local probe="$1"
+  local boot_id=""
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    boot_id="$(tr -d '\n' < /proc/sys/kernel/random/boot_id)"
+  fi
   cat >"$ready_path" <<EOF
 {{
   "ready": true,
   "agent_kind": "${{agent_kind}}",
   "backend_mode": "${{backend_mode}}",
   "service_kind": "${{service_kind}}",
-  "probe": "${{probe}}"
+  "probe": "${{probe}}",
+  "boot_id": "${{boot_id}}"
 }}
 EOF
   rm -f "$failed_path"
