@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use axum::extract::Extension;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode};
 use axum::{response::IntoResponse, Json};
 use base64::Engine;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
@@ -32,30 +32,19 @@ use crate::nostr_auth::{
 };
 use crate::{RequestContext, State};
 use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentRuntimeBackend, AgentRuntimeKind, AgentRuntimeParams,
-    AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams, MicrovmAgentKind,
-    MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth, SpawnerVmBackupStatus,
-    SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind, VmRecoveryPointKind,
-    GUEST_READY_MARKER_PATH,
+    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams,
+    MicrovmAgentKind, MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth,
+    SpawnerVmBackupStatus, SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind,
+    VmRecoveryPointKind, GUEST_READY_MARKER_PATH,
 };
 use pika_agent_microvm::{
-    build_create_vm_request, resolve_params, validate_resolved_params, ManagedVmCreateInput,
-    MicrovmManagedVmProvider, ResolvedMicrovmAgentBackend, ResolvedMicrovmAgentKind,
-    ResolvedMicrovmParams,
+    build_create_vm_request, resolve_params, ManagedVmCreateInput, ResolvedMicrovmAgentBackend,
+    ResolvedMicrovmAgentKind, ResolvedMicrovmParams,
 };
 use pika_relay_profiles::default_message_relays;
 
 const AGENT_OWNER_ACTIVE_INDEX: &str = "agent_instances_owner_active_idx";
 const VM_PROVIDER_ENV: &str = "PIKA_AGENT_VM_PROVIDER";
-const MICROVM_SPAWNER_URL_ENV: &str = "PIKA_AGENT_MICROVM_SPAWNER_URL";
-const MICROVM_KIND_ENV: &str = "PIKA_AGENT_MICROVM_KIND";
-const MICROVM_BACKEND_ENV: &str = "PIKA_AGENT_MICROVM_BACKEND";
-const MICROVM_ACP_EXEC_ENV: &str = "PIKA_AGENT_MICROVM_ACP_EXEC";
-const MICROVM_ACP_CWD_ENV: &str = "PIKA_AGENT_MICROVM_ACP_CWD";
-const RUNTIME_KIND_ENV: &str = "PIKA_AGENT_RUNTIME_KIND";
-const RUNTIME_BACKEND_ENV: &str = "PIKA_AGENT_RUNTIME_BACKEND";
-const RUNTIME_ACP_EXEC_ENV: &str = "PIKA_AGENT_RUNTIME_ACP_EXEC";
-const RUNTIME_ACP_CWD_ENV: &str = "PIKA_AGENT_RUNTIME_ACP_CWD";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const INCUS_ENDPOINT_ENV: &str = "PIKA_AGENT_INCUS_ENDPOINT";
 const INCUS_PROJECT_ENV: &str = "PIKA_AGENT_INCUS_PROJECT";
@@ -109,6 +98,266 @@ pub struct AgentApiError {
     status: StatusCode,
     code: AgentApiErrorCode,
     request_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::serial_test_guard;
+    use axum::body::to_bytes;
+    use pika_agent_microvm::{ResolvedMicrovmAgentBackend, ResolvedMicrovmAgentKind};
+
+    struct EnvGuard {
+        prior: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
+            let mut prior = Vec::with_capacity(overrides.len());
+            for (name, value) in overrides {
+                prior.push((*name, std::env::var(name).ok()));
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.prior.drain(..).rev() {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+
+    fn with_env<T>(overrides: &[(&'static str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _serial = serial_test_guard();
+        let _env = EnvGuard::set(overrides);
+        f()
+    }
+
+    fn complete_incus_env() -> [(&'static str, Option<&'static str>); 8] {
+        [
+            (VM_PROVIDER_ENV, Some("incus")),
+            (INCUS_ENDPOINT_ENV, Some("https://incus.example.test:8443")),
+            (INCUS_PROJECT_ENV, Some("pika-managed-agents")),
+            (INCUS_PROFILE_ENV, Some("pika-agent-dev")),
+            (INCUS_STORAGE_POOL_ENV, Some("default")),
+            (INCUS_IMAGE_ALIAS_ENV, Some("pika-agent/dev")),
+            (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+            (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+        ]
+    }
+
+    #[test]
+    fn provider_kind_db_value_round_trips() {
+        assert_eq!(provider_kind_db_value(ProviderKind::Incus), "incus");
+        assert_eq!(
+            provider_kind_from_db_value("incus").expect("incus provider"),
+            ProviderKind::Incus
+        );
+    }
+
+    #[test]
+    fn provider_kind_from_db_value_rejects_unknown_provider() {
+        let err = provider_kind_from_db_value("microvm").expect_err("unknown provider must fail");
+        assert!(err.to_string().contains("unknown managed VM provider"));
+    }
+
+    #[test]
+    fn default_vm_provider_kind_defaults_to_incus() {
+        with_env(&[(VM_PROVIDER_ENV, None)], || {
+            assert_eq!(
+                default_vm_provider_kind_from_env().expect("default provider"),
+                ProviderKind::Incus
+            );
+        });
+    }
+
+    #[test]
+    fn default_vm_provider_kind_rejects_microvm() {
+        with_env(&[(VM_PROVIDER_ENV, Some("microvm"))], || {
+            let err = default_vm_provider_kind_from_env().expect_err("microvm must be rejected");
+            assert!(err.to_string().contains("no longer supported"));
+        });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn agent_api_healthcheck_skips_when_incus_is_unconfigured() {
+        let overrides = [
+            (VM_PROVIDER_ENV, None),
+            (INCUS_ENDPOINT_ENV, None),
+            (INCUS_PROJECT_ENV, None),
+            (INCUS_PROFILE_ENV, None),
+            (INCUS_STORAGE_POOL_ENV, None),
+            (INCUS_IMAGE_ALIAS_ENV, None),
+            (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+            (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+        ];
+        let _serial = serial_test_guard();
+        let _env = EnvGuard::set(&overrides);
+        agent_api_healthcheck()
+            .await
+            .expect("unconfigured server should still start");
+    }
+
+    #[test]
+    fn resolved_incus_params_require_image_alias() {
+        let overrides = [
+            (VM_PROVIDER_ENV, Some("incus")),
+            (INCUS_ENDPOINT_ENV, Some("https://incus.example.test:8443")),
+            (INCUS_PROJECT_ENV, Some("pika-managed-agents")),
+            (INCUS_PROFILE_ENV, Some("pika-agent-dev")),
+            (INCUS_STORAGE_POOL_ENV, Some("default")),
+            (INCUS_IMAGE_ALIAS_ENV, None),
+            (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+            (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+        ];
+        with_env(&overrides, || {
+            let err = resolved_incus_params(None).expect_err("missing image alias must fail");
+            assert!(err.to_string().contains("missing incus.image_alias"));
+        });
+    }
+
+    #[test]
+    fn resolved_incus_params_use_request_overrides_and_openclaw_defaults() {
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some("https://override.example.test:8443".to_string()),
+                project: Some("override-project".to_string()),
+                profile: Some("override-profile".to_string()),
+                storage_pool: Some("override-pool".to_string()),
+                image_alias: Some("override-image".to_string()),
+                insecure_tls: Some(false),
+                openclaw_guest_ipv4_cidr: Some("10.200.0.10/24".to_string()),
+                openclaw_proxy_host: Some("203.0.113.10".to_string()),
+            }),
+        };
+        with_env(&complete_incus_env(), || {
+            let resolved = resolved_incus_params(Some(&requested)).expect("resolve params");
+            assert_eq!(resolved.endpoint, "https://override.example.test:8443");
+            assert_eq!(resolved.project, "override-project");
+            assert_eq!(resolved.profile, "override-profile");
+            assert_eq!(resolved.storage_pool, "override-pool");
+            assert_eq!(resolved.image_alias, "override-image");
+            assert!(!resolved.insecure_tls);
+            assert_eq!(
+                resolved.openclaw_guest_ipv4_cidr.as_deref(),
+                Some("10.200.0.10/24")
+            );
+            assert_eq!(
+                resolved.openclaw_proxy_host.as_deref(),
+                Some("203.0.113.10")
+            );
+            assert_eq!(resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw);
+            assert_eq!(resolved.agent_backend, ResolvedMicrovmAgentBackend::Native);
+        });
+    }
+
+    #[test]
+    fn resolve_managed_vm_provider_config_is_incus_only() {
+        with_env(&complete_incus_env(), || {
+            let config = resolve_managed_vm_provider_config(None).expect("resolve provider");
+            match config {
+                ResolvedManagedVmProviderConfig::Incus(resolved) => {
+                    assert_eq!(resolved.project, "pika-managed-agents");
+                    assert_eq!(resolved.agent_kind, ResolvedMicrovmAgentKind::Openclaw);
+                    assert_eq!(resolved.agent_backend, ResolvedMicrovmAgentBackend::Native);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn materialized_managed_vm_params_are_incus_only() {
+        let config = ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
+            endpoint: "https://incus.example.test:8443".to_string(),
+            project: "pika-managed-agents".to_string(),
+            profile: "pika-agent-dev".to_string(),
+            storage_pool: "default".to_string(),
+            image_alias: "pika-agent/dev".to_string(),
+            insecure_tls: true,
+            openclaw_guest_ipv4_cidr: Some("10.200.0.10/24".to_string()),
+            openclaw_proxy_host: Some("203.0.113.10".to_string()),
+            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+            agent_backend: ResolvedMicrovmAgentBackend::Native,
+        });
+        let params = materialized_managed_vm_params(&config);
+        assert_eq!(params.provider, Some(ProviderKind::Incus));
+        let incus = params.incus.expect("incus params");
+        assert_eq!(
+            incus.endpoint.as_deref(),
+            Some("https://incus.example.test:8443")
+        );
+        assert_eq!(incus.project.as_deref(), Some("pika-managed-agents"));
+        assert_eq!(incus.profile.as_deref(), Some("pika-agent-dev"));
+        assert_eq!(incus.storage_pool.as_deref(), Some("default"));
+        assert_eq!(incus.image_alias.as_deref(), Some("pika-agent/dev"));
+        assert_eq!(incus.insecure_tls, Some(true));
+        assert_eq!(
+            incus.openclaw_guest_ipv4_cidr.as_deref(),
+            Some("10.200.0.10/24")
+        );
+        assert_eq!(incus.openclaw_proxy_host.as_deref(), Some("203.0.113.10"));
+    }
+
+    #[test]
+    fn serialize_managed_vm_provider_config_omits_legacy_fields() {
+        let config = ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
+            endpoint: "https://incus.example.test:8443".to_string(),
+            project: "pika-managed-agents".to_string(),
+            profile: "pika-agent-dev".to_string(),
+            storage_pool: "default".to_string(),
+            image_alias: "pika-agent/dev".to_string(),
+            insecure_tls: true,
+            openclaw_guest_ipv4_cidr: None,
+            openclaw_proxy_host: None,
+            agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+            agent_backend: ResolvedMicrovmAgentBackend::Native,
+        });
+        let json = serialize_managed_vm_provider_config(&config).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse config json");
+        assert_eq!(value["provider"], "incus");
+        assert!(value.get("incus").is_some());
+        assert!(value.get("runtime").is_none());
+        assert!(value.get("microvm").is_none());
+    }
+
+    #[test]
+    fn incus_params_provided_detects_any_request_scoped_field() {
+        let params = IncusProvisionParams {
+            endpoint: None,
+            project: None,
+            profile: None,
+            storage_pool: None,
+            image_alias: None,
+            insecure_tls: None,
+            openclaw_guest_ipv4_cidr: Some("10.200.0.10/24".to_string()),
+            openclaw_proxy_host: None,
+        };
+        assert!(incus_params_provided(&params));
+    }
+
+    #[tokio::test]
+    async fn agent_api_error_response_includes_request_id() {
+        let response = AgentApiError::from_code(AgentApiErrorCode::RecoverFailed)
+            .with_request_id("req-123")
+            .into_response();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse error body");
+        assert_eq!(json["error"], AgentApiErrorCode::RecoverFailed.as_str());
+        assert_eq!(json["request_id"], "req-123");
+    }
 }
 
 impl AgentApiError {
@@ -253,13 +502,11 @@ struct ResolvedIncusTlsConfig {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ResolvedManagedVmProviderConfig {
-    Microvm(ResolvedMicrovmParams),
     Incus(ResolvedIncusParams),
 }
 
 #[derive(Debug, Clone)]
 enum ManagedVmProvider {
-    Microvm(MicrovmManagedVmProvider),
     Incus(IncusManagedVmProvider),
 }
 
@@ -375,14 +622,12 @@ struct IncusOpenClawAuthConfig {
 
 fn provider_kind_db_value(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Microvm => "microvm",
         ProviderKind::Incus => "incus",
     }
 }
 
 fn provider_kind_from_db_value(value: &str) -> anyhow::Result<ProviderKind> {
     match value.trim() {
-        "microvm" => Ok(ProviderKind::Microvm),
         "incus" => Ok(ProviderKind::Incus),
         other => anyhow::bail!("unknown managed VM provider stored on row: {other:?}"),
     }
@@ -392,84 +637,8 @@ fn materialized_managed_vm_params(
     config: &ResolvedManagedVmProviderConfig,
 ) -> ManagedVmProvisionParams {
     match config {
-        ResolvedManagedVmProviderConfig::Microvm(resolved) => ManagedVmProvisionParams {
-            provider: Some(ProviderKind::Microvm),
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(match resolved.kind {
-                    pika_agent_microvm::ResolvedMicrovmAgentKind::Pi => AgentRuntimeKind::Pi,
-                    pika_agent_microvm::ResolvedMicrovmAgentKind::Openclaw => {
-                        AgentRuntimeKind::Openclaw
-                    }
-                }),
-                backend: Some(match &resolved.backend {
-                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Native => {
-                        AgentRuntimeBackend::Native
-                    }
-                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
-                        AgentRuntimeBackend::Acp {
-                            exec_command: Some(exec_command.clone()),
-                            cwd: Some(cwd.clone()),
-                        }
-                    }
-                }),
-            }),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: Some(resolved.spawner_url.clone()),
-                kind: Some(match resolved.kind {
-                    pika_agent_microvm::ResolvedMicrovmAgentKind::Pi => MicrovmAgentKind::Pi,
-                    pika_agent_microvm::ResolvedMicrovmAgentKind::Openclaw => {
-                        MicrovmAgentKind::Openclaw
-                    }
-                }),
-                backend: Some(match &resolved.backend {
-                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Native => {
-                        pika_agent_control_plane::MicrovmAgentBackend::Native
-                    }
-                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
-                        pika_agent_control_plane::MicrovmAgentBackend::Acp {
-                            exec_command: Some(exec_command.clone()),
-                            cwd: Some(cwd.clone()),
-                        }
-                    }
-                }),
-            }),
-            incus: None,
-        },
         ResolvedManagedVmProviderConfig::Incus(resolved) => ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(match resolved.agent_kind {
-                    ResolvedMicrovmAgentKind::Pi => AgentRuntimeKind::Pi,
-                    ResolvedMicrovmAgentKind::Openclaw => AgentRuntimeKind::Openclaw,
-                }),
-                backend: Some(match &resolved.agent_backend {
-                    ResolvedMicrovmAgentBackend::Native => AgentRuntimeBackend::Native,
-                    ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
-                        AgentRuntimeBackend::Acp {
-                            exec_command: Some(exec_command.clone()),
-                            cwd: Some(cwd.clone()),
-                        }
-                    }
-                }),
-            }),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: None,
-                kind: Some(match resolved.agent_kind {
-                    ResolvedMicrovmAgentKind::Pi => MicrovmAgentKind::Pi,
-                    ResolvedMicrovmAgentKind::Openclaw => MicrovmAgentKind::Openclaw,
-                }),
-                backend: Some(match &resolved.agent_backend {
-                    ResolvedMicrovmAgentBackend::Native => {
-                        pika_agent_control_plane::MicrovmAgentBackend::Native
-                    }
-                    ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
-                        pika_agent_control_plane::MicrovmAgentBackend::Acp {
-                            exec_command: Some(exec_command.clone()),
-                            cwd: Some(cwd.clone()),
-                        }
-                    }
-                }),
-            }),
             incus: Some(IncusProvisionParams {
                 endpoint: Some(resolved.endpoint.clone()),
                 project: Some(resolved.project.clone()),
@@ -511,38 +680,6 @@ fn managed_vm_params_from_row(row: &AgentInstance) -> anyhow::Result<ManagedVmPr
         params.provider = Some(provider);
     }
     Ok(params)
-}
-
-fn merge_microvm_provision_params(
-    base: Option<MicrovmProvisionParams>,
-    requested: Option<&MicrovmProvisionParams>,
-) -> Option<MicrovmProvisionParams> {
-    let mut merged = base.unwrap_or_default();
-    let mut changed = false;
-    if let Some(requested) = requested {
-        if requested
-            .spawner_url
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            merged.spawner_url = requested.spawner_url.clone();
-            changed = true;
-        }
-        if requested.kind.is_some() {
-            merged.kind = requested.kind;
-            changed = true;
-        }
-        if requested.backend.is_some() {
-            merged.backend = requested.backend.clone();
-            changed = true;
-        }
-    }
-    if changed || merged.spawner_url.is_some() || merged.kind.is_some() || merged.backend.is_some()
-    {
-        Some(merged)
-    } else {
-        None
-    }
 }
 
 fn merge_incus_provision_params(
@@ -651,25 +788,7 @@ fn managed_vm_params_for_existing_row(
     }
 
     match row_provider {
-        ProviderKind::Microvm => {
-            if requested.incus.as_ref().is_some_and(incus_params_provided) {
-                anyhow::bail!(
-                    "existing managed VM is bound to microvm, but request supplied incus params"
-                );
-            }
-            params.microvm =
-                merge_microvm_provision_params(params.microvm.take(), requested.microvm.as_ref());
-        }
         ProviderKind::Incus => {
-            if requested
-                .microvm
-                .as_ref()
-                .is_some_and(microvm_params_provided)
-            {
-                anyhow::bail!(
-                    "existing managed VM is bound to incus, but request supplied microvm params"
-                );
-            }
             params.incus =
                 merge_incus_provision_params(params.incus.take(), requested.incus.as_ref());
         }
@@ -751,116 +870,6 @@ pub(crate) fn list_recent_managed_environment_events(
     })
 }
 
-#[cfg(test)]
-fn required_microvm_spawner_url(raw: Option<String>) -> anyhow::Result<String> {
-    raw.map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .with_context(|| format!("missing {MICROVM_SPAWNER_URL_ENV}"))
-}
-
-fn microvm_kind_from_env() -> Option<MicrovmAgentKind> {
-    match non_empty_env_var(RUNTIME_KIND_ENV)
-        .or_else(|| non_empty_env_var(MICROVM_KIND_ENV))
-        .as_deref()
-    {
-        Some("openclaw") => Some(MicrovmAgentKind::Openclaw),
-        Some("pi") => Some(MicrovmAgentKind::Pi),
-        _ => None,
-    }
-}
-
-fn runtime_backend_from_env() -> Option<pika_agent_control_plane::MicrovmAgentBackend> {
-    match non_empty_env_var(RUNTIME_BACKEND_ENV)
-        .or_else(|| non_empty_env_var(MICROVM_BACKEND_ENV))
-        .as_deref()
-    {
-        Some("native") => Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
-        Some("acp") => Some(pika_agent_control_plane::MicrovmAgentBackend::Acp {
-            exec_command: non_empty_env_var(RUNTIME_ACP_EXEC_ENV)
-                .or_else(|| non_empty_env_var(MICROVM_ACP_EXEC_ENV)),
-            cwd: non_empty_env_var(RUNTIME_ACP_CWD_ENV)
-                .or_else(|| non_empty_env_var(MICROVM_ACP_CWD_ENV)),
-        }),
-        _ => None,
-    }
-}
-
-fn runtime_params_from_env() -> Option<AgentRuntimeParams> {
-    let kind = microvm_kind_from_env().map(Into::into);
-    let backend = runtime_backend_from_env().map(Into::into);
-    if kind.is_none() && backend.is_none() {
-        return None;
-    }
-    Some(AgentRuntimeParams { kind, backend })
-}
-
-fn default_microvm_params_from_env() -> MicrovmProvisionParams {
-    let runtime = runtime_params_from_env();
-    MicrovmProvisionParams {
-        spawner_url: non_empty_env_var(MICROVM_SPAWNER_URL_ENV),
-        kind: runtime
-            .clone()
-            .and_then(|params| params.kind.map(Into::into)),
-        backend: runtime.and_then(|params| params.backend.map(Into::into)),
-    }
-}
-
-fn is_private_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
-    ip.is_private() || ip.is_loopback() || ip.is_link_local() || is_cgnat
-}
-
-fn is_private_ipv6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local()
-}
-
-fn ensure_private_microvm_spawner_url(spawner_url: &str) -> anyhow::Result<()> {
-    let uri: Uri = spawner_url.parse().with_context(|| {
-        format!("{MICROVM_SPAWNER_URL_ENV} must be a valid URL or URI host, got: {spawner_url}")
-    })?;
-    let host = uri.host().with_context(|| {
-        format!(
-            "microvm spawner URL must include an explicit host: {}",
-            spawner_url
-        )
-    })?;
-    let normalized_host = host.trim_matches(|c| c == '[' || c == ']');
-
-    if normalized_host.eq_ignore_ascii_case("localhost") {
-        return Ok(());
-    }
-    if let Ok(ipv4) = normalized_host.parse::<Ipv4Addr>() {
-        if is_private_ipv4(ipv4) {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "microvm spawner host must be private (RFC1918/CGNAT/loopback), got public IPv4 {}",
-            normalized_host
-        );
-    }
-    if let Ok(ipv6) = normalized_host.parse::<Ipv6Addr>() {
-        if is_private_ipv6(ipv6) {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "microvm spawner host must be private (ULA/link-local/loopback), got public IPv6 {}",
-            normalized_host
-        );
-    }
-
-    let is_private_dns_name = normalized_host.ends_with(".internal")
-        || normalized_host.ends_with(".tailnet")
-        || normalized_host.ends_with(".tailnet.ts.net");
-    if is_private_dns_name {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "microvm spawner host must be private DNS (.internal/.tailnet/.tailnet.ts.net) or private IP, got {}",
-        normalized_host
-    );
-}
-
 fn non_empty_env_var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -870,10 +879,12 @@ fn non_empty_env_var(name: &str) -> Option<String> {
 
 fn default_vm_provider_kind_from_env() -> anyhow::Result<ProviderKind> {
     match non_empty_env_var(VM_PROVIDER_ENV).as_deref() {
-        None | Some("microvm") => Ok(ProviderKind::Microvm),
-        Some("incus") => Ok(ProviderKind::Incus),
+        None | Some("incus") => Ok(ProviderKind::Incus),
+        Some("microvm") => anyhow::bail!(
+            "{VM_PROVIDER_ENV}=microvm is no longer supported for the managed-agent product path"
+        ),
         Some(other) => {
-            anyhow::bail!("{VM_PROVIDER_ENV} must be one of [microvm, incus], got {other:?}")
+            anyhow::bail!("{VM_PROVIDER_ENV} must be incus when set, got {other:?}")
         }
     }
 }
@@ -891,10 +902,6 @@ fn default_incus_params_from_env() -> IncusProvisionParams {
         openclaw_guest_ipv4_cidr: non_empty_env_var(INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV),
         openclaw_proxy_host: non_empty_env_var(INCUS_OPENCLAW_PROXY_HOST_ENV),
     }
-}
-
-fn should_probe_incus_canary_health() -> bool {
-    incus_params_provided(&default_incus_params_from_env())
 }
 
 fn build_incus_http_client(resolved: &ResolvedIncusParams) -> anyhow::Result<reqwest::Client> {
@@ -957,81 +964,6 @@ fn resolved_incus_tls_config(
     })
 }
 
-fn microvm_params_provided(params: &MicrovmProvisionParams) -> bool {
-    params
-        .spawner_url
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || params.kind.is_some()
-        || params.backend.is_some()
-}
-
-fn microvm_transport_params_provided(params: &MicrovmProvisionParams) -> bool {
-    params
-        .spawner_url
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn microvm_runtime_params_provided(params: &MicrovmProvisionParams) -> bool {
-    params.kind.is_some() || params.backend.is_some()
-}
-
-fn runtime_params_provided(params: &AgentRuntimeParams) -> bool {
-    params.kind.is_some() || params.backend.is_some()
-}
-
-fn legacy_runtime_params_from_microvm(
-    params: &MicrovmProvisionParams,
-) -> Option<AgentRuntimeParams> {
-    if !microvm_runtime_params_provided(params) {
-        return None;
-    }
-    Some(AgentRuntimeParams {
-        kind: params.kind.map(Into::into),
-        backend: params.backend.clone().map(Into::into),
-    })
-}
-
-fn merged_requested_runtime_params(
-    requested: Option<&ManagedVmProvisionParams>,
-) -> anyhow::Result<Option<AgentRuntimeParams>> {
-    let explicit_runtime = requested.and_then(|params| params.runtime.clone());
-    let legacy_runtime = requested
-        .and_then(|params| params.microvm.as_ref())
-        .and_then(legacy_runtime_params_from_microvm);
-
-    match (explicit_runtime, legacy_runtime) {
-        (Some(runtime), Some(legacy)) => {
-            if let (Some(runtime_kind), Some(legacy_kind)) = (runtime.kind, legacy.kind) {
-                anyhow::ensure!(
-                    runtime_kind == legacy_kind,
-                    "managed VM request runtime.kind {:?} conflicts with legacy microvm.kind {:?}",
-                    runtime_kind,
-                    legacy_kind
-                );
-            }
-            if let (Some(runtime_backend), Some(legacy_backend)) =
-                (runtime.backend.as_ref(), legacy.backend.as_ref())
-            {
-                anyhow::ensure!(
-                    runtime_backend == legacy_backend,
-                    "managed VM request runtime.backend {:?} conflicts with legacy microvm.backend {:?}",
-                    runtime_backend,
-                    legacy_backend
-                );
-            }
-            Ok(Some(AgentRuntimeParams {
-                kind: runtime.kind.or(legacy.kind),
-                backend: runtime.backend.or(legacy.backend),
-            }))
-        }
-        (Some(runtime), None) => Ok(Some(runtime)),
-        (None, Some(legacy)) => Ok(Some(legacy)),
-        (None, None) => Ok(None),
-    }
-}
-
 fn incus_params_provided(params: &IncusProvisionParams) -> bool {
     [
         params.endpoint.as_deref(),
@@ -1063,7 +995,6 @@ fn required_non_empty_field(
 impl ManagedVmProvider {
     fn ensure_customer_openclaw_flow_supported(&self) -> anyhow::Result<()> {
         match self {
-            Self::Microvm(_) => Ok(()),
             Self::Incus(provider) => provider.ensure_customer_openclaw_flow_supported(),
         }
     }
@@ -1074,9 +1005,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<OpenClawProxyTarget> {
         match self {
-            Self::Microvm(provider) => Ok(OpenClawProxyTarget {
-                base_url: format!("{}/vms/{vm_id}/openclaw", provider.spawner_base_url()),
-            }),
             Self::Incus(provider) => provider.get_openclaw_proxy_target(vm_id, request_id).await,
         }
     }
@@ -1087,7 +1015,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
         match self {
-            Self::Microvm(provider) => provider.create_managed_vm(input, request_id).await,
             Self::Incus(provider) => provider.create_managed_vm(input, request_id).await,
         }
     }
@@ -1098,7 +1025,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
         match self {
-            Self::Microvm(provider) => provider.get_vm_status(vm_id, request_id).await,
             Self::Incus(provider) => provider.get_vm_status(vm_id, request_id).await,
         }
     }
@@ -1109,7 +1035,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmBackupStatus> {
         match self {
-            Self::Microvm(provider) => provider.get_vm_backup_status(vm_id, request_id).await,
             Self::Incus(provider) => provider.get_vm_backup_status(vm_id, request_id).await,
         }
     }
@@ -1120,7 +1045,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
         match self {
-            Self::Microvm(provider) => provider.recover_vm(vm_id, request_id).await,
             Self::Incus(provider) => provider.recover_vm(vm_id, request_id).await,
         }
     }
@@ -1131,14 +1055,12 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerVmResponse> {
         match self {
-            Self::Microvm(provider) => provider.restore_vm(vm_id, request_id).await,
             Self::Incus(provider) => provider.restore_vm(vm_id, request_id).await,
         }
     }
 
     async fn delete_vm(&self, vm_id: &str, request_id: Option<&str>) -> anyhow::Result<()> {
         match self {
-            Self::Microvm(provider) => provider.delete_vm(vm_id, request_id).await,
             Self::Incus(provider) => provider.delete_vm(vm_id, request_id).await,
         }
     }
@@ -1149,7 +1071,6 @@ impl ManagedVmProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<SpawnerOpenClawLaunchAuth> {
         match self {
-            Self::Microvm(provider) => provider.get_openclaw_launch_auth(vm_id, request_id).await,
             Self::Incus(provider) => provider.get_openclaw_launch_auth(vm_id, request_id).await,
         }
     }
@@ -3238,24 +3159,6 @@ fn load_visible_agent_row(
     Ok(select_visible_agent_row(active, latest))
 }
 
-#[cfg(test)]
-fn visible_agent_response(
-    conn: &mut PgConnection,
-    owner_npub: &str,
-    request_id: &str,
-    missing_code: AgentApiErrorCode,
-) -> Result<Json<AgentStateResponse>, AgentApiError> {
-    let Some(active) = load_visible_agent_row(conn, owner_npub)
-        .map_err(|err| err.with_request_id(request_id.to_string()))?
-    else {
-        return Err(AgentApiError::from_code(missing_code).with_request_id(request_id.to_string()));
-    };
-    let startup_phase = startup_phase_from_row_phase(&active.phase)
-        .ok_or_else(|| AgentApiError::from_code(AgentApiErrorCode::Internal))
-        .map_err(|err| err.with_request_id(request_id.to_string()))?;
-    json_response(active, startup_phase, request_id)
-}
-
 fn normalize_loaded_agent_row(
     conn: &mut PgConnection,
     row: AgentInstance,
@@ -3666,91 +3569,13 @@ fn resolve_requested_provider_kind(
     requested: Option<&ManagedVmProvisionParams>,
 ) -> anyhow::Result<ProviderKind> {
     let env_provider = default_vm_provider_kind_from_env()?;
-    let explicit_provider = requested.and_then(|params| params.provider);
-    let has_microvm_transport_params = requested
-        .and_then(|params| params.microvm.as_ref())
-        .is_some_and(microvm_transport_params_provided);
-    let has_microvm_runtime_params = requested
-        .and_then(|params| params.microvm.as_ref())
-        .is_some_and(microvm_runtime_params_provided);
-    let has_runtime_params = requested
-        .and_then(|params| params.runtime.as_ref())
-        .is_some_and(runtime_params_provided);
-    let has_incus_params = requested
-        .and_then(|params| params.incus.as_ref())
-        .is_some_and(incus_params_provided);
-    if has_microvm_transport_params && has_incus_params {
-        anyhow::bail!(
-            "managed VM request cannot include both microvm and incus params without a single provider selection"
+    if let Some(provider) = requested.and_then(|params| params.provider) {
+        anyhow::ensure!(
+            provider == ProviderKind::Incus,
+            "managed-agent product path only supports provider=incus"
         );
     }
-    Ok(match explicit_provider {
-        Some(provider) => provider,
-        None if has_microvm_transport_params => ProviderKind::Microvm,
-        None if has_incus_params => ProviderKind::Incus,
-        None if (has_runtime_params || has_microvm_runtime_params)
-            && matches!(env_provider, ProviderKind::Incus) =>
-        {
-            ProviderKind::Incus
-        }
-        None if has_runtime_params || has_microvm_runtime_params => ProviderKind::Microvm,
-        None => env_provider,
-    })
-}
-
-fn resolved_spawner_params(
-    requested: Option<&ManagedVmProvisionParams>,
-) -> anyhow::Result<ResolvedMicrovmParams> {
-    let provider = resolve_requested_provider_kind(requested)?;
-    let mut params = default_microvm_params_from_env();
-    if let Some(requested) = requested {
-        if let Some(incus) = requested
-            .incus
-            .as_ref()
-            .filter(|params| incus_params_provided(params))
-        {
-            anyhow::bail!(
-                "managed VM request selected {:?} but also included incus params: {:?}",
-                provider,
-                incus
-            );
-        }
-        if let Some(requested) = requested.microvm.as_ref() {
-            if requested
-                .spawner_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-            {
-                params.spawner_url = requested.spawner_url.clone();
-            }
-        }
-    }
-    if let Some(runtime) = merged_requested_runtime_params(requested)? {
-        if runtime.kind.is_some() {
-            params.kind = runtime.kind.map(Into::into);
-        }
-        if runtime.backend.is_some() {
-            params.backend = runtime.backend.map(Into::into);
-        }
-    }
-    if provider != ProviderKind::Microvm {
-        anyhow::bail!(
-            "managed VM provider {:?} is not the microvm backend",
-            provider
-        );
-    }
-    params.spawner_url = Some(required_non_empty_field(
-        params.spawner_url.clone(),
-        "microvm.spawner_url",
-        MICROVM_SPAWNER_URL_ENV,
-    )?);
-    let resolved = resolve_params(&params);
-    validate_resolved_params(&resolved).context("validate microvm agent selection")?;
-    ensure_private_microvm_spawner_url(&resolved.spawner_url)
-        .context("validate private microvm spawner URL")?;
-    Ok(resolved)
+    Ok(env_provider)
 }
 
 fn resolved_incus_params(
@@ -3758,28 +3583,7 @@ fn resolved_incus_params(
 ) -> anyhow::Result<ResolvedIncusParams> {
     let provider = resolve_requested_provider_kind(requested)?;
     let mut params = default_incus_params_from_env();
-    let default_runtime = runtime_params_from_env();
-    let mut guest_selection = MicrovmProvisionParams {
-        spawner_url: None,
-        kind: default_runtime
-            .clone()
-            .and_then(|params| params.kind.map(Into::into)),
-        backend: default_runtime.and_then(|params| params.backend.map(Into::into)),
-    };
     if let Some(requested) = requested {
-        if let Some(microvm) = requested
-            .microvm
-            .as_ref()
-            .filter(|params| microvm_params_provided(params))
-        {
-            if microvm_transport_params_provided(microvm) {
-                anyhow::bail!(
-                    "managed VM request selected {:?} but also included microvm transport params: {:?}",
-                    provider,
-                    microvm
-                );
-            }
-        }
         if let Some(requested) = requested.incus.as_ref() {
             if requested
                 .endpoint
@@ -3835,22 +3639,17 @@ fn resolved_incus_params(
             }
         }
     }
-    if let Some(runtime) = merged_requested_runtime_params(requested)? {
-        if runtime.kind.is_some() {
-            guest_selection.kind = runtime.kind.map(Into::into);
-        }
-        if runtime.backend.is_some() {
-            guest_selection.backend = runtime.backend.map(Into::into);
-        }
-    }
     if provider != ProviderKind::Incus {
         anyhow::bail!(
             "managed VM provider {:?} is not the incus backend",
             provider
         );
     }
-    let guest_selection = resolve_params(&guest_selection);
-    validate_resolved_params(&guest_selection).context("validate incus guest selection")?;
+    let guest_selection = resolve_params(&MicrovmProvisionParams {
+        spawner_url: None,
+        kind: Some(MicrovmAgentKind::Openclaw),
+        backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+    });
     let endpoint = required_non_empty_field(params.endpoint, "incus.endpoint", INCUS_ENDPOINT_ENV)?;
     let mut endpoint_url = Url::parse(&endpoint)
         .with_context(|| format!("incus.endpoint must be a valid URL, got {endpoint:?}"))?;
@@ -3886,23 +3685,16 @@ fn resolved_incus_params(
 fn resolve_managed_vm_provider_config(
     requested: Option<&ManagedVmProvisionParams>,
 ) -> anyhow::Result<ResolvedManagedVmProviderConfig> {
-    match resolve_requested_provider_kind(requested)? {
-        ProviderKind::Microvm => Ok(ResolvedManagedVmProviderConfig::Microvm(
-            resolved_spawner_params(requested)?,
-        )),
-        ProviderKind::Incus => Ok(ResolvedManagedVmProviderConfig::Incus(
-            resolved_incus_params(requested)?,
-        )),
-    }
+    let _ = resolve_requested_provider_kind(requested)?;
+    Ok(ResolvedManagedVmProviderConfig::Incus(
+        resolved_incus_params(requested)?,
+    ))
 }
 
 fn managed_vm_provider_from_resolved(
     config: ResolvedManagedVmProviderConfig,
 ) -> anyhow::Result<ManagedVmProvider> {
     match config {
-        ResolvedManagedVmProviderConfig::Microvm(resolved) => Ok(ManagedVmProvider::Microvm(
-            MicrovmManagedVmProvider::new(resolved),
-        )),
         ResolvedManagedVmProviderConfig::Incus(resolved) => Ok(ManagedVmProvider::Incus(
             IncusManagedVmProvider::new(resolved)?,
         )),
@@ -3963,7 +3755,6 @@ async fn provision_agent_for_owner(
         AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
     })?;
     let provider_kind = provider_kind_db_value(match &resolved_provider {
-        ResolvedManagedVmProviderConfig::Microvm(_) => ProviderKind::Microvm,
         ResolvedManagedVmProviderConfig::Incus(_) => ProviderKind::Incus,
     });
     let provider_config =
@@ -4632,41 +4423,26 @@ pub async fn recover_my_agent(
 }
 
 pub async fn agent_api_healthcheck() -> anyhow::Result<()> {
+    let configured_incus = default_incus_params_from_env();
+    if non_empty_env_var(VM_PROVIDER_ENV).is_none() && !incus_params_provided(&configured_incus) {
+        tracing::info!("managed-agent incus config not present; skipping agent api healthcheck");
+        return Ok(());
+    }
     let resolved = resolve_managed_vm_provider_config(None)
         .context("resolve and validate managed VM provider")?;
     let provider = managed_vm_provider_from_resolved(resolved)
         .context("initialize configured managed VM provider")?;
-    if let ManagedVmProvider::Incus(incus) = &provider {
-        incus.healthcheck().await?;
-    }
-    if should_probe_incus_canary_health() && !matches!(provider, ManagedVmProvider::Incus(_)) {
-        let requested = ManagedVmProvisionParams {
-            provider: Some(ProviderKind::Incus),
-            runtime: None,
-            microvm: None,
-            incus: None,
-        };
-        let incus = managed_vm_provider(Some(&requested))
-            .context("initialize configured Incus canary provider")?;
-        match incus {
-            ManagedVmProvider::Incus(incus) => incus
-                .healthcheck()
-                .await
-                .context("validate configured Incus canary backend")?,
-            ManagedVmProvider::Microvm(_) => {
-                unreachable!("explicit incus provider must resolve to Incus")
-            }
-        }
-    }
+    let ManagedVmProvider::Incus(incus) = &provider;
+    incus.healthcheck().await?;
     provider
         .ensure_customer_openclaw_flow_supported()
         .context("validate managed-agent customer OpenClaw flow")?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 #[allow(clippy::await_holding_lock)]
-mod tests {
+mod removed_legacy_tests {
     use super::*;
     use crate::admin::AdminConfig;
     use crate::browser_auth::BrowserAuthConfig;

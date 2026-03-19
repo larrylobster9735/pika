@@ -3,8 +3,7 @@ use std::time::Duration;
 use base64::Engine;
 use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag, TagKind};
 use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentRuntimeKind, AgentRuntimeParams, AgentStartupPhase,
-    IncusProvisionParams, ProviderKind,
+    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ProviderKind,
 };
 use reqwest::Method;
 use serde::Deserialize;
@@ -77,28 +76,6 @@ fn endpoint(base: &str, path: &str) -> String {
 
 fn default_agent_startup_phase() -> AgentStartupPhase {
     AgentStartupPhase::ProvisioningVm
-}
-
-fn internal_managed_agent_provider(base_url: &str) -> Option<ProviderKind> {
-    if let Ok(raw) = std::env::var("PIKA_AGENT_VM_PROVIDER") {
-        match raw.trim() {
-            "incus" => return Some(ProviderKind::Incus),
-            "microvm" => return Some(ProviderKind::Microvm),
-            _ => {}
-        }
-    }
-
-    let default_host = reqwest::Url::parse(DEFAULT_AGENT_API_URL)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string));
-    let current_host = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string));
-    if current_host.is_some() && current_host == default_host {
-        Some(ProviderKind::Incus)
-    } else {
-        None
-    }
 }
 
 fn resolve_agent_api_url(
@@ -335,26 +312,12 @@ fn send_progress(
 }
 
 fn internal_managed_agent_request(
-    base_url: &str,
-    agent_kind: crate::state::AgentKind,
+    _base_url: &str,
+    _agent_kind: crate::state::AgentKind,
 ) -> AgentProvisionRequest {
-    let provider = internal_managed_agent_provider(base_url);
     AgentProvisionRequest {
-        provider,
-        runtime: Some(AgentRuntimeParams {
-            kind: Some(match agent_kind {
-                crate::state::AgentKind::Openclaw => AgentRuntimeKind::Openclaw,
-                crate::state::AgentKind::Pi => AgentRuntimeKind::Pi,
-            }),
-            backend: None,
-        }),
-        microvm: None,
-        // Keep the transitional runtime-selection payload explicit while making
-        // the hosted internal flow target Incus deliberately. Custom app-server
-        // targets still fall back to server-default substrate policy unless the
-        // client overrides PIKA_AGENT_VM_PROVIDER explicitly.
-        incus: matches!(provider, Some(ProviderKind::Incus))
-            .then_some(IncusProvisionParams::default()),
+        provider: Some(ProviderKind::Incus),
+        incus: Some(IncusProvisionParams::default()),
     }
 }
 
@@ -944,50 +907,22 @@ mod tests {
 
     #[test]
     fn internal_managed_agent_request_targets_incus_for_hosted_api() {
-        let request =
-            internal_managed_agent_request("https://api.pikachat.org", crate::state::AgentKind::Pi);
-        match std::env::var("PIKA_AGENT_VM_PROVIDER").ok().as_deref() {
-            Some("microvm") => {
-                assert_eq!(request.provider, Some(ProviderKind::Microvm));
-                assert_eq!(request.incus, None);
-            }
-            Some("incus") => {
-                assert_eq!(request.provider, Some(ProviderKind::Incus));
-                assert_eq!(request.incus, Some(IncusProvisionParams::default()));
-            }
-            _ => {
-                assert_eq!(request.provider, Some(ProviderKind::Incus));
-                assert_eq!(request.incus, Some(IncusProvisionParams::default()));
-            }
-        }
-        assert_eq!(
-            request.runtime.as_ref().and_then(|params| params.kind),
-            Some(AgentRuntimeKind::Pi)
+        let request = internal_managed_agent_request(
+            "https://api.pikachat.org",
+            crate::state::AgentKind::Openclaw,
         );
+        assert_eq!(request.provider, Some(ProviderKind::Incus));
+        assert_eq!(request.incus, Some(IncusProvisionParams::default()));
     }
 
     #[test]
-    fn internal_managed_agent_request_leaves_provider_unset_for_custom_server() {
-        let request =
-            internal_managed_agent_request("http://127.0.0.1:8080", crate::state::AgentKind::Pi);
-        match std::env::var("PIKA_AGENT_VM_PROVIDER").ok().as_deref() {
-            Some("microvm") => {
-                assert_eq!(request.provider, Some(ProviderKind::Microvm));
-                assert_eq!(request.incus, None);
-            }
-            Some("incus") => {
-                assert_eq!(request.provider, Some(ProviderKind::Incus));
-                assert_eq!(request.incus, Some(IncusProvisionParams::default()));
-            }
-            _ => {
-                assert_eq!(request.provider, None);
-                assert_eq!(request.incus, None);
-            }
-        }
-        assert_eq!(
-            request.runtime.as_ref().and_then(|params| params.kind),
-            Some(AgentRuntimeKind::Pi)
+    fn internal_managed_agent_request_targets_incus_for_custom_server_too() {
+        let request = internal_managed_agent_request(
+            "http://127.0.0.1:8080",
+            crate::state::AgentKind::Openclaw,
         );
+        assert_eq!(request.provider, Some(ProviderKind::Incus));
+        assert_eq!(request.incus, Some(IncusProvisionParams::default()));
     }
 
     #[test]
@@ -1057,7 +992,8 @@ mod tests {
         assert!(captured[1].0.starts_with("GET /v1/agents/me "));
         assert!(captured[0].1.starts_with("Nostr "));
         assert!(captured[1].1.starts_with("Nostr "));
-        assert!(captured[0].2.contains("\"kind\":\"openclaw\""));
+        assert!(captured[0].2.contains("\"provider\":\"incus\""));
+        assert!(captured[0].2.contains("\"incus\":{}"));
     }
 
     #[tokio::test]
@@ -1109,7 +1045,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_agent_flow_recover_sends_selected_agent_kind() {
+    async fn run_agent_flow_recover_uses_incus_request_shape() {
         let (base_url, handle) = spawn_agent_flow_mock_server_scripted(vec![
             (
                 "POST /v1/agents/ensure ",
@@ -1125,7 +1061,7 @@ mod tests {
             ),
             (
                 "GET /v1/agents/me ",
-                r#"{"agent_id":"npub1piagent","state":"ready","startup_phase":"ready"}"#,
+                r#"{"agent_id":"npub1recovered","state":"ready","startup_phase":"ready"}"#,
             ),
         ])
         .expect("start mock server");
@@ -1133,10 +1069,17 @@ mod tests {
         let keys = Keys::generate();
 
         let (tx, _rx) = flume::unbounded();
-        let agent_id = run_agent_flow(client, keys, base_url, crate::state::AgentKind::Pi, tx, 1)
-            .await
-            .expect("run agent flow");
-        assert_eq!(agent_id, "npub1piagent");
+        let agent_id = run_agent_flow(
+            client,
+            keys,
+            base_url,
+            crate::state::AgentKind::Openclaw,
+            tx,
+            1,
+        )
+        .await
+        .expect("run agent flow");
+        assert_eq!(agent_id, "npub1recovered");
 
         let captured = handle
             .join()
@@ -1147,11 +1090,12 @@ mod tests {
             .iter()
             .find(|(request_line, _, _)| request_line.starts_with("POST /v1/agents/me/recover "))
             .expect("recover request");
-        assert!(recover.2.contains("\"kind\":\"pi\""));
+        assert!(recover.2.contains("\"provider\":\"incus\""));
+        assert!(recover.2.contains("\"incus\":{}"));
     }
 
     #[tokio::test]
-    async fn run_agent_flow_leaves_provider_unset_for_custom_server() {
+    async fn run_agent_flow_uses_incus_request_shape_for_custom_server() {
         let (base_url, handle) = spawn_agent_flow_mock_server().expect("start mock server");
         let client = reqwest::Client::new();
         let keys = Keys::generate();
@@ -1174,8 +1118,7 @@ mod tests {
             .map_err(|_| anyhow!("mock server thread panicked"))
             .and_then(|result| result)
             .expect("collect captured requests");
-        assert!(!captured[0].2.contains("\"provider\":\"incus\""));
-        assert!(!captured[0].2.contains("\"incus\":{}"));
-        assert!(captured[0].2.contains("\"kind\":\"openclaw\""));
+        assert!(captured[0].2.contains("\"provider\":\"incus\""));
+        assert!(captured[0].2.contains("\"incus\":{}"));
     }
 }

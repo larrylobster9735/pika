@@ -16,7 +16,6 @@ pub const ERROR_SCHEMA_V1: &str = "agent.control.error.v1";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
-    Microvm,
     Incus,
 }
 
@@ -115,10 +114,6 @@ pub struct IncusProvisionParams {
 pub struct ManagedVmProvisionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<AgentRuntimeParams>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub microvm: Option<MicrovmProvisionParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
 }
@@ -454,10 +449,6 @@ pub struct AgentProvisionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<AgentRuntimeParams>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub microvm: Option<MicrovmProvisionParams>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
 }
 
@@ -465,8 +456,6 @@ impl AgentProvisionRequest {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: self.provider,
-            runtime: self.runtime.clone(),
-            microvm: self.microvm.clone(),
             incus: self.incus.clone(),
         }
     }
@@ -572,10 +561,6 @@ pub struct ProvisionCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_secret_key_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<AgentRuntimeParams>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub microvm: Option<MicrovmProvisionParams>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
 }
 
@@ -583,8 +568,6 @@ impl ProvisionCommand {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: Some(self.provider),
-            runtime: self.runtime.clone(),
-            microvm: self.microvm.clone(),
             incus: self.incus.clone(),
         }
     }
@@ -779,15 +762,13 @@ mod tests {
             "req-1".to_string(),
             "idem-1".to_string(),
             AgentControlCommand::Provision(ProvisionCommand {
-                provider: ProviderKind::Microvm,
+                provider: ProviderKind::Incus,
                 protocol: ProtocolKind::Acp,
                 name: Some("agent".to_string()),
-                runtime_class: Some("microvm-us-east".to_string()),
+                runtime_class: Some("incus-us-east".to_string()),
                 relay_urls: vec!["wss://relay.example.com".to_string()],
                 bot_secret_key_hex: None,
-                runtime: None,
-                microvm: None,
-                incus: None,
+                incus: Some(IncusProvisionParams::default()),
             }),
             AuthContext::default(),
         );
@@ -799,8 +780,9 @@ mod tests {
         assert_eq!(decoded.idempotency_key, "idem-1");
         match decoded.command {
             AgentControlCommand::Provision(provision) => {
-                assert_eq!(provision.provider, ProviderKind::Microvm);
+                assert_eq!(provision.provider, ProviderKind::Incus);
                 assert_eq!(provision.protocol, ProtocolKind::Acp);
+                assert_eq!(provision.incus, Some(IncusProvisionParams::default()));
             }
             _ => panic!("expected provision command"),
         }
@@ -810,28 +792,13 @@ mod tests {
     fn all_command_variants_round_trip() {
         let commands = vec![
             AgentControlCommand::Provision(ProvisionCommand {
-                provider: ProviderKind::Microvm,
+                provider: ProviderKind::Incus,
                 protocol: ProtocolKind::Acp,
                 name: None,
                 runtime_class: None,
                 relay_urls: vec![],
                 bot_secret_key_hex: Some("deadbeef".to_string()),
-                runtime: Some(AgentRuntimeParams {
-                    kind: Some(AgentRuntimeKind::Pi),
-                    backend: Some(AgentRuntimeBackend::Acp {
-                        exec_command: Some("npx -y pi-acp".to_string()),
-                        cwd: Some("/root/pika-agent/acp".to_string()),
-                    }),
-                }),
-                microvm: Some(MicrovmProvisionParams {
-                    spawner_url: Some("http://127.0.0.1:8080".to_string()),
-                    kind: Some(MicrovmAgentKind::Pi),
-                    backend: Some(MicrovmAgentBackend::Acp {
-                        exec_command: Some("npx -y pi-acp".to_string()),
-                        cwd: Some("/root/pika-agent/acp".to_string()),
-                    }),
-                }),
-                incus: None,
+                incus: Some(IncusProvisionParams::default()),
             }),
             AgentControlCommand::ProcessWelcome(ProcessWelcomeCommand {
                 runtime_id: "rt-1".to_string(),
@@ -846,10 +813,10 @@ mod tests {
                 runtime_id: "rt-3".to_string(),
             }),
             AgentControlCommand::ListRuntimes(ListRuntimesCommand {
-                provider: Some(ProviderKind::Microvm),
+                provider: Some(ProviderKind::Incus),
                 protocol: Some(ProtocolKind::Acp),
                 lifecycle_phase: Some(RuntimeLifecyclePhase::Ready),
-                runtime_class: Some("microvm-us-east".to_string()),
+                runtime_class: Some("incus-us-east".to_string()),
                 limit: Some(10),
             }),
             AgentControlCommand::ListRuntimes(ListRuntimesCommand::default()),
@@ -875,7 +842,7 @@ mod tests {
             "req-5".to_string(),
             RuntimeLifecyclePhase::Provisioning,
             Some("rt-42".to_string()),
-            Some(ProviderKind::Microvm),
+            Some(ProviderKind::Incus),
             Some("provisioning started".to_string()),
             json!({"percent": 25}),
         );
@@ -885,7 +852,7 @@ mod tests {
         assert_eq!(decoded.schema, STATUS_SCHEMA_V1);
         assert_eq!(decoded.phase, RuntimeLifecyclePhase::Provisioning);
         assert_eq!(decoded.runtime_id, Some("rt-42".to_string()));
-        assert_eq!(decoded.provider, Some(ProviderKind::Microvm));
+        assert_eq!(decoded.provider, Some(ProviderKind::Incus));
     }
 
     #[test]
@@ -918,7 +885,7 @@ mod tests {
     fn runtime_descriptor_optional_fields_default_correctly() {
         let minimal_json = json!({
             "runtime_id": "rt-min",
-            "provider": "microvm",
+            "provider": "incus",
             "lifecycle_phase": "queued",
         });
         let descriptor: RuntimeDescriptor =
@@ -935,16 +902,8 @@ mod tests {
     #[test]
     fn provider_kind_serde_uses_snake_case() {
         assert_eq!(
-            serde_json::to_string(&ProviderKind::Microvm).unwrap(),
-            "\"microvm\""
-        );
-        assert_eq!(
             serde_json::to_string(&ProviderKind::Incus).unwrap(),
             "\"incus\""
-        );
-        assert_eq!(
-            serde_json::from_str::<ProviderKind>("\"microvm\"").unwrap(),
-            ProviderKind::Microvm
         );
         assert_eq!(
             serde_json::from_str::<ProviderKind>("\"incus\"").unwrap(),
@@ -977,7 +936,7 @@ mod tests {
     #[test]
     fn provision_command_minimal_fields_decode() {
         let json = json!({
-            "provider": "microvm",
+            "provider": "incus",
             "protocol": "acp",
         });
         let cmd: ProvisionCommand = serde_json::from_value(json).expect("decode");
@@ -985,8 +944,6 @@ mod tests {
         assert_eq!(cmd.runtime_class, None);
         assert!(cmd.relay_urls.is_empty());
         assert_eq!(cmd.bot_secret_key_hex, None);
-        assert_eq!(cmd.runtime, None);
-        assert_eq!(cmd.microvm, None);
         assert_eq!(cmd.incus, None);
     }
 
@@ -1057,24 +1014,24 @@ mod tests {
     #[test]
     fn guest_startup_plan_round_trips_through_guest_autostart_request() {
         let plan = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
-            service_kind: GuestServiceKind::PikachatDaemon,
-            backend_mode: GuestServiceBackendMode::Acp,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
-            service: GuestServiceLaunch::PikachatDaemon {
-                acp_backend: Some(GuestAcpBackend {
-                    exec_command: "npx -y pi-acp".to_string(),
-                    cwd: "/root/pika-agent/acp".to_string(),
-                }),
+            agent_kind: MicrovmAgentKind::Openclaw,
+            service_kind: GuestServiceKind::OpenclawGateway,
+            backend_mode: GuestServiceBackendMode::Native,
+            daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
+            service: GuestServiceLaunch::OpenclawGateway {
+                exec_command: "npx -y openclaw".to_string(),
+                state_dir: "/root/pika-agent/openclaw".to_string(),
+                config_path: GUEST_OPENCLAW_CONFIG_PATH.to_string(),
+                gateway_port: 18789,
+                daemon_backend: GuestOpenclawDaemonBackend::Native,
             },
-            readiness_check: GuestServiceReadinessCheck::LogContains {
-                path: GUEST_LOG_PATH.to_string(),
-                pattern: "\"type\":\"ready\"".to_string(),
-                ready_probe: "daemon_ready_event".to_string(),
-                timeout_failure_reason: "timeout_waiting_for_daemon_ready".to_string(),
+            readiness_check: GuestServiceReadinessCheck::HttpGetOk {
+                url: "http://127.0.0.1:18789/health".to_string(),
+                ready_probe: "openclaw_gateway_health".to_string(),
+                timeout_failure_reason: "timeout_waiting_for_openclaw_health".to_string(),
             },
             artifacts: GuestStartupArtifacts::default(),
-            exit_failure_reason: "pi_agent_exited".to_string(),
+            exit_failure_reason: "openclaw_gateway_exited".to_string(),
         };
         let request = SpawnerGuestAutostartRequest {
             command: GUEST_AUTOSTART_COMMAND.to_string(),
@@ -1105,81 +1062,10 @@ mod tests {
     #[test]
     fn guest_startup_plan_validate_rejects_mismatched_service_kind() {
         let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
-            service_kind: GuestServiceKind::OpenclawGateway,
-            backend_mode: GuestServiceBackendMode::Acp,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
-            service: GuestServiceLaunch::PikachatDaemon { acp_backend: None },
-            readiness_check: GuestServiceReadinessCheck::LogContains {
-                path: GUEST_LOG_PATH.to_string(),
-                pattern: "\"type\":\"ready\"".to_string(),
-                ready_probe: "daemon_ready_event".to_string(),
-                timeout_failure_reason: "timeout_waiting_for_daemon_ready".to_string(),
-            },
-            artifacts: GuestStartupArtifacts::default(),
-            exit_failure_reason: "pi_agent_exited".to_string(),
-        }
-        .validate()
-        .expect_err("plan should reject mismatched service kind");
-        assert!(err.contains("service_kind mismatch"));
-    }
-
-    #[test]
-    fn guest_startup_plan_validate_rejects_acp_backend_mode_without_acp_payload() {
-        let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
-            service_kind: GuestServiceKind::PikachatDaemon,
-            backend_mode: GuestServiceBackendMode::Acp,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
-            service: GuestServiceLaunch::PikachatDaemon { acp_backend: None },
-            readiness_check: GuestServiceReadinessCheck::LogContains {
-                path: GUEST_LOG_PATH.to_string(),
-                pattern: "\"type\":\"ready\"".to_string(),
-                ready_probe: "daemon_ready_event".to_string(),
-                timeout_failure_reason: "timeout_waiting_for_daemon_ready".to_string(),
-            },
-            artifacts: GuestStartupArtifacts::default(),
-            exit_failure_reason: "pi_agent_exited".to_string(),
-        }
-        .validate()
-        .expect_err("plan should reject ACP mode without ACP payload");
-        assert!(err.contains("backend_mode=acp"));
-    }
-
-    #[test]
-    fn guest_startup_plan_validate_rejects_native_backend_mode_with_acp_payload() {
-        let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
+            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::PikachatDaemon,
             backend_mode: GuestServiceBackendMode::Native,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
-            service: GuestServiceLaunch::PikachatDaemon {
-                acp_backend: Some(GuestAcpBackend {
-                    exec_command: "npx -y pi-acp".to_string(),
-                    cwd: "/root/pika-agent/acp".to_string(),
-                }),
-            },
-            readiness_check: GuestServiceReadinessCheck::LogContains {
-                path: GUEST_LOG_PATH.to_string(),
-                pattern: "\"type\":\"ready\"".to_string(),
-                ready_probe: "daemon_ready_event".to_string(),
-                timeout_failure_reason: "timeout_waiting_for_daemon_ready".to_string(),
-            },
-            artifacts: GuestStartupArtifacts::default(),
-            exit_failure_reason: "pi_agent_exited".to_string(),
-        }
-        .validate()
-        .expect_err("plan should reject native mode with ACP payload");
-        assert!(err.contains("backend_mode=native"));
-    }
-
-    #[test]
-    fn guest_startup_plan_validate_rejects_openclaw_acp_mode_with_native_daemon_backend() {
-        let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
-            service_kind: GuestServiceKind::OpenclawGateway,
-            backend_mode: GuestServiceBackendMode::Acp,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
+            daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
             service: GuestServiceLaunch::OpenclawGateway {
                 exec_command: "npx -y openclaw".to_string(),
                 state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1196,9 +1082,8 @@ mod tests {
             exit_failure_reason: "openclaw_gateway_exited".to_string(),
         }
         .validate()
-        .expect_err("plan should reject OpenClaw ACP mode without ACP daemon backend");
-        assert!(err.contains("backend_mode=acp"));
-        assert!(err.contains("OpenclawGateway.daemon_backend=acp"));
+        .expect_err("plan should reject mismatched service kind");
+        assert!(err.contains("service_kind mismatch"));
     }
 
     #[test]
@@ -1207,7 +1092,7 @@ mod tests {
             agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::OpenclawGateway,
             backend_mode: GuestServiceBackendMode::Native,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
+            daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
             service: GuestServiceLaunch::OpenclawGateway {
                 exec_command: "npx -y openclaw".to_string(),
                 state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1237,27 +1122,27 @@ mod tests {
     #[test]
     fn guest_startup_plan_validate_rejects_non_canonical_artifact_paths() {
         let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
-            service_kind: GuestServiceKind::PikachatDaemon,
-            backend_mode: GuestServiceBackendMode::Acp,
-            daemon_state_dir: "/root/pika-agent/state".to_string(),
-            service: GuestServiceLaunch::PikachatDaemon {
-                acp_backend: Some(GuestAcpBackend {
-                    exec_command: "npx -y pi-acp".to_string(),
-                    cwd: "/root/pika-agent/acp".to_string(),
-                }),
+            agent_kind: MicrovmAgentKind::Openclaw,
+            service_kind: GuestServiceKind::OpenclawGateway,
+            backend_mode: GuestServiceBackendMode::Native,
+            daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
+            service: GuestServiceLaunch::OpenclawGateway {
+                exec_command: "npx -y openclaw".to_string(),
+                state_dir: "/root/pika-agent/openclaw".to_string(),
+                config_path: GUEST_OPENCLAW_CONFIG_PATH.to_string(),
+                gateway_port: 18789,
+                daemon_backend: GuestOpenclawDaemonBackend::Native,
             },
-            readiness_check: GuestServiceReadinessCheck::LogContains {
-                path: GUEST_LOG_PATH.to_string(),
-                pattern: "\"type\":\"ready\"".to_string(),
-                ready_probe: "daemon_ready_event".to_string(),
-                timeout_failure_reason: "timeout_waiting_for_daemon_ready".to_string(),
+            readiness_check: GuestServiceReadinessCheck::HttpGetOk {
+                url: "http://127.0.0.1:18789/health".to_string(),
+                ready_probe: "openclaw_gateway_health".to_string(),
+                timeout_failure_reason: "timeout_waiting_for_openclaw_health".to_string(),
             },
             artifacts: GuestStartupArtifacts {
                 ready_marker_path: "workspace/custom/service-ready.json".to_string(),
                 ..GuestStartupArtifacts::default()
             },
-            exit_failure_reason: "pi_agent_exited".to_string(),
+            exit_failure_reason: "openclaw_gateway_exited".to_string(),
         }
         .validate()
         .expect_err("plan should reject non-canonical artifact paths");
@@ -1266,62 +1151,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_provision_request_round_trips_microvm_backend() {
-        let request = AgentProvisionRequest {
-            provider: None,
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(AgentRuntimeKind::Pi),
-                backend: Some(AgentRuntimeBackend::Acp {
-                    exec_command: Some("npx -y pi-acp".to_string()),
-                    cwd: Some("/root/pika-agent/acp".to_string()),
-                }),
-            }),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: Some("http://127.0.0.1:8080".to_string()),
-                kind: Some(MicrovmAgentKind::Pi),
-                backend: Some(MicrovmAgentBackend::Acp {
-                    exec_command: Some("npx -y pi-acp".to_string()),
-                    cwd: Some("/root/pika-agent/acp".to_string()),
-                }),
-            }),
-            incus: None,
-        };
-        let encoded = serde_json::to_string(&request).expect("encode request");
-        let decoded: AgentProvisionRequest =
-            serde_json::from_str(&encoded).expect("decode request");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn agent_provision_request_round_trips_native_microvm_backend() {
-        let request = AgentProvisionRequest {
-            provider: None,
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(AgentRuntimeKind::Openclaw),
-                backend: Some(AgentRuntimeBackend::Native),
-            }),
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: Some("http://127.0.0.1:8080".to_string()),
-                kind: Some(MicrovmAgentKind::Openclaw),
-                backend: Some(MicrovmAgentBackend::Native),
-            }),
-            incus: None,
-        };
-        let encoded = serde_json::to_string(&request).expect("encode request");
-        let decoded: AgentProvisionRequest =
-            serde_json::from_str(&encoded).expect("decode request");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
     fn agent_provision_request_round_trips_incus_backend() {
         let request = AgentProvisionRequest {
             provider: Some(ProviderKind::Incus),
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(AgentRuntimeKind::Openclaw),
-                backend: Some(AgentRuntimeBackend::Native),
-            }),
-            microvm: None,
             incus: Some(IncusProvisionParams {
                 endpoint: Some("https://incus.internal:8443".to_string()),
                 project: Some("managed-agents".to_string()),
@@ -1340,43 +1172,15 @@ mod tests {
     }
 
     #[test]
-    fn managed_vm_params_preserve_legacy_microvm_request_shape() {
-        let request = AgentProvisionRequest {
-            provider: None,
-            runtime: None,
-            microvm: Some(MicrovmProvisionParams {
-                spawner_url: Some("http://127.0.0.1:8080".to_string()),
-                kind: Some(MicrovmAgentKind::Openclaw),
-                backend: Some(MicrovmAgentBackend::Native),
-            }),
-            incus: None,
-        };
-
-        let managed_vm = request.managed_vm_params();
-
-        assert_eq!(managed_vm.provider, None);
-        assert_eq!(managed_vm.runtime, None);
-        assert_eq!(managed_vm.microvm, request.microvm);
-        assert_eq!(managed_vm.incus, None);
-    }
-
-    #[test]
-    fn managed_vm_params_preserve_runtime_request_shape() {
+    fn managed_vm_params_preserve_incus_request_shape() {
         let request = AgentProvisionRequest {
             provider: Some(ProviderKind::Incus),
-            runtime: Some(AgentRuntimeParams {
-                kind: Some(AgentRuntimeKind::Openclaw),
-                backend: Some(AgentRuntimeBackend::Native),
-            }),
-            microvm: None,
             incus: Some(IncusProvisionParams::default()),
         };
 
         let managed_vm = request.managed_vm_params();
 
         assert_eq!(managed_vm.provider, Some(ProviderKind::Incus));
-        assert_eq!(managed_vm.runtime, request.runtime);
-        assert_eq!(managed_vm.microvm, None);
         assert_eq!(managed_vm.incus, request.incus);
     }
 
@@ -1406,9 +1210,9 @@ mod tests {
             "req-9".to_string(),
             RuntimeDescriptor {
                 runtime_id: "runtime-1".to_string(),
-                provider: ProviderKind::Microvm,
+                provider: ProviderKind::Incus,
                 lifecycle_phase: RuntimeLifecyclePhase::Ready,
-                runtime_class: Some("microvm-dev".to_string()),
+                runtime_class: Some("incus-dev".to_string()),
                 region: Some("us-east".to_string()),
                 capacity: json!({"slots": 12}),
                 policy_constraints: json!({"allow_keep": true}),
@@ -1426,7 +1230,7 @@ mod tests {
             decoded.runtime.lifecycle_phase,
             RuntimeLifecyclePhase::Ready
         );
-        assert_eq!(decoded.runtime.provider, ProviderKind::Microvm);
+        assert_eq!(decoded.runtime.provider, ProviderKind::Incus);
         assert_eq!(
             decoded.runtime.protocol_compatibility,
             vec![ProtocolKind::Acp]

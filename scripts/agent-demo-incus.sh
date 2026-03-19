@@ -9,7 +9,6 @@ load_local_env "$ROOT"
 set_agent_api_base_url_default remote-demo
 require_agent_api_nsec
 set_agent_incus_lane_defaults
-set_agent_runtime_defaults openclaw
 
 STATE_DIR="${PIKA_AGENT_DEMO_STATE_DIR:-$ROOT/.tmp/agent-cli-incus}"
 LISTEN_TIMEOUT="${PIKA_AGENT_DEMO_LISTEN_TIMEOUT:-90}"
@@ -32,9 +31,6 @@ for arg in "$@"; do
 done
 
 echo "Agent demo API base URL: $PIKA_AGENT_API_BASE_URL"
-echo "Agent demo provider: $PIKA_AGENT_VM_PROVIDER"
-echo "Agent demo runtime kind: $PIKA_AGENT_RUNTIME_KIND"
-echo "Agent demo runtime backend: $PIKA_AGENT_RUNTIME_BACKEND"
 echo "Agent demo Incus endpoint: $PIKA_AGENT_INCUS_ENDPOINT"
 
 rm -rf "$STATE_DIR"

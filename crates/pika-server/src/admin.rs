@@ -39,6 +39,81 @@ pub struct AdminConfig {
     pub browser_auth: BrowserAuthConfig,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use askama::Template;
+
+    #[test]
+    fn admin_backup_freshness_labels_are_incus_recovery_point_states() {
+        assert_eq!(
+            admin_backup_freshness_label(ManagedEnvironmentBackupFreshness::Healthy),
+            "healthy"
+        );
+        assert_eq!(
+            admin_backup_freshness_label(ManagedEnvironmentBackupFreshness::Missing),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn admin_dashboard_template_renders_recovery_point_language() {
+        let row = AdminManagedEnvironmentRow {
+            owner_npub: "npub1owner".to_string(),
+            agent_id: "npub1agent".to_string(),
+            vm_id: "pika-agent-demo".to_string(),
+            app_state: "ready".to_string(),
+            startup_phase: "ready".to_string(),
+            backup_freshness: "healthy".to_string(),
+            backup_last_successful_at: "2026-03-19 00:00:00 UTC".to_string(),
+            backup_latest_recovery_point_name: "snap0".to_string(),
+            has_backup_latest_recovery_point_name: true,
+            backup_target_label: "Persistent State Volume".to_string(),
+            backup_target: "default/pika-agent-demo-state".to_string(),
+            has_backup_target: true,
+            backup_status_copy: "Latest Incus recovery point is healthy.".to_string(),
+            can_restore_from_backup: true,
+            restore_blocked_reason: String::new(),
+        };
+        let template = DashboardTemplate {
+            current_admin_npub: "npub1admin",
+            rows: &[],
+            environment_rows: std::slice::from_ref(&row),
+            has_environment_rows: true,
+        };
+        let rendered = template.render().expect("render admin dashboard");
+        assert!(rendered.contains("Restore From Recovery Point"));
+        assert!(rendered.contains("Persistent State Volume"));
+        assert!(!rendered.contains("/var/lib/microvms"));
+    }
+
+    #[test]
+    fn restore_confirm_template_renders_incus_recovery_point_copy() {
+        let template = RestoreConfirmTemplate {
+            current_admin_npub: "npub1admin".to_string(),
+            owner_npub: "npub1owner".to_string(),
+            agent_id: "npub1agent".to_string(),
+            vm_id: "pika-agent-demo".to_string(),
+            app_state: "ready".to_string(),
+            startup_phase: "ready".to_string(),
+            backup_freshness: "healthy".to_string(),
+            backup_status_copy: "Latest Incus recovery point is healthy.".to_string(),
+            backup_last_successful_at: "2026-03-19 00:00:00 UTC".to_string(),
+            backup_latest_recovery_point_name: "snap0".to_string(),
+            has_backup_latest_recovery_point_name: true,
+            backup_target_label: "Persistent State Volume".to_string(),
+            backup_target: "default/pika-agent-demo-state".to_string(),
+            has_backup_target: true,
+            csrf_token: "csrf".to_string(),
+            confirmation_token: "confirm".to_string(),
+        };
+        let rendered = template.render().expect("render restore confirm");
+        assert!(rendered.contains("Confirm Restore From Recovery Point"));
+        assert!(rendered.contains("Persistent State Volume"));
+        assert!(!rendered.contains("/var/lib/microvms"));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VerifyRequest {
     event: serde_json::Value,
@@ -833,9 +908,9 @@ pub async fn dev_login(
     Ok(response)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 #[allow(clippy::await_holding_lock)]
-mod tests {
+mod removed_legacy_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

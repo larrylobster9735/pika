@@ -16,8 +16,9 @@ It is intentionally narrow:
 - `pika-build` is the first Incus host target
 - the guest image is Nix-built and imported into Incus manually
 - `pika-build` is the Incus substrate for this lane, not the agent API host
-- `pika-server` stays on `microvm` as the default provider
-- Incus is exercised through explicit request-scoped provisioning
+- the managed-agent product path is now Incus-only and OpenClaw-only
+- `pika-server` still shares a host with other legacy microVM infrastructure, but managed-agent
+  requests no longer provision through that substrate
 
 ## What This Lane Proves
 
@@ -177,7 +178,7 @@ The smoke API base URL must point at a `pika-server` process that is configured 
 
 - a local branch build of `pika-server`
 - a dedicated canary deployment of `pika-server`
-- the real `pika-server` host with `microvm` still left as the default provider
+- the real `pika-server` host with the managed-agent path configured for Incus
 
 The Incus provider expects these settings for request-scoped provisioning:
 
@@ -204,7 +205,7 @@ scripts/incus-managed-agent-smoke.sh \
 
 Expected results:
 
-1. The chosen `pika-server` process starts healthy with `microvm` still as the default provider.
+1. The chosen `pika-server` process starts healthy with the managed-agent path configured for Incus.
 2. The explicit Incus provision request succeeds.
 3. An Incus VM appears with a deterministic `pika-agent-*` instance name.
 4. A matching custom volume named `<vm_id>-state` appears.
@@ -289,18 +290,17 @@ Current limitations:
 
 ## `pika-server` Canary Mode
 
-Deploy the code with Incus configuration present, but keep the global default provider unchanged:
+Deploy the code with the managed-agent path configured for Incus:
 
-- do not set `PIKA_AGENT_VM_PROVIDER=incus`
-- keep the existing microVM environment working as the default path
-- use request-scoped Incus provisioning only for internal validation
+- set `PIKA_AGENT_VM_PROVIDER=incus` or leave it unset
+- do not expect managed-agent provisioning to fall back to `microvm`
+- use the hosted Incus lane for internal validation
 
 The real internal dashboard path is now Incus-only:
 
 - `/dashboard` provision, recover, and reset actions explicitly request `provider=incus`
 - built-in OpenClaw launch and proxying only unlock for Incus-backed rows
-- legacy microVM rows remain visible but the dashboard will only offer destructive reset to replace
-  them with a fresh Incus-backed environment
+- the managed-agent product path no longer preserves legacy microVM rows or compatibility behavior
 
 Recommended server env for canarying:
 
@@ -338,9 +338,8 @@ that is reachable from `pika-server` itself. In practice that means the private 
 
 This lets operators verify:
 
-- startup health can authenticate and probe the Incus client path honestly when Incus canary env is present
-- Incus requests can create and observe real managed guests
-- existing microVM-backed rows still route to the microVM backend
+- startup health can authenticate and probe the Incus client path honestly when Incus config is present
+- Incus requests can create and observe real managed OpenClaw guests
 - the smoke helper is provisioning a fresh Incus environment, not just re-reading an existing owner state
 
 ## CLI Incus Demo Flow
@@ -364,23 +363,8 @@ These wrappers:
 - default to `https://api.pikachat.org` unless `PIKA_AGENT_API_BASE_URL` or `PIKA_SERVER_URL` is set
 - request `provider=incus` explicitly
 - default to the hosted Incus lane on `pika-build`
-- default to the OpenClaw native runtime because that is the usable conversational managed-agent path
+- target the only supported managed-agent runtime: OpenClaw
 - use normal `pika-server` ensure or recover semantics instead of direct `vm-spawner` deletion
-
-If you want to exercise the Pi daemon path instead, override it with the neutral
-runtime-selection env vars:
-
-```bash
-PIKA_AGENT_RUNTIME_KIND=pi \
-PIKA_AGENT_RUNTIME_BACKEND=acp \
-just agent-incus-chat "hello from the Incus Pi daemon lane"
-```
-
-Legacy compatibility aliases still work for older shells and scripts:
-- `PIKA_AGENT_MICROVM_KIND`
-- `PIKA_AGENT_MICROVM_BACKEND`
-- `PIKA_AGENT_MICROVM_ACP_EXEC`
-- `PIKA_AGENT_MICROVM_ACP_CWD`
 
 ## Deletion Validation
 
