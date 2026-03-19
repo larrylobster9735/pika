@@ -3925,18 +3925,18 @@ pub(crate) async fn reset_agent_for_owner(
     };
 
     if let Some(vm_id) = existing.as_ref().and_then(|row| row.vm_id.as_deref()) {
-        let provider =
-            managed_vm_provider_for_row(existing.as_ref().expect("existing row"), requested)
-                .map_err(|err| {
-                    tracing::error!(
-                        request_id = %request_id,
-                        owner_npub = %owner_npub,
-                        error = %err,
-                        "failed to resolve stored reset managed VM provider"
-                    );
-                    AgentApiError::from_code(AgentApiErrorCode::Internal)
-                        .with_request_id(request_id)
-                })?;
+        // Reset intentionally tears down the existing environment using the row's stored provider
+        // and only then provisions the replacement with the requested provider policy.
+        let provider = managed_vm_provider_for_row(existing.as_ref().expect("existing row"), None)
+            .map_err(|err| {
+                tracing::error!(
+                    request_id = %request_id,
+                    owner_npub = %owner_npub,
+                    error = %err,
+                    "failed to resolve stored reset managed VM provider"
+                );
+                AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
+            })?;
         match provider.delete_vm(vm_id, Some(request_id)).await {
             Ok(()) => {
                 tracing::info!(
@@ -6811,6 +6811,156 @@ GFs2pW5hEhS7cCO0qXaa5g==
         assert_eq!(latest.agent_id, existing.agent_id);
         assert_eq!(latest.phase, AGENT_PHASE_CREATING);
         assert_eq!(latest.vm_id, None);
+
+        clear_test_database(&mut conn);
+    }
+
+    #[tokio::test]
+    async fn reset_agent_for_owner_deletes_legacy_microvm_and_reprovisions_on_requested_incus() {
+        let _guard = serial_test_guard();
+        let Some(db_pool) = init_test_db_pool() else {
+            return;
+        };
+        let state = test_state(db_pool.clone());
+        let owner_npub = "npub1resetlegacytoincus";
+        let mut conn = db_pool.get().expect("get test connection");
+        clear_test_database(&mut conn);
+        let existing = AgentInstance::create(
+            &mut conn,
+            owner_npub,
+            "agent-reset-legacy",
+            Some("vm-reset-legacy"),
+            AGENT_PHASE_READY,
+        )
+        .expect("seed legacy microvm row");
+        drop(conn);
+
+        let (microvm_base_url, microvm_rx) = spawn_one_shot_server("204 No Content", "");
+        let (incus_base_url, incus_rx) = spawn_response_sequence_server(vec![
+            ("200 OK", r#"{"type":"sync","metadata":{}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"devices":{"eth0":{"type":"nic","network":"incusbr0","name":"eth0"}}}}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"type":"async","operation":"/1.0/operations/op-create","metadata":{"err":""}}"#,
+            ),
+            ("200 OK", r#"{"type":"sync","metadata":{"err":""}}"#),
+            (
+                "200 OK",
+                r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+            ),
+            ("404 Not Found", ""),
+        ]);
+        let requested = ManagedVmProvisionParams {
+            provider: Some(ProviderKind::Incus),
+            microvm: Some(MicrovmProvisionParams {
+                spawner_url: None,
+                kind: Some(MicrovmAgentKind::Openclaw),
+                backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
+            }),
+            incus: Some(IncusProvisionParams {
+                endpoint: Some(incus_base_url.clone()),
+                project: Some("managed-agents".to_string()),
+                profile: Some("pika-agent".to_string()),
+                storage_pool: Some("managed-agents-zfs".to_string()),
+                image_alias: Some("pika-agent/dev".to_string()),
+                openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
+                insecure_tls: Some(true),
+            }),
+        };
+
+        with_env_overrides(
+            &[
+                (VM_PROVIDER_ENV, Some("microvm")),
+                (MICROVM_SPAWNER_URL_ENV, Some(microvm_base_url.as_str())),
+            ],
+            || async {
+                let action = reset_agent_for_owner(
+                    &state,
+                    owner_npub,
+                    "req-reset-legacy-to-incus",
+                    Some(&requested),
+                )
+                .await
+                .expect("reset should delete legacy microvm and reprovision on incus");
+                assert_eq!(action.startup_phase, AgentStartupPhase::ProvisioningVm);
+                assert_eq!(action.row.provider, "incus");
+                assert_eq!(action.row.phase, AGENT_PHASE_CREATING);
+                assert!(action.row.vm_id.is_some());
+            },
+        )
+        .await;
+
+        let delete_request = microvm_rx.recv().expect("captured legacy microvm delete");
+        assert_eq!(delete_request.method, "DELETE");
+        assert_eq!(delete_request.path, "/vms/vm-reset-legacy");
+        assert_eq!(
+            delete_request
+                .headers
+                .get("x-request-id")
+                .map(String::as_str),
+            Some("req-reset-legacy-to-incus")
+        );
+
+        let volume_request = incus_rx.recv().expect("captured incus volume create");
+        assert_eq!(volume_request.method, "POST");
+        assert_eq!(
+            volume_request.path,
+            "/1.0/storage-pools/managed-agents-zfs/volumes/custom?project=managed-agents"
+        );
+
+        let profile_request = incus_rx.recv().expect("captured incus profile lookup");
+        assert_eq!(profile_request.method, "GET");
+        assert_eq!(
+            profile_request.path,
+            "/1.0/profiles/pika-agent?project=managed-agents"
+        );
+
+        let instance_request = incus_rx.recv().expect("captured incus instance create");
+        assert_eq!(instance_request.method, "POST");
+        assert_eq!(
+            instance_request.path,
+            "/1.0/instances?project=managed-agents"
+        );
+
+        let operation_request = incus_rx.recv().expect("captured incus operation poll");
+        assert_eq!(operation_request.method, "GET");
+        assert_eq!(
+            operation_request.path,
+            "/1.0/operations/op-create?project=managed-agents"
+        );
+
+        let status_request = incus_rx.recv().expect("captured incus status request");
+        assert_eq!(status_request.method, "GET");
+        let created_vm_id = status_request
+            .path
+            .strip_prefix("/1.0/instances/")
+            .and_then(|rest| rest.strip_suffix("/state?project=managed-agents"))
+            .expect("status request path should contain vm id")
+            .to_string();
+        assert!(!created_vm_id.is_empty());
+
+        let ready_marker_request = incus_rx.recv().expect("captured incus ready-marker lookup");
+        assert_eq!(ready_marker_request.method, "GET");
+        assert_eq!(
+            ready_marker_request.path,
+            format!(
+                "/1.0/instances/{created_vm_id}/files?path=%2Fworkspace%2Fpika-agent%2Fservice-ready.json&project=managed-agents"
+            )
+        );
+
+        let mut conn = db_pool.get().expect("get verify connection");
+        let latest = AgentInstance::find_latest_by_owner(&mut conn, owner_npub)
+            .expect("query latest row")
+            .expect("latest row");
+        assert_eq!(latest.provider, "incus");
+        assert_eq!(latest.vm_id.as_deref(), Some(created_vm_id.as_str()));
+        let stale = AgentInstance::find_by_agent_id(&mut conn, &existing.agent_id)
+            .expect("query legacy row")
+            .expect("legacy row");
+        assert_eq!(stale.phase, AGENT_PHASE_ERROR);
 
         clear_test_database(&mut conn);
     }
