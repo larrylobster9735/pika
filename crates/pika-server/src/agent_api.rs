@@ -3137,6 +3137,8 @@ pub(crate) async fn load_openclaw_proxy_target(
                 request_id = %request_id,
                 vm_id = %vm_id,
                 error = %err,
+                error_chain = %format!("{err:#}"),
+                error_debug = ?err,
                 "failed to resolve managed OpenClaw proxy target"
             );
             AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
