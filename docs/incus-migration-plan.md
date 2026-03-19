@@ -345,8 +345,12 @@ Current transition status:
   still mutates per-instance proxy devices on demand and should likely be simplified later
 - guest secret injection exists today for the internal lane and currently rides the guest bootstrap
   path; it needs a more deliberate long-term model for provenance, rotation, and auditability
-- the shared app/core path and the human CLI demo path should now select `provider=incus`
-  explicitly rather than relying on `provider: None` plus a runtime-only `microvm` payload
+- substrate provider selection and guest runtime selection are separate concepts; the old
+  `microvm` naming leaked those together and made the internal contract harder to reason about
+- the shared app/core path and the human CLI demo path now use a neutral `runtime` selector for
+  Pi vs OpenClaw while keeping `provider=incus` explicit on the hosted internal lane
+- compatibility aliases for the legacy `microvm` request block and `PIKA_AGENT_MICROVM_*` env vars
+  still exist temporarily for older callers and shells, but they should not be extended further
 - the customer dashboard path is now Incus-only internally, but the broader platform still carries
   transitional contract debt for old microVM rows and compatibility-oriented API shapes
 
@@ -355,7 +359,8 @@ Current transition status:
 The next high-signal simplification targets are:
 
 - split runtime kind/backend selection from VM substrate selection more cleanly so Incus is not
-  still carrying `microvm`-shaped runtime knobs in product-facing request types
+  still carrying legacy compatibility shims in product-facing request types once older callers are
+  gone
 - simplify Incus OpenClaw ingress so less instance mutation happens on demand and the proxy target
   is more static and obvious
 - decide on a deliberate guest secret injection model instead of growing more bootstrap-time env

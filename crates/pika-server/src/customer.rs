@@ -16,8 +16,8 @@ use crate::models::managed_environment_event::ManagedEnvironmentEvent;
 use crate::nostr_auth::{expected_host_from_headers, verify_nip98_event};
 use crate::{RequestContext, State};
 use pika_agent_control_plane::{
-    IncusProvisionParams, ManagedVmProvisionParams, MicrovmAgentBackend, MicrovmAgentKind,
-    MicrovmProvisionParams, ProviderKind,
+    AgentRuntimeBackend, AgentRuntimeKind, IncusProvisionParams, ManagedVmProvisionParams,
+    ProviderKind,
 };
 
 mod openclaw;
@@ -217,11 +217,11 @@ fn dashboard_substrate_label(
 fn customer_dashboard_managed_vm_policy() -> ManagedVmProvisionParams {
     ManagedVmProvisionParams {
         provider: Some(ProviderKind::Incus),
-        microvm: Some(MicrovmProvisionParams {
-            spawner_url: None,
-            kind: Some(MicrovmAgentKind::Openclaw),
-            backend: Some(MicrovmAgentBackend::Native),
+        runtime: Some(pika_agent_control_plane::AgentRuntimeParams {
+            kind: Some(AgentRuntimeKind::Openclaw),
+            backend: Some(AgentRuntimeBackend::Native),
         }),
+        microvm: None,
         incus: Some(IncusProvisionParams::default()),
     }
 }

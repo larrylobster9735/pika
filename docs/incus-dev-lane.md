@@ -367,14 +367,20 @@ These wrappers:
 - use normal `pika-server` ensure or recover semantics instead of direct `vm-spawner` deletion
 
 The default demo runtime is still the Pi ACP path because it gives the shortest repeatable
-Marmot message loop. Override it with the existing runtime-selection env vars if you want to
+Marmot message loop. Override it with the neutral runtime-selection env vars if you want to
 exercise a different managed guest:
 
 ```bash
-PIKA_AGENT_MICROVM_KIND=openclaw \
-PIKA_AGENT_MICROVM_BACKEND=native \
+PIKA_AGENT_RUNTIME_KIND=openclaw \
+PIKA_AGENT_RUNTIME_BACKEND=native \
 just agent-incus-chat "hello from OpenClaw on Incus"
 ```
+
+Legacy compatibility aliases still work for older shells and scripts:
+- `PIKA_AGENT_MICROVM_KIND`
+- `PIKA_AGENT_MICROVM_BACKEND`
+- `PIKA_AGENT_MICROVM_ACP_EXEC`
+- `PIKA_AGENT_MICROVM_ACP_CWD`
 
 ## Deletion Validation
 

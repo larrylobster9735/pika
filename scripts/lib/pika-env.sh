@@ -80,9 +80,40 @@ require_agent_api_nsec() {
   fi
 }
 
-set_agent_microvm_backend_default() {
+sync_agent_runtime_env_aliases() {
+  if [ -z "${PIKA_AGENT_RUNTIME_KIND:-}" ] && [ -n "${PIKA_AGENT_MICROVM_KIND:-}" ]; then
+    export PIKA_AGENT_RUNTIME_KIND="$PIKA_AGENT_MICROVM_KIND"
+  fi
+  if [ -z "${PIKA_AGENT_RUNTIME_BACKEND:-}" ] && [ -n "${PIKA_AGENT_MICROVM_BACKEND:-}" ]; then
+    export PIKA_AGENT_RUNTIME_BACKEND="$PIKA_AGENT_MICROVM_BACKEND"
+  fi
+  if [ -z "${PIKA_AGENT_RUNTIME_ACP_EXEC:-}" ] && [ -n "${PIKA_AGENT_MICROVM_ACP_EXEC:-}" ]; then
+    export PIKA_AGENT_RUNTIME_ACP_EXEC="$PIKA_AGENT_MICROVM_ACP_EXEC"
+  fi
+  if [ -z "${PIKA_AGENT_RUNTIME_ACP_CWD:-}" ] && [ -n "${PIKA_AGENT_MICROVM_ACP_CWD:-}" ]; then
+    export PIKA_AGENT_RUNTIME_ACP_CWD="$PIKA_AGENT_MICROVM_ACP_CWD"
+  fi
+
+  # Keep legacy aliases populated for older scripts until they are retired.
+  if [ -z "${PIKA_AGENT_MICROVM_KIND:-}" ] && [ -n "${PIKA_AGENT_RUNTIME_KIND:-}" ]; then
+    export PIKA_AGENT_MICROVM_KIND="$PIKA_AGENT_RUNTIME_KIND"
+  fi
+  if [ -z "${PIKA_AGENT_MICROVM_BACKEND:-}" ] && [ -n "${PIKA_AGENT_RUNTIME_BACKEND:-}" ]; then
+    export PIKA_AGENT_MICROVM_BACKEND="$PIKA_AGENT_RUNTIME_BACKEND"
+  fi
+  if [ -z "${PIKA_AGENT_MICROVM_ACP_EXEC:-}" ] && [ -n "${PIKA_AGENT_RUNTIME_ACP_EXEC:-}" ]; then
+    export PIKA_AGENT_MICROVM_ACP_EXEC="$PIKA_AGENT_RUNTIME_ACP_EXEC"
+  fi
+  if [ -z "${PIKA_AGENT_MICROVM_ACP_CWD:-}" ] && [ -n "${PIKA_AGENT_RUNTIME_ACP_CWD:-}" ]; then
+    export PIKA_AGENT_MICROVM_ACP_CWD="$PIKA_AGENT_RUNTIME_ACP_CWD"
+  fi
+}
+
+set_agent_runtime_backend_default() {
   local default_backend="${1:-acp}"
-  set_default "PIKA_AGENT_MICROVM_BACKEND" "$default_backend"
+  sync_agent_runtime_env_aliases
+  set_default "PIKA_AGENT_RUNTIME_BACKEND" "$default_backend"
+  sync_agent_runtime_env_aliases
 }
 
 set_agent_vm_provider_default() {
@@ -92,15 +123,17 @@ set_agent_vm_provider_default() {
 
 set_agent_runtime_defaults() {
   local default_kind="${1:-pi}"
-  set_default "PIKA_AGENT_MICROVM_KIND" "$default_kind"
-  case "${PIKA_AGENT_MICROVM_KIND}" in
+  sync_agent_runtime_env_aliases
+  set_default "PIKA_AGENT_RUNTIME_KIND" "$default_kind"
+  case "${PIKA_AGENT_RUNTIME_KIND}" in
     openclaw)
-      set_agent_microvm_backend_default native
+      set_agent_runtime_backend_default native
       ;;
     *)
-      set_agent_microvm_backend_default acp
+      set_agent_runtime_backend_default acp
       ;;
   esac
+  sync_agent_runtime_env_aliases
 }
 
 set_agent_incus_lane_defaults() {

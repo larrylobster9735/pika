@@ -64,6 +64,33 @@ pub struct MicrovmProvisionParams {
     pub backend: Option<MicrovmAgentBackend>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeKind {
+    Pi,
+    Openclaw,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AgentRuntimeBackend {
+    Native,
+    Acp {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exec_command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+pub struct AgentRuntimeParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AgentRuntimeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<AgentRuntimeBackend>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
 pub struct IncusProvisionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +116,8 @@ pub struct ManagedVmProvisionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntimeParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub microvm: Option<MicrovmProvisionParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
@@ -111,6 +140,42 @@ pub enum MicrovmAgentBackend {
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+}
+
+impl From<MicrovmAgentKind> for AgentRuntimeKind {
+    fn from(value: MicrovmAgentKind) -> Self {
+        match value {
+            MicrovmAgentKind::Pi => Self::Pi,
+            MicrovmAgentKind::Openclaw => Self::Openclaw,
+        }
+    }
+}
+
+impl From<AgentRuntimeKind> for MicrovmAgentKind {
+    fn from(value: AgentRuntimeKind) -> Self {
+        match value {
+            AgentRuntimeKind::Pi => Self::Pi,
+            AgentRuntimeKind::Openclaw => Self::Openclaw,
+        }
+    }
+}
+
+impl From<MicrovmAgentBackend> for AgentRuntimeBackend {
+    fn from(value: MicrovmAgentBackend) -> Self {
+        match value {
+            MicrovmAgentBackend::Native => Self::Native,
+            MicrovmAgentBackend::Acp { exec_command, cwd } => Self::Acp { exec_command, cwd },
+        }
+    }
+}
+
+impl From<AgentRuntimeBackend> for MicrovmAgentBackend {
+    fn from(value: AgentRuntimeBackend) -> Self {
+        match value {
+            AgentRuntimeBackend::Native => Self::Native,
+            AgentRuntimeBackend::Acp { exec_command, cwd } => Self::Acp { exec_command, cwd },
+        }
+    }
 }
 
 pub const GUEST_AUTOSTART_COMMAND: &str = "bash /workspace/pika-agent/start-agent.sh";
@@ -389,6 +454,8 @@ pub struct AgentProvisionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntimeParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub microvm: Option<MicrovmProvisionParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
@@ -398,6 +465,7 @@ impl AgentProvisionRequest {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: self.provider,
+            runtime: self.runtime.clone(),
             microvm: self.microvm.clone(),
             incus: self.incus.clone(),
         }
@@ -504,6 +572,8 @@ pub struct ProvisionCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_secret_key_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntimeParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub microvm: Option<MicrovmProvisionParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incus: Option<IncusProvisionParams>,
@@ -513,6 +583,7 @@ impl ProvisionCommand {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: Some(self.provider),
+            runtime: self.runtime.clone(),
             microvm: self.microvm.clone(),
             incus: self.incus.clone(),
         }
@@ -714,6 +785,7 @@ mod tests {
                 runtime_class: Some("microvm-us-east".to_string()),
                 relay_urls: vec!["wss://relay.example.com".to_string()],
                 bot_secret_key_hex: None,
+                runtime: None,
                 microvm: None,
                 incus: None,
             }),
@@ -744,6 +816,13 @@ mod tests {
                 runtime_class: None,
                 relay_urls: vec![],
                 bot_secret_key_hex: Some("deadbeef".to_string()),
+                runtime: Some(AgentRuntimeParams {
+                    kind: Some(AgentRuntimeKind::Pi),
+                    backend: Some(AgentRuntimeBackend::Acp {
+                        exec_command: Some("npx -y pi-acp".to_string()),
+                        cwd: Some("/root/pika-agent/acp".to_string()),
+                    }),
+                }),
                 microvm: Some(MicrovmProvisionParams {
                     spawner_url: Some("http://127.0.0.1:8080".to_string()),
                     kind: Some(MicrovmAgentKind::Pi),
@@ -906,6 +985,7 @@ mod tests {
         assert_eq!(cmd.runtime_class, None);
         assert!(cmd.relay_urls.is_empty());
         assert_eq!(cmd.bot_secret_key_hex, None);
+        assert_eq!(cmd.runtime, None);
         assert_eq!(cmd.microvm, None);
         assert_eq!(cmd.incus, None);
     }
@@ -1189,6 +1269,13 @@ mod tests {
     fn agent_provision_request_round_trips_microvm_backend() {
         let request = AgentProvisionRequest {
             provider: None,
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Pi),
+                backend: Some(AgentRuntimeBackend::Acp {
+                    exec_command: Some("npx -y pi-acp".to_string()),
+                    cwd: Some("/root/pika-agent/acp".to_string()),
+                }),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: Some("http://127.0.0.1:8080".to_string()),
                 kind: Some(MicrovmAgentKind::Pi),
@@ -1209,6 +1296,10 @@ mod tests {
     fn agent_provision_request_round_trips_native_microvm_backend() {
         let request = AgentProvisionRequest {
             provider: None,
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: Some("http://127.0.0.1:8080".to_string()),
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -1226,6 +1317,10 @@ mod tests {
     fn agent_provision_request_round_trips_incus_backend() {
         let request = AgentProvisionRequest {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: None,
             incus: Some(IncusProvisionParams {
                 endpoint: Some("https://incus.internal:8443".to_string()),
@@ -1248,6 +1343,7 @@ mod tests {
     fn managed_vm_params_preserve_legacy_microvm_request_shape() {
         let request = AgentProvisionRequest {
             provider: None,
+            runtime: None,
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: Some("http://127.0.0.1:8080".to_string()),
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -1259,8 +1355,29 @@ mod tests {
         let managed_vm = request.managed_vm_params();
 
         assert_eq!(managed_vm.provider, None);
+        assert_eq!(managed_vm.runtime, None);
         assert_eq!(managed_vm.microvm, request.microvm);
         assert_eq!(managed_vm.incus, None);
+    }
+
+    #[test]
+    fn managed_vm_params_preserve_runtime_request_shape() {
+        let request = AgentProvisionRequest {
+            provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
+            microvm: None,
+            incus: Some(IncusProvisionParams::default()),
+        };
+
+        let managed_vm = request.managed_vm_params();
+
+        assert_eq!(managed_vm.provider, Some(ProviderKind::Incus));
+        assert_eq!(managed_vm.runtime, request.runtime);
+        assert_eq!(managed_vm.microvm, None);
+        assert_eq!(managed_vm.incus, request.incus);
     }
 
     #[test]

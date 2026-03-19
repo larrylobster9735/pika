@@ -3,8 +3,8 @@ use std::time::Duration;
 use base64::Engine;
 use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag, TagKind};
 use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, MicrovmAgentKind,
-    MicrovmProvisionParams, ProviderKind,
+    AgentProvisionRequest, AgentRuntimeKind, AgentRuntimeParams, AgentStartupPhase,
+    IncusProvisionParams, ProviderKind,
 };
 use reqwest::Method;
 use serde::Deserialize;
@@ -341,14 +341,14 @@ fn internal_managed_agent_request(
     let provider = internal_managed_agent_provider(base_url);
     AgentProvisionRequest {
         provider,
-        microvm: Some(MicrovmProvisionParams {
-            spawner_url: None,
+        runtime: Some(AgentRuntimeParams {
             kind: Some(match agent_kind {
-                crate::state::AgentKind::Openclaw => MicrovmAgentKind::Openclaw,
-                crate::state::AgentKind::Pi => MicrovmAgentKind::Pi,
+                crate::state::AgentKind::Openclaw => AgentRuntimeKind::Openclaw,
+                crate::state::AgentKind::Pi => AgentRuntimeKind::Pi,
             }),
             backend: None,
         }),
+        microvm: None,
         // Keep the transitional runtime-selection payload explicit while making
         // the hosted internal flow target Incus deliberately. Custom app-server
         // targets still fall back to server-default substrate policy unless the
@@ -961,8 +961,8 @@ mod tests {
             }
         }
         assert_eq!(
-            request.microvm.as_ref().and_then(|params| params.kind),
-            Some(MicrovmAgentKind::Pi)
+            request.runtime.as_ref().and_then(|params| params.kind),
+            Some(AgentRuntimeKind::Pi)
         );
     }
 
@@ -985,8 +985,8 @@ mod tests {
             }
         }
         assert_eq!(
-            request.microvm.as_ref().and_then(|params| params.kind),
-            Some(MicrovmAgentKind::Pi)
+            request.runtime.as_ref().and_then(|params| params.kind),
+            Some(AgentRuntimeKind::Pi)
         );
     }
 

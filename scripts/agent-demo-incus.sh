@@ -33,8 +33,8 @@ done
 
 echo "Agent demo API base URL: $PIKA_AGENT_API_BASE_URL"
 echo "Agent demo provider: $PIKA_AGENT_VM_PROVIDER"
-echo "Agent demo runtime kind: $PIKA_AGENT_MICROVM_KIND"
-echo "Agent demo runtime backend: $PIKA_AGENT_MICROVM_BACKEND"
+echo "Agent demo runtime kind: $PIKA_AGENT_RUNTIME_KIND"
+echo "Agent demo runtime backend: $PIKA_AGENT_RUNTIME_BACKEND"
 echo "Agent demo Incus endpoint: $PIKA_AGENT_INCUS_ENDPOINT"
 
 rm -rf "$STATE_DIR"

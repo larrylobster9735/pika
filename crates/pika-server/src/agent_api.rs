@@ -32,10 +32,11 @@ use crate::nostr_auth::{
 };
 use crate::{RequestContext, State};
 use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams,
-    MicrovmAgentKind, MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth,
-    SpawnerVmBackupStatus, SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind,
-    VmRecoveryPointKind, GUEST_READY_MARKER_PATH,
+    AgentProvisionRequest, AgentRuntimeBackend, AgentRuntimeKind, AgentRuntimeParams,
+    AgentStartupPhase, IncusProvisionParams, ManagedVmProvisionParams, MicrovmAgentKind,
+    MicrovmProvisionParams, ProviderKind, SpawnerOpenClawLaunchAuth, SpawnerVmBackupStatus,
+    SpawnerVmResponse, VmBackupFreshness, VmBackupUnitKind, VmRecoveryPointKind,
+    GUEST_READY_MARKER_PATH,
 };
 use pika_agent_microvm::{
     build_create_vm_request, resolve_params, validate_resolved_params, ManagedVmCreateInput,
@@ -369,6 +370,25 @@ fn materialized_managed_vm_params(
     match config {
         ResolvedManagedVmProviderConfig::Microvm(resolved) => ManagedVmProvisionParams {
             provider: Some(ProviderKind::Microvm),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(match resolved.kind {
+                    pika_agent_microvm::ResolvedMicrovmAgentKind::Pi => AgentRuntimeKind::Pi,
+                    pika_agent_microvm::ResolvedMicrovmAgentKind::Openclaw => {
+                        AgentRuntimeKind::Openclaw
+                    }
+                }),
+                backend: Some(match &resolved.backend {
+                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Native => {
+                        AgentRuntimeBackend::Native
+                    }
+                    pika_agent_microvm::ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
+                        AgentRuntimeBackend::Acp {
+                            exec_command: Some(exec_command.clone()),
+                            cwd: Some(cwd.clone()),
+                        }
+                    }
+                }),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: Some(resolved.spawner_url.clone()),
                 kind: Some(match resolved.kind {
@@ -393,6 +413,21 @@ fn materialized_managed_vm_params(
         },
         ResolvedManagedVmProviderConfig::Incus(resolved) => ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(match resolved.agent_kind {
+                    ResolvedMicrovmAgentKind::Pi => AgentRuntimeKind::Pi,
+                    ResolvedMicrovmAgentKind::Openclaw => AgentRuntimeKind::Openclaw,
+                }),
+                backend: Some(match &resolved.agent_backend {
+                    ResolvedMicrovmAgentBackend::Native => AgentRuntimeBackend::Native,
+                    ResolvedMicrovmAgentBackend::Acp { exec_command, cwd } => {
+                        AgentRuntimeBackend::Acp {
+                            exec_command: Some(exec_command.clone()),
+                            cwd: Some(cwd.clone()),
+                        }
+                    }
+                }),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(match resolved.agent_kind {
@@ -890,6 +925,61 @@ fn microvm_transport_params_provided(params: &MicrovmProvisionParams) -> bool {
 
 fn microvm_runtime_params_provided(params: &MicrovmProvisionParams) -> bool {
     params.kind.is_some() || params.backend.is_some()
+}
+
+fn runtime_params_provided(params: &AgentRuntimeParams) -> bool {
+    params.kind.is_some() || params.backend.is_some()
+}
+
+fn legacy_runtime_params_from_microvm(
+    params: &MicrovmProvisionParams,
+) -> Option<AgentRuntimeParams> {
+    if !microvm_runtime_params_provided(params) {
+        return None;
+    }
+    Some(AgentRuntimeParams {
+        kind: params.kind.map(Into::into),
+        backend: params.backend.clone().map(Into::into),
+    })
+}
+
+fn merged_requested_runtime_params(
+    requested: Option<&ManagedVmProvisionParams>,
+) -> anyhow::Result<Option<AgentRuntimeParams>> {
+    let explicit_runtime = requested.and_then(|params| params.runtime.clone());
+    let legacy_runtime = requested
+        .and_then(|params| params.microvm.as_ref())
+        .and_then(legacy_runtime_params_from_microvm);
+
+    match (explicit_runtime, legacy_runtime) {
+        (Some(runtime), Some(legacy)) => {
+            if let (Some(runtime_kind), Some(legacy_kind)) = (runtime.kind, legacy.kind) {
+                anyhow::ensure!(
+                    runtime_kind == legacy_kind,
+                    "managed VM request runtime.kind {:?} conflicts with legacy microvm.kind {:?}",
+                    runtime_kind,
+                    legacy_kind
+                );
+            }
+            if let (Some(runtime_backend), Some(legacy_backend)) =
+                (runtime.backend.as_ref(), legacy.backend.as_ref())
+            {
+                anyhow::ensure!(
+                    runtime_backend == legacy_backend,
+                    "managed VM request runtime.backend {:?} conflicts with legacy microvm.backend {:?}",
+                    runtime_backend,
+                    legacy_backend
+                );
+            }
+            Ok(Some(AgentRuntimeParams {
+                kind: runtime.kind.or(legacy.kind),
+                backend: runtime.backend.or(legacy.backend),
+            }))
+        }
+        (Some(runtime), None) => Ok(Some(runtime)),
+        (None, Some(legacy)) => Ok(Some(legacy)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn incus_params_provided(params: &IncusProvisionParams) -> bool {
@@ -3445,6 +3535,9 @@ fn resolve_requested_provider_kind(
     let has_microvm_runtime_params = requested
         .and_then(|params| params.microvm.as_ref())
         .is_some_and(microvm_runtime_params_provided);
+    let has_runtime_params = requested
+        .and_then(|params| params.runtime.as_ref())
+        .is_some_and(runtime_params_provided);
     let has_incus_params = requested
         .and_then(|params| params.incus.as_ref())
         .is_some_and(incus_params_provided);
@@ -3457,10 +3550,12 @@ fn resolve_requested_provider_kind(
         Some(provider) => provider,
         None if has_microvm_transport_params => ProviderKind::Microvm,
         None if has_incus_params => ProviderKind::Incus,
-        None if has_microvm_runtime_params && matches!(env_provider, ProviderKind::Incus) => {
+        None if (has_runtime_params || has_microvm_runtime_params)
+            && matches!(env_provider, ProviderKind::Incus) =>
+        {
             ProviderKind::Incus
         }
-        None if has_microvm_runtime_params => ProviderKind::Microvm,
+        None if has_runtime_params || has_microvm_runtime_params => ProviderKind::Microvm,
         None => env_provider,
     })
 }
@@ -3492,12 +3587,14 @@ fn resolved_spawner_params(
             {
                 params.spawner_url = requested.spawner_url.clone();
             }
-            if requested.kind.is_some() {
-                params.kind = requested.kind;
-            }
-            if requested.backend.is_some() {
-                params.backend = requested.backend.clone();
-            }
+        }
+    }
+    if let Some(runtime) = merged_requested_runtime_params(requested)? {
+        if runtime.kind.is_some() {
+            params.kind = runtime.kind.map(Into::into);
+        }
+        if runtime.backend.is_some() {
+            params.backend = runtime.backend.map(Into::into);
         }
     }
     if provider != ProviderKind::Microvm {
@@ -3540,12 +3637,6 @@ fn resolved_incus_params(
                     provider,
                     microvm
                 );
-            }
-            if microvm.kind.is_some() {
-                guest_selection.kind = microvm.kind;
-            }
-            if microvm.backend.is_some() {
-                guest_selection.backend = microvm.backend.clone();
             }
         }
         if let Some(requested) = requested.incus.as_ref() {
@@ -3601,6 +3692,14 @@ fn resolved_incus_params(
             {
                 params.openclaw_proxy_host = requested.openclaw_proxy_host.clone();
             }
+        }
+    }
+    if let Some(runtime) = merged_requested_runtime_params(requested)? {
+        if runtime.kind.is_some() {
+            guest_selection.kind = runtime.kind.map(Into::into);
+        }
+        if runtime.backend.is_some() {
+            guest_selection.backend = runtime.backend.map(Into::into);
         }
     }
     if provider != ProviderKind::Incus {
@@ -4402,6 +4501,7 @@ pub async fn agent_api_healthcheck() -> anyhow::Result<()> {
     if should_probe_incus_canary_health() && !matches!(provider, ManagedVmProvider::Incus(_)) {
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: None,
             microvm: None,
             incus: None,
         };
@@ -4618,6 +4718,7 @@ mod tests {
     fn requested_microvm_params(params: MicrovmProvisionParams) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: Some(ProviderKind::Microvm),
+            runtime: legacy_runtime_params_from_microvm(&params),
             microvm: Some(params),
             incus: None,
         }
@@ -4626,6 +4727,7 @@ mod tests {
     fn requested_incus_params(params: IncusProvisionParams) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: None,
             microvm: None,
             incus: Some(params),
         }
@@ -5130,6 +5232,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
     fn provider_selection_rejects_mixed_provider_specific_params() {
         let requested = ManagedVmProvisionParams {
             provider: None,
+            runtime: None,
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: Some("http://127.0.0.1:8080".to_string()),
                 kind: None,
@@ -5157,6 +5260,7 @@ GFs2pW5hEhS7cCO0qXaa5g==
         let _guard = serial_test_guard();
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: None,
             microvm: None,
             incus: Some(IncusProvisionParams {
                 endpoint: Some("https://incus.internal:8443".to_string()),
@@ -5205,11 +5309,70 @@ GFs2pW5hEhS7cCO0qXaa5g==
             || {
                 let requested = ManagedVmProvisionParams {
                     provider: Some(ProviderKind::Incus),
+                    runtime: Some(AgentRuntimeParams {
+                        kind: Some(AgentRuntimeKind::Openclaw),
+                        backend: Some(AgentRuntimeBackend::Native),
+                    }),
                     microvm: Some(MicrovmProvisionParams {
                         spawner_url: None,
                         kind: Some(MicrovmAgentKind::Openclaw),
                         backend: Some(pika_agent_control_plane::MicrovmAgentBackend::Native),
                     }),
+                    incus: Some(IncusProvisionParams {
+                        endpoint: Some("https://incus.internal:8443".to_string()),
+                        project: Some("managed-agents".to_string()),
+                        profile: Some("pika-agent".to_string()),
+                        storage_pool: Some("managed-agents-zfs".to_string()),
+                        image_alias: Some("pika-agent/dev".to_string()),
+                        insecure_tls: Some(true),
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                    }),
+                };
+
+                let resolved = resolve_managed_vm_provider_config(Some(&requested))
+                    .expect("resolve incus config");
+                assert_eq!(
+                    resolved,
+                    ResolvedManagedVmProviderConfig::Incus(ResolvedIncusParams {
+                        endpoint: "https://incus.internal:8443".to_string(),
+                        project: "managed-agents".to_string(),
+                        profile: "pika-agent".to_string(),
+                        storage_pool: "managed-agents-zfs".to_string(),
+                        image_alias: "pika-agent/dev".to_string(),
+                        insecure_tls: true,
+                        openclaw_guest_ipv4_cidr: None,
+                        openclaw_proxy_host: Some("100.81.250.67".to_string()),
+                        agent_kind: ResolvedMicrovmAgentKind::Openclaw,
+                        agent_backend: ResolvedMicrovmAgentBackend::Native,
+                    })
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_managed_vm_provider_config_accepts_runtime_only_incus_request_params() {
+        let _guard = serial_test_guard();
+        with_env_overrides(
+            &[
+                (INCUS_ENDPOINT_ENV, None),
+                (INCUS_PROJECT_ENV, None),
+                (INCUS_PROFILE_ENV, None),
+                (INCUS_STORAGE_POOL_ENV, None),
+                (INCUS_IMAGE_ALIAS_ENV, None),
+                (INCUS_OPENCLAW_GUEST_IPV4_CIDR_ENV, None),
+                (INCUS_OPENCLAW_PROXY_HOST_ENV, None),
+                (INCUS_INSECURE_TLS_ENV, None),
+            ],
+            || {
+                let requested = ManagedVmProvisionParams {
+                    provider: Some(ProviderKind::Incus),
+                    runtime: Some(AgentRuntimeParams {
+                        kind: Some(AgentRuntimeKind::Openclaw),
+                        backend: Some(AgentRuntimeBackend::Native),
+                    }),
+                    microvm: None,
                     incus: Some(IncusProvisionParams {
                         endpoint: Some("https://incus.internal:8443".to_string()),
                         project: Some("managed-agents".to_string()),
@@ -5627,6 +5790,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -5837,6 +6004,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -5892,6 +6063,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         )]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -5954,6 +6129,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6052,6 +6231,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6119,6 +6302,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6164,6 +6351,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6200,6 +6391,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         )]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6282,6 +6477,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6384,6 +6583,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
@@ -6490,6 +6693,13 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Pi),
+                backend: Some(AgentRuntimeBackend::Acp {
+                    exec_command: Some("npx -y pi-acp".to_string()),
+                    cwd: Some("/root/pika-agent/acp".to_string()),
+                }),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Pi),
@@ -7378,6 +7588,10 @@ GFs2pW5hEhS7cCO0qXaa5g==
         ]);
         let requested = ManagedVmProvisionParams {
             provider: Some(ProviderKind::Incus),
+            runtime: Some(AgentRuntimeParams {
+                kind: Some(AgentRuntimeKind::Openclaw),
+                backend: Some(AgentRuntimeBackend::Native),
+            }),
             microvm: Some(MicrovmProvisionParams {
                 spawner_url: None,
                 kind: Some(MicrovmAgentKind::Openclaw),
