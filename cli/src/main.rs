@@ -14,9 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use hypernote_protocol as hn;
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
-use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ProviderKind,
-};
+use pika_agent_control_plane::{AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams};
 use pika_marmot_runtime::key_package::normalize_peer_key_package_event_for_mdk;
 use pika_marmot_runtime::outbound::{OutboundConversationAction, PreparedConversationAction};
 use pika_marmot_runtime::runtime::MarmotRuntime;
@@ -1765,8 +1763,7 @@ fn agent_provision_request(runtime: &AgentRuntimeArgs) -> Option<AgentProvisionR
         return None;
     }
     Some(AgentProvisionRequest {
-        provider: Some(ProviderKind::Incus),
-        incus: Some(IncusProvisionParams {
+        incus: IncusProvisionParams {
             endpoint: runtime.incus_endpoint.clone(),
             project: runtime.incus_project.clone(),
             profile: runtime.incus_profile.clone(),
@@ -1775,18 +1772,13 @@ fn agent_provision_request(runtime: &AgentRuntimeArgs) -> Option<AgentProvisionR
             insecure_tls: runtime.incus_insecure_tls,
             openclaw_guest_ipv4_cidr: None,
             openclaw_proxy_host: None,
-        }),
+        },
     })
 }
 
 async fn cmd_agent_new(http: &AgentHttpArgs, runtime: &AgentRuntimeArgs) -> anyhow::Result<()> {
     let body = agent_provision_request(runtime);
     let ensured = ensure_agent_idempotent(http, body.as_ref()).await?;
-    ensure_agent_matches_requested_provider(
-        &ensured.agent,
-        Some(ProviderKind::Incus),
-        "agent ensure response",
-    )?;
     print(json!({
         "operation": "ensure",
         "created": ensured.created,
@@ -1813,11 +1805,6 @@ async fn cmd_agent_recover(http: &AgentHttpArgs, runtime: &AgentRuntimeArgs) -> 
         body.as_ref(),
     )
     .await?;
-    ensure_agent_matches_requested_provider(
-        &agent,
-        Some(ProviderKind::Incus),
-        "agent recover response",
-    )?;
     print(json!({
         "operation": "recover",
         "agent": agent,
@@ -1914,42 +1901,6 @@ fn parse_agent_startup_phase(agent: &serde_json::Value) -> anyhow::Result<AgentS
         "error" => AgentStartupPhase::Failed,
         _ => AgentStartupPhase::ProvisioningVm,
     })
-}
-
-fn parse_agent_provider(agent: &serde_json::Value) -> anyhow::Result<Option<ProviderKind>> {
-    let Some(raw) = agent.get("provider") else {
-        return Ok(None);
-    };
-    let Some(raw) = raw.as_str() else {
-        anyhow::bail!("agent response provider was not a string");
-    };
-    match raw.trim() {
-        "incus" => Ok(Some(ProviderKind::Incus)),
-        other => anyhow::bail!("agent response provider was invalid: {other}"),
-    }
-}
-
-fn ensure_agent_matches_requested_provider(
-    agent: &serde_json::Value,
-    requested_provider: Option<ProviderKind>,
-    context: &str,
-) -> anyhow::Result<()> {
-    let Some(requested_provider) = requested_provider else {
-        return Ok(());
-    };
-    let actual_provider = parse_agent_provider(agent)?.with_context(|| {
-        format!(
-            "{context} did not include provider identity; cannot verify requested provider {:?}",
-            requested_provider
-        )
-    })?;
-    anyhow::ensure!(
-        actual_provider == requested_provider,
-        "{context} resolved to provider {:?}, expected {:?}",
-        actual_provider,
-        requested_provider
-    );
-    Ok(())
 }
 
 fn agent_startup_status_message(phase: AgentStartupPhase) -> &'static str {
@@ -2088,13 +2039,7 @@ async fn cmd_agent_chat(
     };
 
     let body = agent_provision_request(runtime);
-    let requested_provider = Some(ProviderKind::Incus);
-    let ensured = ensure_agent_idempotent(http, body.as_ref()).await?;
-    ensure_agent_matches_requested_provider(
-        &ensured.agent,
-        requested_provider,
-        "agent ensure response",
-    )?;
+    let _ensured = ensure_agent_idempotent(http, body.as_ref()).await?;
     let poll_delay = Duration::from_secs(options.poll_delay_sec);
     let mut last_state = String::new();
     let mut last_phase = Some(AgentStartupPhase::Requested);
@@ -2105,7 +2050,6 @@ async fn cmd_agent_chat(
 
     for attempt in 1..=options.poll_attempts {
         let me = call_agent_api(http, reqwest::Method::GET, AGENT_API_ME_PATH, None).await?;
-        ensure_agent_matches_requested_provider(&me, requested_provider, "agent status response")?;
         let (agent_npub, state) = parse_agent_fields(&me)?;
         let startup_phase = parse_agent_startup_phase(&me)?;
         last_state = state.clone();
@@ -2239,8 +2183,7 @@ async fn call_agent_api_raw(
         request = request
             .header("Content-Type", "application/json")
             .json(body.unwrap_or(&AgentProvisionRequest {
-                provider: Some(ProviderKind::Incus),
-                incus: Some(IncusProvisionParams::default()),
+                incus: IncusProvisionParams::default(),
             }));
     }
 
@@ -2860,39 +2803,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_agent_matches_requested_provider_accepts_matching_response() {
-        let agent = json!({
-            "agent_id": "npub1test",
-            "provider": "incus",
-            "state": "ready",
-            "startup_phase": "ready"
-        });
-        ensure_agent_matches_requested_provider(
-            &agent,
-            Some(ProviderKind::Incus),
-            "agent ensure response",
-        )
-        .expect("provider should match");
-    }
-
-    #[test]
-    fn ensure_agent_matches_requested_provider_rejects_mismatch() {
-        let agent = json!({
-            "agent_id": "npub1test",
-            "provider": "microvm",
-            "state": "ready",
-            "startup_phase": "ready"
-        });
-        let err = ensure_agent_matches_requested_provider(
-            &agent,
-            Some(ProviderKind::Incus),
-            "agent ensure response",
-        )
-        .expect_err("provider mismatch should fail");
-        assert!(err.to_string().contains("expected Incus"));
-    }
-
-    #[test]
     fn agent_chat_typed_startup_phase_drives_waiting_text() {
         let payload = json!({
             "agent_id": "npub1test",
@@ -2989,10 +2899,9 @@ mod tests {
         })
         .expect("build request");
 
-        assert_eq!(request.provider, Some(ProviderKind::Incus));
         assert_eq!(
             request.incus,
-            Some(IncusProvisionParams {
+            IncusProvisionParams {
                 endpoint: Some("https://pika-build:8443".to_string()),
                 project: Some("pika-managed-agents".to_string()),
                 profile: Some("pika-agent-dev".to_string()),
@@ -3001,7 +2910,7 @@ mod tests {
                 insecure_tls: Some(true),
                 openclaw_guest_ipv4_cidr: None,
                 openclaw_proxy_host: None,
-            })
+            }
         );
     }
 

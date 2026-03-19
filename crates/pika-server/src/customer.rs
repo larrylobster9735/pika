@@ -15,7 +15,7 @@ use crate::models::agent_allowlist::AgentAllowlistEntry;
 use crate::models::managed_environment_event::ManagedEnvironmentEvent;
 use crate::nostr_auth::{expected_host_from_headers, verify_nip98_event};
 use crate::{RequestContext, State};
-use pika_agent_control_plane::{IncusProvisionParams, ManagedVmProvisionParams, ProviderKind};
+use pika_agent_control_plane::{IncusProvisionParams, ManagedVmProvisionParams};
 
 mod openclaw;
 
@@ -61,8 +61,7 @@ mod tests {
     #[test]
     fn customer_dashboard_managed_vm_policy_is_incus_only() {
         let policy = customer_dashboard_managed_vm_policy();
-        assert_eq!(policy.provider, Some(ProviderKind::Incus));
-        assert_eq!(policy.incus, Some(IncusProvisionParams::default()));
+        assert_eq!(policy.incus, IncusProvisionParams::default());
     }
 
     #[test]
@@ -88,7 +87,6 @@ mod tests {
                 row: None,
                 app_state: Some(AgentAppState::Creating),
                 startup_phase: Some(AgentStartupPhase::ProvisioningVm),
-                runtime_kind: Some(pika_agent_control_plane::MicrovmAgentKind::Openclaw),
                 environment_exists: false,
                 status_copy: "No managed OpenClaw environment has been provisioned yet."
                     .to_string(),
@@ -250,8 +248,7 @@ fn dashboard_substrate_label(
 
 fn customer_dashboard_managed_vm_policy() -> ManagedVmProvisionParams {
     ManagedVmProvisionParams {
-        provider: Some(ProviderKind::Incus),
-        incus: Some(IncusProvisionParams::default()),
+        incus: IncusProvisionParams::default(),
     }
 }
 

@@ -6,11 +6,11 @@ use nostr_sdk::prelude::PublicKey;
 use pika_agent_control_plane::{
     GuestAcpBackend, GuestOpenclawDaemonBackend, GuestServiceBackendMode, GuestServiceKind,
     GuestServiceLaunch, GuestServiceReadinessCheck, GuestStartupArtifacts, GuestStartupPlan,
-    MicrovmAgentBackend, MicrovmAgentKind, MicrovmProvisionParams,
     SpawnerCreateVmRequest as CreateVmRequest,
     SpawnerGuestAutostartRequest as GuestAutostartRequest, SpawnerOpenClawLaunchAuth,
     SpawnerVmBackupStatus, SpawnerVmResponse as VmResponse,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use pika_agent_control_plane::{
@@ -43,6 +43,35 @@ const GET_VM_TIMEOUT: Duration = Duration::from_secs(10);
 const GET_VM_BACKUP_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const GET_OPENCLAW_LAUNCH_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_ID_HEADER: &str = "x-request-id";
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, Default)]
+pub struct MicrovmProvisionParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawner_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MicrovmAgentKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<MicrovmAgentBackend>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrovmAgentKind {
+    Pi,
+    Openclaw,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum MicrovmAgentBackend {
+    Native,
+    Acp {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exec_command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResolvedMicrovmParams {
@@ -629,7 +658,6 @@ fn guest_startup_plan(params: &ResolvedMicrovmParams) -> GuestStartupPlan {
     match (&params.kind, &params.backend) {
         (ResolvedMicrovmAgentKind::Pi, ResolvedMicrovmAgentBackend::Acp { exec_command, cwd }) => {
             GuestStartupPlan {
-                agent_kind: MicrovmAgentKind::Pi,
                 service_kind: GuestServiceKind::PikachatDaemon,
                 backend_mode: GuestServiceBackendMode::Acp,
                 daemon_state_dir: DEFAULT_DAEMON_STATE_DIR.to_string(),
@@ -650,7 +678,6 @@ fn guest_startup_plan(params: &ResolvedMicrovmParams) -> GuestStartupPlan {
             }
         }
         (ResolvedMicrovmAgentKind::Pi, ResolvedMicrovmAgentBackend::Native) => GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Pi,
             service_kind: GuestServiceKind::PikachatDaemon,
             backend_mode: GuestServiceBackendMode::Native,
             daemon_state_dir: DEFAULT_DAEMON_STATE_DIR.to_string(),
@@ -668,7 +695,6 @@ fn guest_startup_plan(params: &ResolvedMicrovmParams) -> GuestStartupPlan {
             ResolvedMicrovmAgentKind::Openclaw,
             ResolvedMicrovmAgentBackend::Acp { exec_command, cwd },
         ) => GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::OpenclawGateway,
             backend_mode: GuestServiceBackendMode::Acp,
             daemon_state_dir: DEFAULT_DAEMON_STATE_DIR.to_string(),
@@ -694,7 +720,6 @@ fn guest_startup_plan(params: &ResolvedMicrovmParams) -> GuestStartupPlan {
         },
         (ResolvedMicrovmAgentKind::Openclaw, ResolvedMicrovmAgentBackend::Native) => {
             GuestStartupPlan {
-                agent_kind: MicrovmAgentKind::Openclaw,
                 service_kind: GuestServiceKind::OpenclawGateway,
                 backend_mode: GuestServiceBackendMode::Native,
                 daemon_state_dir: DEFAULT_DAEMON_STATE_DIR.to_string(),
@@ -850,7 +875,6 @@ if [[ ! -f "$STARTUP_PLAN_PATH" ]]; then
   exit 1
 fi
 
-agent_kind="$(plan_value '.agent_kind')"
 service_kind="$(plan_value '.service_kind')"
 backend_mode="$(plan_value '.backend_mode')"
 daemon_state_dir="$(plan_value '.daemon_state_dir')"
@@ -858,6 +882,15 @@ ready_path="$(workspace_path "$(plan_value '.artifacts.ready_marker_path')")"
 failed_path="$(workspace_path "$(plan_value '.artifacts.failed_marker_path')")"
 identity_seed_path="$(workspace_path "$(plan_value '.artifacts.identity_seed_path')")"
 exit_failure_reason="$(plan_value '.exit_failure_reason')"
+
+case "$service_kind" in
+  pikachat_daemon) agent_kind="pi" ;;
+  openclaw_gateway) agent_kind="openclaw" ;;
+  *)
+    echo "[microvm-agent] unsupported service_kind $service_kind" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$daemon_state_dir"
 if [[ -f "$identity_seed_path" && ! -f "$daemon_state_dir/identity.json" ]]; then

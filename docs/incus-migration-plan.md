@@ -299,7 +299,7 @@ Current transition status:
 - the managed-agent product contract has now hard-cut to Incus + OpenClaw only
 - managed-agent request/command contracts no longer preserve the old `microvm` request shape or Pi/ACP runtime selection
 - the server routes managed-agent lifecycle calls only through the Incus provider seam
-- new managed-environment rows now persist the chosen provider identity and resolved provider config so later status/recover/launch paths do not drift with process env changes
+- `agent_instances` now persists only the resolved Incus config needed for later status, reset, recover, restore, and launch paths
 - the first Incus dev lane is now real for create, status, delete, and an image-backed guest boot path
 - the Incus dev path currently requires explicit endpoint, project, profile, storage-pool, and image-alias config, and it models each managed environment as one disposable VM root plus one attached persistent custom volume mounted at `/mnt/pika-state`
 - the first managed-agent Incus guest image is Nix-built and imported as a VM image artifact rather than assembled from host-local runner directories
@@ -350,6 +350,22 @@ Current transition status:
   compatibility layers instead of continuing to pay that tax in product-facing code
 - the customer dashboard path is now Incus-only internally, while any remaining microVM work lives
   outside the managed-agent product path
+- the final hard cut also removes the live legacy microVM teardown bridge from `pika-server`; old
+  managed-agent microVM rows and VMs must now be cleaned up manually before deploy instead of
+  staying in the live request path forever
+
+### One-Time Hard-Cut Cleanup
+
+Before deploying the schema cut that removes `agent_instances.provider`, operators should:
+
+1. Query `agent_instances` on `pika-server` for rows where `provider='microvm'` and
+   `phase in ('creating', 'ready')`.
+2. Delete those matching legacy VMs on `pika-build` via the local `vm-spawner` API.
+3. Mark those DB rows `phase='error'` with `vm_id=NULL`, or delete them outright.
+4. Deploy the hard cut only after that query returns zero active legacy rows.
+
+This is intentionally destructive. The surviving managed-agent product path is fresh
+reprovision-on-Incus, not perpetual mixed-substrate compatibility.
 
 ### Focused Simplification Debt
 

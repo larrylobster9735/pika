@@ -29,7 +29,7 @@ This lane is meant to prove:
 - cloud-init bootstrap starts the managed-agent service
 - the guest publishes readiness at `/workspace/pika-agent/service-ready.json`
 - `pika-server` reads that signal through Incus and reports `guest_ready=true`
-- Incus-backed rows keep routing to Incus later through the persisted provider config
+- Incus-backed rows keep routing to Incus later through the persisted Incus config snapshot
 
 This lane now also proves the internal coworker dashboard path:
 
@@ -180,9 +180,8 @@ The smoke API base URL must point at a `pika-server` process that is configured 
 - a dedicated canary deployment of `pika-server`
 - the real `pika-server` host with the managed-agent path configured for Incus
 
-The Incus provider expects these settings for request-scoped provisioning:
+The managed-agent API now accepts request-scoped Incus overrides directly:
 
-- `provider=incus`
 - Incus endpoint
 - Incus project
 - Incus profile
@@ -258,6 +257,62 @@ For a repeated internal dashboard check, the shortest useful loop is now:
 2. reset or recover the environment
 3. run `scripts/incus-dogfood-check.sh ...`
 4. refresh the dashboard until `state=ready` and `startup_phase=ready`
+
+## One-Time Hard-Cut Cleanup
+
+Before deploying the managed-agent hard cut that drops legacy provider identity from
+`agent_instances`, delete the remaining managed-agent microVM rows and VMs manually.
+
+1. On `pika-server`, identify active legacy managed-agent rows:
+
+```bash
+ssh root@178.156.233.63 \
+  "sudo -u pika_server psql pika_server -Atc \
+  \"select owner_npub, agent_id, vm_id, phase \
+     from agent_instances \
+    where provider = 'microvm' \
+      and phase in ('creating', 'ready') \
+ order by updated_at desc;\""
+```
+
+2. On `pika-build`, delete the corresponding legacy VMs through `vm-spawner`:
+
+```bash
+ssh root@65.108.234.158 \
+  'for vm in vm-00000003 vm-00000005; do
+     curl -fsS -X DELETE "http://127.0.0.1:8080/vms/$vm" || true
+   done'
+```
+
+Replace the VM IDs with whatever the SQL query returned. This is destructive; it removes the
+legacy managed-agent environment entirely instead of migrating it.
+
+3. Retire those DB rows on `pika-server` so the surviving Incus/OpenClaw path can reprovision
+fresh environments later:
+
+```bash
+ssh root@178.156.233.63 \
+  "sudo -u pika_server psql pika_server -c \
+  \"update agent_instances
+       set phase = 'error',
+           vm_id = null,
+           updated_at = now()
+     where provider = 'microvm'
+       and phase in ('creating', 'ready');\""
+```
+
+4. Confirm the pre-deploy cleanup is complete:
+
+```bash
+ssh root@178.156.233.63 \
+  "sudo -u pika_server psql pika_server -Atc \
+  \"select count(*) from agent_instances
+     where provider = 'microvm'
+       and phase in ('creating', 'ready');\""
+```
+
+Deploy the hard cut only once that count is `0`. After the migration lands, `agent_instances`
+will no longer retain a `provider` column for this product path.
 5. click OpenClaw and confirm the UI loads on `openclaw.api.pikachat.org`
 
 ## Incus Operational Lifecycle Model

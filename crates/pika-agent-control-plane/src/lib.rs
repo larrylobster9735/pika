@@ -53,20 +53,6 @@ pub struct AuthContext {
     pub acting_as_pubkey: Option<String>,
 }
 
-/// Internal guest-startup types retained for `pika-agent-microvm` / `vm-spawner`.
-///
-/// They are not part of the managed-agent product request contract anymore.
-#[doc(hidden)]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
-pub struct MicrovmProvisionParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spawner_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<MicrovmAgentKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<MicrovmAgentBackend>,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
 pub struct IncusProvisionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,32 +74,10 @@ pub struct IncusProvisionParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedVmProvisionParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incus: Option<IncusProvisionParams>,
-}
-
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MicrovmAgentKind {
-    Pi,
-    Openclaw,
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum MicrovmAgentBackend {
-    Native,
-    Acp {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exec_command: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-    },
+    #[serde(flatten)]
+    pub incus: IncusProvisionParams,
 }
 
 pub const GUEST_AUTOSTART_COMMAND: &str = "bash /workspace/pika-agent/start-agent.sh";
@@ -145,7 +109,6 @@ pub enum GuestServiceBackendMode {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GuestStartupPlan {
-    pub agent_kind: MicrovmAgentKind,
     pub service_kind: GuestServiceKind,
     /// Authoritative for the guest service startup contract.
     ///
@@ -173,17 +136,6 @@ impl GuestStartupPlan {
                 self.service_kind,
                 self.service.kind()
             ));
-        }
-
-        match (self.agent_kind, self.service_kind) {
-            (MicrovmAgentKind::Pi, GuestServiceKind::PikachatDaemon)
-            | (MicrovmAgentKind::Openclaw, GuestServiceKind::OpenclawGateway) => {}
-            (agent_kind, service_kind) => {
-                return Err(format!(
-                    "guest startup plan agent_kind/service_kind mismatch: {:?} vs {:?}",
-                    agent_kind, service_kind
-                ));
-            }
         }
 
         match (&self.service, self.backend_mode) {
@@ -390,16 +342,13 @@ impl GuestStartupArtifacts {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProvisionRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incus: Option<IncusProvisionParams>,
+    #[serde(flatten)]
+    pub incus: IncusProvisionParams,
 }
 
 impl AgentProvisionRequest {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
-            provider: self.provider,
             incus: self.incus.clone(),
         }
     }
@@ -425,8 +374,6 @@ pub struct SpawnerVmResponse {
     pub id: String,
     #[serde(default = "default_spawner_vm_status")]
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_kind: Option<MicrovmAgentKind>,
     #[serde(default)]
     #[serde(alias = "guest_service_ready")]
     pub startup_probe_satisfied: bool,
@@ -511,8 +458,7 @@ pub struct ProvisionCommand {
 impl ProvisionCommand {
     pub fn managed_vm_params(&self) -> ManagedVmProvisionParams {
         ManagedVmProvisionParams {
-            provider: Some(self.provider),
-            incus: self.incus.clone(),
+            incus: self.incus.clone().unwrap_or_default(),
         }
     }
 }
@@ -939,7 +885,6 @@ mod tests {
             "guest_ready": false
         }))
         .expect("decode vm response");
-        assert_eq!(decoded.agent_kind, None);
         assert!(decoded.startup_probe_satisfied);
         assert!(!decoded.guest_ready);
     }
@@ -958,7 +903,6 @@ mod tests {
     #[test]
     fn guest_startup_plan_round_trips_through_guest_autostart_request() {
         let plan = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::OpenclawGateway,
             backend_mode: GuestServiceBackendMode::Native,
             daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1006,7 +950,6 @@ mod tests {
     #[test]
     fn guest_startup_plan_validate_rejects_mismatched_service_kind() {
         let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::PikachatDaemon,
             backend_mode: GuestServiceBackendMode::Native,
             daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1033,7 +976,6 @@ mod tests {
     #[test]
     fn guest_startup_plan_validate_rejects_openclaw_native_mode_with_acp_daemon_backend() {
         let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::OpenclawGateway,
             backend_mode: GuestServiceBackendMode::Native,
             daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1066,7 +1008,6 @@ mod tests {
     #[test]
     fn guest_startup_plan_validate_rejects_non_canonical_artifact_paths() {
         let err = GuestStartupPlan {
-            agent_kind: MicrovmAgentKind::Openclaw,
             service_kind: GuestServiceKind::OpenclawGateway,
             backend_mode: GuestServiceBackendMode::Native,
             daemon_state_dir: "/root/pika-agent/openclaw".to_string(),
@@ -1097,8 +1038,7 @@ mod tests {
     #[test]
     fn agent_provision_request_round_trips_incus_backend() {
         let request = AgentProvisionRequest {
-            provider: Some(ProviderKind::Incus),
-            incus: Some(IncusProvisionParams {
+            incus: IncusProvisionParams {
                 endpoint: Some("https://incus.internal:8443".to_string()),
                 project: Some("managed-agents".to_string()),
                 profile: Some("pika-agent".to_string()),
@@ -1107,7 +1047,7 @@ mod tests {
                 insecure_tls: Some(true),
                 openclaw_guest_ipv4_cidr: Some("10.193.52.0/24".to_string()),
                 openclaw_proxy_host: Some("100.81.250.67".to_string()),
-            }),
+            },
         };
         let encoded = serde_json::to_string(&request).expect("encode request");
         let decoded: AgentProvisionRequest =
@@ -1118,43 +1058,20 @@ mod tests {
     #[test]
     fn managed_vm_params_preserve_incus_request_shape() {
         let request = AgentProvisionRequest {
-            provider: Some(ProviderKind::Incus),
-            incus: Some(IncusProvisionParams::default()),
+            incus: IncusProvisionParams::default(),
         };
 
         let managed_vm = request.managed_vm_params();
 
-        assert_eq!(managed_vm.provider, Some(ProviderKind::Incus));
         assert_eq!(managed_vm.incus, request.incus);
     }
 
     #[test]
     fn agent_provision_request_rejects_removed_legacy_fields() {
-        let err = serde_json::from_str::<AgentProvisionRequest>(
-            r#"{"provider":"incus","microvm":{"kind":"openclaw"}}"#,
-        )
-        .expect_err("removed legacy request fields must fail closed");
+        let err =
+            serde_json::from_str::<AgentProvisionRequest>(r#"{"microvm":{"kind":"openclaw"}}"#)
+                .expect_err("removed legacy request fields must fail closed");
         assert!(err.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn microvm_agent_kind_serde_uses_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&MicrovmAgentKind::Pi).unwrap(),
-            "\"pi\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MicrovmAgentKind::Openclaw).unwrap(),
-            "\"openclaw\""
-        );
-        assert_eq!(
-            serde_json::from_str::<MicrovmAgentKind>("\"pi\"").unwrap(),
-            MicrovmAgentKind::Pi
-        );
-        assert_eq!(
-            serde_json::from_str::<MicrovmAgentKind>("\"openclaw\"").unwrap(),
-            MicrovmAgentKind::Openclaw
-        );
     }
 
     #[test]

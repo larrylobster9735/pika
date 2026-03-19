@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag, TagKind};
-use pika_agent_control_plane::{
-    AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams, ProviderKind,
-};
+use pika_agent_control_plane::{AgentProvisionRequest, AgentStartupPhase, IncusProvisionParams};
 use reqwest::Method;
 use serde::Deserialize;
 
@@ -28,8 +26,6 @@ struct AgentStateResponse {
     state: AgentAppState,
     #[serde(default = "default_agent_startup_phase")]
     startup_phase: AgentStartupPhase,
-    #[serde(default, rename = "provider")]
-    _provider: Option<ProviderKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,8 +309,7 @@ fn send_progress(
 
 fn internal_managed_agent_request() -> AgentProvisionRequest {
     AgentProvisionRequest {
-        provider: Some(ProviderKind::Incus),
-        incus: Some(IncusProvisionParams::default()),
+        incus: IncusProvisionParams::default(),
     }
 }
 
@@ -905,15 +900,13 @@ mod tests {
     #[test]
     fn internal_managed_agent_request_targets_incus_for_hosted_api() {
         let request = internal_managed_agent_request();
-        assert_eq!(request.provider, Some(ProviderKind::Incus));
-        assert_eq!(request.incus, Some(IncusProvisionParams::default()));
+        assert_eq!(request.incus, IncusProvisionParams::default());
     }
 
     #[test]
     fn internal_managed_agent_request_targets_incus_for_custom_server_too() {
         let request = internal_managed_agent_request();
-        assert_eq!(request.provider, Some(ProviderKind::Incus));
-        assert_eq!(request.incus, Some(IncusProvisionParams::default()));
+        assert_eq!(request.incus, IncusProvisionParams::default());
     }
 
     #[test]
@@ -983,8 +976,7 @@ mod tests {
         assert!(captured[1].0.starts_with("GET /v1/agents/me "));
         assert!(captured[0].1.starts_with("Nostr "));
         assert!(captured[1].1.starts_with("Nostr "));
-        assert!(captured[0].2.contains("\"provider\":\"incus\""));
-        assert!(captured[0].2.contains("\"incus\":{}"));
+        assert_eq!(captured[0].2.trim(), "{}");
     }
 
     #[tokio::test]
@@ -1081,8 +1073,7 @@ mod tests {
             .iter()
             .find(|(request_line, _, _)| request_line.starts_with("POST /v1/agents/me/recover "))
             .expect("recover request");
-        assert!(recover.2.contains("\"provider\":\"incus\""));
-        assert!(recover.2.contains("\"incus\":{}"));
+        assert_eq!(recover.2.trim(), "{}");
     }
 
     #[tokio::test]
@@ -1109,7 +1100,6 @@ mod tests {
             .map_err(|_| anyhow!("mock server thread panicked"))
             .and_then(|result| result)
             .expect("collect captured requests");
-        assert!(captured[0].2.contains("\"provider\":\"incus\""));
-        assert!(captured[0].2.contains("\"incus\":{}"));
+        assert_eq!(captured[0].2.trim(), "{}");
     }
 }
