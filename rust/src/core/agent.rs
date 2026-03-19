@@ -151,9 +151,9 @@ async fn ensure_agent(
     client: &reqwest::Client,
     keys: &Keys,
     base_url: &str,
-    agent_kind: crate::state::AgentKind,
+    _agent_kind: crate::state::AgentKind,
 ) -> Result<(), AgentFlowError> {
-    let body = serde_json::to_value(internal_managed_agent_request(base_url, agent_kind))
+    let body = serde_json::to_value(internal_managed_agent_request())
         .map_err(|_| AgentFlowError::InvalidResponse)?;
     let response = send_agent_request(
         client,
@@ -235,9 +235,9 @@ async fn recover_my_agent(
     client: &reqwest::Client,
     keys: &Keys,
     base_url: &str,
-    agent_kind: crate::state::AgentKind,
+    _agent_kind: crate::state::AgentKind,
 ) -> Result<AgentStateResponse, AgentFlowError> {
-    let body = serde_json::to_value(internal_managed_agent_request(base_url, agent_kind))
+    let body = serde_json::to_value(internal_managed_agent_request())
         .map_err(|_| AgentFlowError::InvalidResponse)?;
     let response = send_agent_request(
         client,
@@ -311,10 +311,7 @@ fn send_progress(
     )));
 }
 
-fn internal_managed_agent_request(
-    _base_url: &str,
-    _agent_kind: crate::state::AgentKind,
-) -> AgentProvisionRequest {
+fn internal_managed_agent_request() -> AgentProvisionRequest {
     AgentProvisionRequest {
         provider: Some(ProviderKind::Incus),
         incus: Some(IncusProvisionParams::default()),
@@ -907,20 +904,14 @@ mod tests {
 
     #[test]
     fn internal_managed_agent_request_targets_incus_for_hosted_api() {
-        let request = internal_managed_agent_request(
-            "https://api.pikachat.org",
-            crate::state::AgentKind::Openclaw,
-        );
+        let request = internal_managed_agent_request();
         assert_eq!(request.provider, Some(ProviderKind::Incus));
         assert_eq!(request.incus, Some(IncusProvisionParams::default()));
     }
 
     #[test]
     fn internal_managed_agent_request_targets_incus_for_custom_server_too() {
-        let request = internal_managed_agent_request(
-            "http://127.0.0.1:8080",
-            crate::state::AgentKind::Openclaw,
-        );
+        let request = internal_managed_agent_request();
         assert_eq!(request.provider, Some(ProviderKind::Incus));
         assert_eq!(request.incus, Some(IncusProvisionParams::default()));
     }

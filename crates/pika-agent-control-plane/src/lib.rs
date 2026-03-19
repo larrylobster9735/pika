@@ -53,6 +53,10 @@ pub struct AuthContext {
     pub acting_as_pubkey: Option<String>,
 }
 
+/// Internal guest-startup types retained for `pika-agent-microvm` / `vm-spawner`.
+///
+/// They are not part of the managed-agent product request contract anymore.
+#[doc(hidden)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
 pub struct MicrovmProvisionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,33 +65,6 @@ pub struct MicrovmProvisionParams {
     pub kind: Option<MicrovmAgentKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<MicrovmAgentBackend>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentRuntimeKind {
-    Pi,
-    Openclaw,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum AgentRuntimeBackend {
-    Native,
-    Acp {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exec_command: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
-pub struct AgentRuntimeParams {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<AgentRuntimeKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<AgentRuntimeBackend>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
@@ -118,6 +95,7 @@ pub struct ManagedVmProvisionParams {
     pub incus: Option<IncusProvisionParams>,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MicrovmAgentKind {
@@ -125,6 +103,7 @@ pub enum MicrovmAgentKind {
     Openclaw,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum MicrovmAgentBackend {
@@ -135,42 +114,6 @@ pub enum MicrovmAgentBackend {
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
-}
-
-impl From<MicrovmAgentKind> for AgentRuntimeKind {
-    fn from(value: MicrovmAgentKind) -> Self {
-        match value {
-            MicrovmAgentKind::Pi => Self::Pi,
-            MicrovmAgentKind::Openclaw => Self::Openclaw,
-        }
-    }
-}
-
-impl From<AgentRuntimeKind> for MicrovmAgentKind {
-    fn from(value: AgentRuntimeKind) -> Self {
-        match value {
-            AgentRuntimeKind::Pi => Self::Pi,
-            AgentRuntimeKind::Openclaw => Self::Openclaw,
-        }
-    }
-}
-
-impl From<MicrovmAgentBackend> for AgentRuntimeBackend {
-    fn from(value: MicrovmAgentBackend) -> Self {
-        match value {
-            MicrovmAgentBackend::Native => Self::Native,
-            MicrovmAgentBackend::Acp { exec_command, cwd } => Self::Acp { exec_command, cwd },
-        }
-    }
-}
-
-impl From<AgentRuntimeBackend> for MicrovmAgentBackend {
-    fn from(value: AgentRuntimeBackend) -> Self {
-        match value {
-            AgentRuntimeBackend::Native => Self::Native,
-            AgentRuntimeBackend::Acp { exec_command, cwd } => Self::Acp { exec_command, cwd },
-        }
-    }
 }
 
 pub const GUEST_AUTOSTART_COMMAND: &str = "bash /workspace/pika-agent/start-agent.sh";
@@ -445,6 +388,7 @@ impl GuestStartupArtifacts {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentProvisionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
@@ -1182,6 +1126,15 @@ mod tests {
 
         assert_eq!(managed_vm.provider, Some(ProviderKind::Incus));
         assert_eq!(managed_vm.incus, request.incus);
+    }
+
+    #[test]
+    fn agent_provision_request_rejects_removed_legacy_fields() {
+        let err = serde_json::from_str::<AgentProvisionRequest>(
+            r#"{"provider":"incus","microvm":{"kind":"openclaw"}}"#,
+        )
+        .expect_err("removed legacy request fields must fail closed");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

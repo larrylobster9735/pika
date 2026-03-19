@@ -92,6 +92,7 @@ const EVENT_RESTORE_REQUESTED: &str = "restore_requested";
 const EVENT_RESTORE_SUCCEEDED: &str = "restore_succeeded";
 const EVENT_RESTORE_FAILED: &str = "restore_failed";
 const EVENT_READINESS_REFRESH_MISSING_VM: &str = "readiness_refresh_missing_vm";
+const EVENT_LEGACY_ROW_RETIRED: &str = "legacy_row_retired";
 
 #[derive(Debug)]
 pub struct AgentApiError {
@@ -163,9 +164,18 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_from_db_value_rejects_unknown_provider() {
-        let err = provider_kind_from_db_value("microvm").expect_err("unknown provider must fail");
-        assert!(err.to_string().contains("unknown managed VM provider"));
+    fn stored_provider_kind_from_db_value_tracks_legacy_microvm_rows() {
+        assert_eq!(
+            stored_provider_kind_from_db_value("microvm").expect("legacy provider"),
+            StoredManagedVmProviderKind::LegacyMicrovm
+        );
+    }
+
+    #[test]
+    fn provider_kind_from_db_value_rejects_legacy_row_provider() {
+        let err =
+            provider_kind_from_db_value("microvm").expect_err("legacy provider must fail closed");
+        assert!(err.to_string().contains("legacy managed VM provider"));
     }
 
     #[test]
@@ -608,16 +618,32 @@ struct IncusOpenClawAuthConfig {
     token: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredManagedVmProviderKind {
+    Incus,
+    LegacyMicrovm,
+}
+
 fn provider_kind_db_value(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Incus => "incus",
     }
 }
 
-fn provider_kind_from_db_value(value: &str) -> anyhow::Result<ProviderKind> {
+fn stored_provider_kind_from_db_value(value: &str) -> anyhow::Result<StoredManagedVmProviderKind> {
     match value.trim() {
-        "incus" => Ok(ProviderKind::Incus),
+        "incus" => Ok(StoredManagedVmProviderKind::Incus),
+        "microvm" => Ok(StoredManagedVmProviderKind::LegacyMicrovm),
         other => anyhow::bail!("unknown managed VM provider stored on row: {other:?}"),
+    }
+}
+
+fn provider_kind_from_db_value(value: &str) -> anyhow::Result<ProviderKind> {
+    match stored_provider_kind_from_db_value(value)? {
+        StoredManagedVmProviderKind::Incus => Ok(ProviderKind::Incus),
+        StoredManagedVmProviderKind::LegacyMicrovm => {
+            anyhow::bail!("legacy managed VM provider stored on row: \"microvm\"")
+        }
     }
 }
 
@@ -3105,13 +3131,55 @@ fn load_visible_agent_row(
 ) -> Result<Option<AgentInstance>, AgentApiError> {
     let active = AgentInstance::find_active_by_owner(conn, owner_npub)
         .map_err(|_| AgentApiError::from_code(AgentApiErrorCode::Internal))?;
+    let active = match active {
+        Some(row)
+            if stored_provider_kind_from_db_value(&row.provider).ok()
+                == Some(StoredManagedVmProviderKind::LegacyMicrovm) =>
+        {
+            retire_legacy_managed_agent_row(conn, &row)?;
+            None
+        }
+        other => other,
+    };
     let latest = if active.is_none() {
         AgentInstance::find_latest_by_owner(conn, owner_npub)
             .map_err(|_| AgentApiError::from_code(AgentApiErrorCode::Internal))?
     } else {
         None
     };
-    Ok(select_visible_agent_row(active, latest))
+    let selected = select_visible_agent_row(active, latest);
+    if selected.as_ref().is_some_and(|row| {
+        stored_provider_kind_from_db_value(&row.provider).ok()
+            == Some(StoredManagedVmProviderKind::LegacyMicrovm)
+    }) {
+        return Ok(None);
+    }
+    Ok(selected)
+}
+
+fn retire_legacy_managed_agent_row(
+    conn: &mut PgConnection,
+    row: &AgentInstance,
+) -> Result<(), AgentApiError> {
+    let retired = AgentInstance::update_phase(conn, &row.agent_id, AGENT_PHASE_ERROR, None)
+        .map_err(|_| AgentApiError::from_code(AgentApiErrorCode::Internal))?;
+    let message = "Retired a legacy microVM managed-agent row after the Incus/OpenClaw hard cut. Provision a fresh environment to continue.";
+    let _ = insert_managed_environment_event(
+        conn,
+        &retired.owner_npub,
+        Some(&retired.agent_id),
+        row.vm_id.as_deref(),
+        EVENT_LEGACY_ROW_RETIRED,
+        message,
+        None,
+    );
+    tracing::warn!(
+        owner_npub = %retired.owner_npub,
+        agent_id = %retired.agent_id,
+        legacy_vm_id = row.vm_id.as_deref().unwrap_or("<missing>"),
+        "retired legacy microvm managed-agent row after hard cut"
+    );
+    Ok(())
 }
 
 fn normalize_loaded_agent_row(
@@ -3721,6 +3789,14 @@ async fn provision_agent_for_owner(
             AgentApiError::from_code(AgentApiErrorCode::Internal).with_request_id(request_id)
         })?;
         conn.transaction::<AgentInstance, anyhow::Error, _>(|conn| {
+            if let Some(active) = AgentInstance::find_active_by_owner(conn, owner_npub)? {
+                if stored_provider_kind_from_db_value(&active.provider)?
+                    == StoredManagedVmProviderKind::LegacyMicrovm
+                {
+                    retire_legacy_managed_agent_row(conn, &active)
+                        .map_err(|_| anyhow!("failed to retire legacy managed-agent row"))?;
+                }
+            }
             let created = AgentInstance::create_with_provider(
                 conn,
                 owner_npub,
