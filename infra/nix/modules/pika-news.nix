@@ -5,13 +5,26 @@ let
   serviceUser = "pika-news";
   serviceGroup = "pika-news";
   serviceStateDir = "/var/lib/pika-news";
+  canonicalGitDir = "${serviceStateDir}/pika.git";
   adminIdentities = import ../lib/admin-identities.nix;
   tomlFormat = pkgs.formats.toml { };
+  prepareCanonicalRepo = pkgs.writeShellScript "pika-news-prepare-canonical-repo" ''
+    set -euo pipefail
+    repo=${lib.escapeShellArg canonicalGitDir}
+    if [ ! -d "$repo" ]; then
+      exit 0
+    fi
+
+    ${pkgs.coreutils}/bin/chown -R ${serviceUser}:${serviceGroup} "$repo"
+    ${pkgs.findutils}/bin/find "$repo" -type d -exec ${pkgs.coreutils}/bin/chmod 2775 {} +
+    ${pkgs.coreutils}/bin/chmod 0664 "$repo"/HEAD "$repo"/config "$repo"/description 2>/dev/null || true
+    ${pkgs.git}/bin/git --git-dir="$repo" config core.sharedRepository group
+  '';
   configFile = tomlFormat.generate "pika-news.toml" {
     repos = [ "sledtools/pika" ];
     forge_repo = {
       repo = "sledtools/pika";
-      canonical_git_dir = "${serviceStateDir}/pika.git";
+      canonical_git_dir = canonicalGitDir;
       default_branch = "master";
       mirror_remote = "github";
       mirror_poll_interval_secs = 300;
@@ -109,6 +122,7 @@ in
       Group = serviceGroup;
       WorkingDirectory = serviceStateDir;
       EnvironmentFile = [ config.sops.templates."pika-news-env".path ];
+      ExecStartPre = [ prepareCanonicalRepo ];
       ExecStart = "${pikaNewsPkg}/bin/pika-news serve --config ${configFile} --db ${serviceStateDir}/pika-news.db";
       Restart = "always";
       RestartSec = "5s";
