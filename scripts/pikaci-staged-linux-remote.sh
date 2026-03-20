@@ -31,9 +31,8 @@ prepare_snapshot_root=""
 source "$script_dir/lib/pikaci-tools.sh"
 
 export_remote_defaults() {
-  resolve_pikaci_tools "$repo_root"
+  load_pikaci_staged_linux_remote_defaults "$repo_root"
   log_pikaci_tool_resolution "staged-linux-remote"
-  eval "$("$PIKACI_BIN" staged-linux-remote-defaults)"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_BINARY="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_BINARY:-$default_ssh_binary}"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_NIX_BINARY="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_NIX_BINARY:-$default_ssh_nix_binary}"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-$default_ssh_host}"
@@ -43,8 +42,7 @@ export_remote_defaults() {
 }
 
 resolve_target() {
-  local target_name="$1"
-  eval "$("$PIKACI_BIN" staged-linux-target-info "$target_name")"
+  load_pikaci_staged_linux_target_info "$1"
 }
 
 prepare_lane() {

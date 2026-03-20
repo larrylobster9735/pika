@@ -156,7 +156,7 @@ pub enum StagedLinuxRustTarget {
     PreMergePikachatOpenclawE2e,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct StagedLinuxRustTargetConfig {
     pub target_id: &'static str,
     pub target_description: &'static str,
@@ -1435,4 +1435,47 @@ pub struct RunRecord {
     #[serde(default)]
     pub message: Option<String>,
     pub jobs: Vec<JobRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct JobLogMetadata {
+    pub id: String,
+    pub host_log_path: String,
+    pub guest_log_path: String,
+    pub host_log_exists: bool,
+    pub guest_log_exists: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct RunLogsMetadata {
+    pub run_id: String,
+    pub status: RunStatus,
+    #[serde(default)]
+    pub jobs: Vec<JobLogMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RunLifecycleEvent {
+    RunStarted {
+        run_id: String,
+        created_at: String,
+        #[serde(default)]
+        rerun_of: Option<String>,
+        #[serde(default)]
+        target_id: Option<String>,
+        #[serde(default)]
+        target_description: Option<String>,
+    },
+    JobStarted {
+        run_id: String,
+        job: Box<JobRecord>,
+    },
+    JobFinished {
+        run_id: String,
+        job: Box<JobRecord>,
+    },
+    RunFinished {
+        run: Box<RunRecord>,
+    },
 }
