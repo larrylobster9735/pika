@@ -5863,6 +5863,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "ph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "nostr",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "phf"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5931,6 +5948,7 @@ dependencies = [
  "pika-agent-control-plane",
  "pika-test-utils",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -6015,12 +6033,15 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
+ "futures",
  "globset",
  "hex",
  "hmac",
  "nostr",
+ "pikaci",
  "pulldown-cmark",
  "rand 0.8.5",
  "reqwest",
@@ -6081,7 +6102,6 @@ dependencies = [
  "ipnet",
  "nostr-sdk",
  "pika-agent-control-plane",
- "pika-agent-microvm",
  "pika-relay-profiles",
  "pika-test-utils",
  "rand 0.8.5",

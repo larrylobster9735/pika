@@ -143,21 +143,52 @@ def lane_timeout_minutes(lane_id: str) -> int:
     return 60
 
 
+def lane_entrypoint(lane: dict) -> str:
+    target = lane.get("staged_linux_target")
+    if target:
+        return f"./scripts/pikaci-staged-linux-remote.sh run {target}"
+    return lane["entrypoint"]
+
+
+def lane_command(lane: dict) -> list[str]:
+    target = lane.get("staged_linux_target")
+    if target:
+        return ["./scripts/pikaci-staged-linux-remote.sh", "run", target]
+    return list(lane["command"])
+
+
+def lane_concurrency_group(lane: dict) -> str | None:
+    explicit = lane.get("concurrency_group")
+    if explicit:
+        return explicit
+    target = lane.get("staged_linux_target")
+    if target:
+        return f"staged-linux:{target}"
+    return None
+
+
 def lane_to_matrix_entry(lane: dict, mode: str) -> dict:
-    command = list(lane["command"])
-    uses_apple_remote = any("pikaci-apple-remote.sh" in part for part in command)
+    command = lane_command(lane)
+    staged_linux_target = lane.get("staged_linux_target")
+    uses_apple_remote = any(
+        "pikaci-apple-remote.sh" in part or "pikaci-apple-github-step" in part
+        for part in command
+    )
+    uses_staged_linux = staged_linux_target is not None
     return {
         "id": lane["id"],
         "title": lane["title"],
-        "entrypoint": lane["entrypoint"],
+        "entrypoint": lane_entrypoint(lane),
         "command": command,
         "command_shell": shlex.join(command),
         "mode": mode,
-        "runner": "ubuntu-latest",
+        "runner": "ubuntu-latest" if uses_apple_remote else "blacksmith-16vcpu-ubuntu-2404",
         "timeout_minutes": lane_timeout_minutes(lane["id"]),
-        "needs_openclaw_checkout": mode == "nightly" and lane["id"] == "nightly_pikachat",
+        "needs_openclaw_checkout": lane["id"] in {"pikachat_openclaw_e2e", "nightly_pikachat"},
         "needs_gradle_cache": mode == "nightly" and lane["id"] == "nightly_pika_ui_android",
         "uses_apple_remote": uses_apple_remote,
+        "uses_staged_linux": uses_staged_linux,
+        "concurrency_group": lane_concurrency_group(lane) or lane["id"],
     }
 
 
@@ -242,7 +273,7 @@ def find_lane(manifest: dict, mode: str, lane_id: str) -> dict:
 def cmd_run(args: argparse.Namespace) -> int:
     manifest = load_manifest(manifest_path())
     lane = find_lane(manifest, args.mode, args.lane_id)
-    command = list(lane["command"])
+    command = lane_command(lane)
     print(f"running {lane['title']}: {shlex.join(command)}", flush=True)
     completed = subprocess.run(command, cwd=repo_root())
     return completed.returncode

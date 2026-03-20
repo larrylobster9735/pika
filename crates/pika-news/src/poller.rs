@@ -5,6 +5,7 @@ use crate::ci;
 use crate::ci_manifest;
 use crate::config::Config;
 use crate::forge;
+use crate::live::CiLiveUpdates;
 use crate::storage::Store;
 
 #[derive(Debug, Default)]
@@ -17,10 +18,20 @@ pub struct PollResult {
     pub queued_ci_runs: usize,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn poll_once_limited(
     store: &Store,
     config: &Config,
     max_branches: usize,
+) -> anyhow::Result<PollResult> {
+    poll_once_limited_with_updates(store, config, max_branches, None)
+}
+
+pub fn poll_once_limited_with_updates(
+    store: &Store,
+    config: &Config,
+    max_branches: usize,
+    live_updates: Option<&CiLiveUpdates>,
 ) -> anyhow::Result<PollResult> {
     let forge_repo = config
         .effective_forge_repo()
@@ -99,6 +110,9 @@ pub fn poll_once_limited(
         }
         if queued_ci {
             result.queued_ci_runs += 1;
+            if let Some(live_updates) = live_updates {
+                live_updates.branch_changed(outcome.branch_id, "run_queued");
+            }
         }
     }
 
@@ -140,6 +154,7 @@ mod tests {
                 repo: "sledtools/pika".to_string(),
                 canonical_git_dir: bare.to_str().expect("bare path").to_string(),
                 default_branch: "master".to_string(),
+                ci_concurrency: Some(2),
                 mirror_remote: None,
                 mirror_poll_interval_secs: None,
                 ci_command: vec!["just".to_string(), "pre-merge".to_string()],

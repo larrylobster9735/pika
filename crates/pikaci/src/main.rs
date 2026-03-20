@@ -1,10 +1,11 @@
 use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use pikaci::{
-    GuestCommand, JobSpec, LogKind, RunMetadata, RunOptions, RunRecord, RunStatus,
-    StagedLinuxRemoteDefaults, StagedLinuxRustLane, StagedLinuxRustTarget,
+    GuestCommand, JobSpec, LogKind, RunLifecycleEvent, RunMetadata, RunOptions, RunRecord,
+    RunStatus, StagedLinuxRemoteDefaults, StagedLinuxRustLane, StagedLinuxRustTarget,
     fulfill_prepared_output_request, gc_runs, git_changed_files, list_runs, load_logs,
-    load_run_record, record_skipped_run, rerun_jobs_with_metadata, run_jobs_with_metadata,
+    load_logs_metadata, load_run_record, record_skipped_run_with_reporter,
+    rerun_jobs_with_metadata_and_reporter, run_jobs_with_metadata_and_reporter,
     staged_linux_remote_defaults,
 };
 
@@ -28,6 +29,8 @@ enum Command {
     Run {
         #[arg(default_value = "beachhead")]
         job: String,
+        #[arg(long, value_enum, default_value = "human")]
+        output: RunOutputArg,
     },
     List,
     Gc {
@@ -40,19 +43,30 @@ enum Command {
         job: Option<String>,
         #[arg(long, value_enum, default_value = "both")]
         kind: LogKindArg,
+        #[arg(long)]
+        metadata_json: bool,
     },
     Status {
         run_id: String,
+        #[arg(long)]
+        json: bool,
     },
     FulfillPreparedOutputRequest {
         request_path: String,
     },
-    StagedLinuxRemoteDefaults,
+    StagedLinuxRemoteDefaults {
+        #[arg(long)]
+        json: bool,
+    },
     StagedLinuxTargetInfo {
         target: String,
+        #[arg(long)]
+        json: bool,
     },
     Rerun {
         run_id: String,
+        #[arg(long, value_enum, default_value = "human")]
+        output: RunOutputArg,
     },
 }
 
@@ -61,6 +75,13 @@ enum LogKindArg {
     Host,
     Guest,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RunOutputArg {
+    Human,
+    Json,
+    Jsonl,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,26 +93,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Command::Run { job } => {
+        Command::Run { job, output } => {
             let target = target_spec(&job)?;
-            let run = run_target(&options, target)?;
-            if run.jobs.is_empty() {
-                let target_id = run.target_id.as_deref().unwrap_or("-");
-                println!("{} {} {}", run.run_id, target_id, status_text(run.status));
-                if let Some(message) = &run.message {
-                    eprintln!("{message}");
-                }
-            } else {
-                for job in &run.jobs {
-                    println!("{} {} {}", run.run_id, job.id, status_text(job.status));
-                    if let Some(message) = &job.message {
-                        eprintln!("{message}");
-                    }
-                }
-            }
-            if matches!(run.status, RunStatus::Failed) {
-                std::process::exit(1);
-            }
+            exit_for_run(run_target_with_output(&options, target, output)?)?;
         }
         Command::List => {
             for run in list_runs(&options.state_root)? {
@@ -115,24 +119,38 @@ fn main() -> anyhow::Result<()> {
                 println!("{run_id}");
             }
         }
-        Command::Logs { run_id, job, kind } => {
-            let logs = load_logs(
-                &options.state_root,
-                &run_id,
-                job.as_deref(),
-                map_log_kind(kind),
-            )?;
-            if let Some(host) = logs.host {
-                println!("== host ==\n{host}");
-            }
-            if let Some(guest) = logs.guest {
-                println!("== guest ==\n{guest}");
+        Command::Logs {
+            run_id,
+            job,
+            kind,
+            metadata_json,
+        } => {
+            if metadata_json {
+                let metadata = load_logs_metadata(&options.state_root, &run_id, job.as_deref())?;
+                print_json(&metadata)?;
+            } else {
+                let logs = load_logs(
+                    &options.state_root,
+                    &run_id,
+                    job.as_deref(),
+                    map_log_kind(kind),
+                )?;
+                if let Some(host) = logs.host {
+                    println!("== host ==\n{host}");
+                }
+                if let Some(guest) = logs.guest {
+                    println!("== guest ==\n{guest}");
+                }
             }
         }
-        Command::Status { run_id } => {
+        Command::Status { run_id, json } => {
             let run = load_run_record(&options.state_root, &run_id)?;
-            for line in format_status_lines(&run) {
-                println!("{line}");
+            if json {
+                print_json(&run)?;
+            } else {
+                for line in format_status_lines(&run) {
+                    println!("{line}");
+                }
             }
         }
         Command::FulfillPreparedOutputRequest { request_path } => {
@@ -141,47 +159,40 @@ fn main() -> anyhow::Result<()> {
             println!("output={}", request.output_name);
             println!("requested_exposures={}", request.requested_exposures.len());
         }
-        Command::StagedLinuxRemoteDefaults => {
-            print_staged_linux_remote_defaults(staged_linux_remote_defaults());
+        Command::StagedLinuxRemoteDefaults { json } => {
+            if json {
+                print_json(&staged_linux_remote_defaults_json(
+                    staged_linux_remote_defaults(),
+                ))?;
+            } else {
+                print_staged_linux_remote_defaults(staged_linux_remote_defaults());
+            }
         }
-        Command::StagedLinuxTargetInfo { target } => {
+        Command::StagedLinuxTargetInfo { target, json } => {
             let target = staged_linux_target(&target)?;
             let config = target.config();
-            println!("target_id={}", config.target_id);
-            println!(
-                "target_description={}",
-                shell_escape(config.target_description)
-            );
-            println!(
-                "workspace_deps_installable={}",
-                config.workspace_deps_installable
-            );
-            println!(
-                "workspace_build_installable={}",
-                config.workspace_build_installable
-            );
-            println!("shadow_recipe={}", shell_escape(config.shadow_recipe));
-        }
-        Command::Rerun { run_id } => {
-            let previous = load_run_record(&options.state_root, &run_id)?;
-            let run = rerun_target(&options, &previous)?;
-            if run.jobs.is_empty() {
-                let target_id = run.target_id.as_deref().unwrap_or("-");
-                println!("{} {} {}", run.run_id, target_id, status_text(run.status));
-                if let Some(message) = &run.message {
-                    eprintln!("{message}");
-                }
+            if json {
+                print_json(&config)?;
             } else {
-                for job in &run.jobs {
-                    println!("{} {} {}", run.run_id, job.id, status_text(job.status));
-                    if let Some(message) = &job.message {
-                        eprintln!("{message}");
-                    }
-                }
+                println!("target_id={}", config.target_id);
+                println!(
+                    "target_description={}",
+                    shell_escape(config.target_description)
+                );
+                println!(
+                    "workspace_deps_installable={}",
+                    config.workspace_deps_installable
+                );
+                println!(
+                    "workspace_build_installable={}",
+                    config.workspace_build_installable
+                );
+                println!("shadow_recipe={}", shell_escape(config.shadow_recipe));
             }
-            if matches!(run.status, RunStatus::Failed) {
-                std::process::exit(1);
-            }
+        }
+        Command::Rerun { run_id, output } => {
+            let previous = load_run_record(&options.state_root, &run_id)?;
+            exit_for_run(rerun_target_with_output(&options, &previous, output)?)?;
         }
     }
 
@@ -216,6 +227,119 @@ fn print_staged_linux_remote_defaults(defaults: StagedLinuxRemoteDefaults) {
         "default_store_uri={}",
         shell_escape(&format!("ssh://{}", defaults.ssh_host))
     );
+}
+
+#[derive(serde::Serialize)]
+struct StagedLinuxRemoteDefaultsJson<'a> {
+    ssh_binary: &'a str,
+    ssh_nix_binary: &'a str,
+    ssh_host: &'a str,
+    remote_work_dir: &'a str,
+    remote_launcher_binary: &'a str,
+    remote_helper_binary: &'a str,
+    store_uri: String,
+}
+
+fn staged_linux_remote_defaults_json(
+    defaults: StagedLinuxRemoteDefaults,
+) -> StagedLinuxRemoteDefaultsJson<'static> {
+    StagedLinuxRemoteDefaultsJson {
+        ssh_binary: defaults.ssh_binary,
+        ssh_nix_binary: defaults.ssh_nix_binary,
+        ssh_host: defaults.ssh_host,
+        remote_work_dir: defaults.remote_work_dir,
+        remote_launcher_binary: defaults.remote_launcher_binary,
+        remote_helper_binary: defaults.remote_helper_binary,
+        store_uri: format!("ssh://{}", defaults.ssh_host),
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer_pretty(&mut locked, value).context("encode json output")?;
+    use std::io::Write as _;
+    writeln!(&mut locked).context("terminate json output")?;
+    Ok(())
+}
+
+fn print_json_line(value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, value).context("encode json line")?;
+    use std::io::Write as _;
+    writeln!(&mut locked).context("terminate json line")?;
+    Ok(())
+}
+
+fn print_run_human_summary(run: &RunRecord) {
+    if run.jobs.is_empty() {
+        let target_id = run.target_id.as_deref().unwrap_or("-");
+        println!("{} {} {}", run.run_id, target_id, status_text(run.status));
+        if let Some(message) = &run.message {
+            eprintln!("{message}");
+        }
+    } else {
+        for job in &run.jobs {
+            println!("{} {} {}", run.run_id, job.id, status_text(job.status));
+            if let Some(message) = &job.message {
+                eprintln!("{message}");
+            }
+        }
+    }
+}
+
+fn exit_for_run(run: RunRecord) -> anyhow::Result<()> {
+    if matches!(run.status, RunStatus::Failed) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_target_with_output(
+    options: &RunOptions,
+    target: TargetSpec,
+    output: RunOutputArg,
+) -> anyhow::Result<RunRecord> {
+    match output {
+        RunOutputArg::Human => {
+            let run = run_target(options, target)?;
+            print_run_human_summary(&run);
+            Ok(run)
+        }
+        RunOutputArg::Json => {
+            let run = run_target(options, target)?;
+            print_json(&run)?;
+            Ok(run)
+        }
+        RunOutputArg::Jsonl => {
+            let mut reporter = |event: RunLifecycleEvent| print_json_line(&event);
+            run_target_with_reporter(options, target, &mut reporter)
+        }
+    }
+}
+
+fn rerun_target_with_output(
+    options: &RunOptions,
+    previous: &pikaci::RunRecord,
+    output: RunOutputArg,
+) -> anyhow::Result<RunRecord> {
+    match output {
+        RunOutputArg::Human => {
+            let run = rerun_target(options, previous)?;
+            print_run_human_summary(&run);
+            Ok(run)
+        }
+        RunOutputArg::Json => {
+            let run = rerun_target(options, previous)?;
+            print_json(&run)?;
+            Ok(run)
+        }
+        RunOutputArg::Jsonl => {
+            let mut reporter = |event: RunLifecycleEvent| print_json_line(&event);
+            rerun_target_with_reporter(options, previous, &mut reporter)
+        }
+    }
 }
 
 fn staged_linux_target(target_id: &str) -> anyhow::Result<StagedLinuxRustTarget> {
@@ -531,6 +655,36 @@ fn target_spec(name: &str) -> anyhow::Result<TargetSpec> {
             "Run the staged Pika docs/contracts follow-up lane",
             &[],
             pika_followup_jobs(),
+        ),
+        "pika-rust-deps-hygiene" => single_job_target_spec(
+            "pika-rust-deps-hygiene",
+            "Run the staged Pika rust-deps-hygiene follow-up lane",
+            &[],
+            pika_followup_jobs(),
+        ),
+        "pika-core-lib-app-flows-tests" => single_job_target_spec(
+            "pika-core-lib-app-flows-tests",
+            "Run the staged pika_core lib/app_flows lane",
+            &[],
+            pika_rust_jobs(),
+        ),
+        "pika-server-package-tests" => single_job_target_spec(
+            "pika-server-package-tests",
+            "Run the staged notifications pika-server package-tests lane",
+            &[],
+            notification_jobs(),
+        ),
+        "pikachat-package-tests" => single_job_target_spec(
+            "pikachat-package-tests",
+            "Run the staged pikachat package-tests lane",
+            &[],
+            pikachat_rust_jobs(),
+        ),
+        "pikahut-clippy" => single_job_target_spec(
+            "pikahut-clippy",
+            "Run the staged fixture pikahut clippy lane",
+            &[],
+            fixture_rust_jobs(),
         ),
         "pre-merge-pikachat-apple-followup" => Ok(TargetSpec {
             id: "pre-merge-pikachat-apple-followup",
@@ -1292,7 +1446,11 @@ fn pikachat_apple_followup_jobs() -> Vec<JobSpec> {
             timeout_secs: 1800,
             writable_workspace: false,
             guest_command: GuestCommand::HostShellCommand {
-                command: "cargo clippy -p pikachat -- -D warnings",
+                command: concat!(
+                    "./scripts/apple-host-record-phase ",
+                    "pikachat-followup.pikachat-clippy rust-live-clippy -- ",
+                    "cargo clippy -p pikachat -- -D warnings"
+                ),
             },
             staged_linux_rust_lane: None,
         },
@@ -1302,7 +1460,11 @@ fn pikachat_apple_followup_jobs() -> Vec<JobSpec> {
             timeout_secs: 1800,
             writable_workspace: false,
             guest_command: GuestCommand::HostShellCommand {
-                command: "cargo clippy -p pikachat-sidecar -- -D warnings",
+                command: concat!(
+                    "./scripts/apple-host-record-phase ",
+                    "pikachat-followup.pikachat-sidecar-clippy rust-live-clippy -- ",
+                    "cargo clippy -p pikachat-sidecar -- -D warnings"
+                ),
             },
             staged_linux_rust_lane: None,
         },
@@ -1312,7 +1474,15 @@ fn pikachat_apple_followup_jobs() -> Vec<JobSpec> {
             timeout_secs: 1800,
             writable_workspace: false,
             guest_command: GuestCommand::HostShellCommand {
-                command: "cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture",
+                command: concat!(
+                    "./scripts/apple-host-record-phase ",
+                    "pikachat-followup.pikachat-ui-e2e-local-desktop rust-prepared -- bash -lc '",
+                    "if [[ -n \"${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}\" ]]; then ",
+                    "./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic ui_e2e_local_desktop --ignored --nocapture; ",
+                    "else ",
+                    "cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture; ",
+                    "fi'"
+                ),
             },
             staged_linux_rust_lane: None,
         },
@@ -1322,7 +1492,12 @@ fn pikachat_apple_followup_jobs() -> Vec<JobSpec> {
             timeout_secs: 1800,
             writable_workspace: false,
             guest_command: GuestCommand::HostShellCommand {
-                command: "npx --yes tsx --test pikachat-openclaw/openclaw/extensions/pikachat-openclaw/src/channel-behavior.test.ts",
+                command: concat!(
+                    "./scripts/apple-host-record-phase ",
+                    "pikachat-followup.pikachat-openclaw-channel-behavior js-live -- ",
+                    "npx --yes tsx --test ",
+                    "pikachat-openclaw/openclaw/extensions/pikachat-openclaw/src/channel-behavior.test.ts"
+                ),
             },
             staged_linux_rust_lane: None,
         },
@@ -1572,6 +1747,14 @@ fn tart_desktop_package_tests_job(id: &'static str, description: &'static str) -
 }
 
 fn run_target(options: &RunOptions, target: TargetSpec) -> anyhow::Result<pikaci::RunRecord> {
+    run_target_with_reporter(options, target, &mut |_| Ok(()))
+}
+
+fn run_target_with_reporter(
+    options: &RunOptions,
+    target: TargetSpec,
+    reporter: &mut dyn FnMut(RunLifecycleEvent) -> anyhow::Result<()>,
+) -> anyhow::Result<pikaci::RunRecord> {
     let changed_files = git_changed_files(&options.source_root);
     let metadata = RunMetadata {
         rerun_of: None,
@@ -1596,21 +1779,36 @@ fn run_target(options: &RunOptions, target: TargetSpec) -> anyhow::Result<pikaci
     };
 
     if target.filters.is_empty() {
-        return run_jobs_with_metadata(target.jobs.as_slice(), options, metadata);
+        return run_jobs_with_metadata_and_reporter(
+            target.jobs.as_slice(),
+            options,
+            metadata,
+            reporter,
+        );
     }
 
     let Some(changed_files) = changed_files else {
         let mut metadata = metadata;
         metadata.message =
             Some("git change detection unavailable; running lane without filtering".to_string());
-        return run_jobs_with_metadata(target.jobs.as_slice(), options, metadata);
+        return run_jobs_with_metadata_and_reporter(
+            target.jobs.as_slice(),
+            options,
+            metadata,
+            reporter,
+        );
     };
 
     if changed_files
         .iter()
         .any(|path| matches_any_filter(path, target.filters))
     {
-        return run_jobs_with_metadata(target.jobs.as_slice(), options, metadata);
+        return run_jobs_with_metadata_and_reporter(
+            target.jobs.as_slice(),
+            options,
+            metadata,
+            reporter,
+        );
     }
 
     let mut metadata = metadata;
@@ -1618,21 +1816,35 @@ fn run_target(options: &RunOptions, target: TargetSpec) -> anyhow::Result<pikaci
         "skipped; no changed files matched {} filter(s)",
         target.filters.len()
     ));
-    record_skipped_run(options, metadata)
+    record_skipped_run_with_reporter(options, metadata, reporter)
 }
 
 fn rerun_target(
     options: &RunOptions,
     previous: &pikaci::RunRecord,
 ) -> anyhow::Result<pikaci::RunRecord> {
+    rerun_target_with_reporter(options, previous, &mut |_| Ok(()))
+}
+
+fn rerun_target_with_reporter(
+    options: &RunOptions,
+    previous: &pikaci::RunRecord,
+    reporter: &mut dyn FnMut(RunLifecycleEvent) -> anyhow::Result<()>,
+) -> anyhow::Result<pikaci::RunRecord> {
     let target = target_spec_for_rerun(previous)?;
     let metadata = rerun_metadata(previous, &target);
 
     if previous.status == RunStatus::Skipped {
-        return record_skipped_run(options, metadata);
+        return record_skipped_run_with_reporter(options, metadata, reporter);
     }
 
-    rerun_jobs_with_metadata(target.jobs.as_slice(), previous, options, metadata)
+    rerun_jobs_with_metadata_and_reporter(
+        target.jobs.as_slice(),
+        previous,
+        options,
+        metadata,
+        reporter,
+    )
 }
 
 fn rerun_metadata(previous: &pikaci::RunRecord, target: &TargetSpec) -> RunMetadata {
@@ -1712,12 +1924,13 @@ fn matches_filter(path: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_status_lines, matches_any_filter, matches_filter, rerun_metadata, target_spec,
-        target_spec_for_rerun,
+        format_status_lines, matches_any_filter, matches_filter, rerun_metadata,
+        staged_linux_remote_defaults_json, target_spec, target_spec_for_rerun,
     };
     use pikaci::{
-        JobRecord, PreparedOutputConsumerKind, RemoteLinuxVmBackend, RunRecord, RunStatus,
-        RunnerKind, StagedLinuxRustLane, StagedLinuxRustTarget,
+        JobRecord, PreparedOutputConsumerKind, RemoteLinuxVmBackend, RunLifecycleEvent, RunRecord,
+        RunStatus, RunnerKind, StagedLinuxRustLane, StagedLinuxRustTarget,
+        staged_linux_remote_defaults,
     };
 
     #[test]
@@ -1884,6 +2097,46 @@ mod tests {
         assert_eq!(
             rmp.jobs[0].staged_linux_rust_lane(),
             Some(StagedLinuxRustLane::RmpInitSmokeCi)
+        );
+
+        let rust_deps = target_spec("pika-rust-deps-hygiene").expect("rust deps hygiene target");
+        assert_eq!(rust_deps.jobs.len(), 1);
+        assert_eq!(rust_deps.jobs[0].id, "pika-rust-deps-hygiene");
+        assert_eq!(
+            rust_deps.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::PikaFollowupRustDepsHygiene)
+        );
+
+        let app_flows = target_spec("pika-core-lib-app-flows-tests").expect("app flows target");
+        assert_eq!(app_flows.jobs.len(), 1);
+        assert_eq!(app_flows.jobs[0].id, "pika-core-lib-app-flows-tests");
+        assert_eq!(
+            app_flows.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::PikaCoreLibAppFlows)
+        );
+
+        let notifications = target_spec("pika-server-package-tests").expect("notifications target");
+        assert_eq!(notifications.jobs.len(), 1);
+        assert_eq!(notifications.jobs[0].id, "pika-server-package-tests");
+        assert_eq!(
+            notifications.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::NotificationsServerPackageTests)
+        );
+
+        let pikachat = target_spec("pikachat-package-tests").expect("pikachat package target");
+        assert_eq!(pikachat.jobs.len(), 1);
+        assert_eq!(pikachat.jobs[0].id, "pikachat-package-tests");
+        assert_eq!(
+            pikachat.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::PikachatPackageTests)
+        );
+
+        let fixture = target_spec("pikahut-clippy").expect("fixture target");
+        assert_eq!(fixture.jobs.len(), 1);
+        assert_eq!(fixture.jobs[0].id, "pikahut-clippy");
+        assert_eq!(
+            fixture.jobs[0].staged_linux_rust_lane(),
+            Some(StagedLinuxRustLane::FixturePikahutClippy)
         );
     }
 
@@ -2166,6 +2419,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn staged_linux_remote_defaults_json_includes_store_uri() {
+        let payload = serde_json::to_value(staged_linux_remote_defaults_json(
+            staged_linux_remote_defaults(),
+        ))
+        .expect("encode defaults json");
+        assert_eq!(payload["ssh_host"], "pika-build");
+        assert_eq!(payload["store_uri"], "ssh://pika-build");
+    }
+
+    #[test]
+    fn run_lifecycle_event_serializes_run_started_with_immediate_run_id() {
+        let payload = serde_json::to_value(RunLifecycleEvent::RunStarted {
+            run_id: "20260319T010203Z-deadbeef".to_string(),
+            created_at: "2026-03-19T01:02:03Z".to_string(),
+            rerun_of: Some("20260318T235959Z-abcdef12".to_string()),
+            target_id: Some("pre-merge-pika-rust".to_string()),
+            target_description: Some("Run staged rust lane".to_string()),
+        })
+        .expect("encode run started event");
+        assert_eq!(payload["event"], "run_started");
+        assert_eq!(payload["run_id"], "20260319T010203Z-deadbeef");
+        assert_eq!(payload["target_id"], "pre-merge-pika-rust");
+    }
+
+    #[test]
+    fn staged_linux_target_config_serializes_machine_readably() {
+        let payload = serde_json::to_value(StagedLinuxRustTarget::PreMergePikaRust.config())
+            .expect("encode target config");
+        assert_eq!(payload["target_id"], "pre-merge-pika-rust");
+        assert_eq!(
+            payload["workspace_deps_installable"],
+            ".#ci.x86_64-linux.workspaceDeps"
+        );
+        assert_eq!(
+            payload["workspace_build_installable"],
+            ".#ci.x86_64-linux.workspaceBuild"
+        );
+    }
+
     fn sample_run_record() -> RunRecord {
         RunRecord {
             run_id: "run-1".to_string(),
@@ -2196,6 +2489,7 @@ mod tests {
             changed_files: vec![],
             filters: vec![],
             message: None,
+            prepare_timings: vec![],
             jobs: vec![],
         }
     }
@@ -2214,6 +2508,7 @@ mod tests {
             finished_at: Some("2026-03-07T00:00:01Z".to_string()),
             exit_code: Some(0),
             message: Some("ok".to_string()),
+            pre_execution_prepare_duration_ms: None,
             remote_linux_vm_execution: None,
         }
     }

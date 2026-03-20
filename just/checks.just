@@ -150,8 +150,7 @@ apple-host-sanity:
         export PIKA_XCODE_INSTALL_PROMPT="${PIKA_XCODE_INSTALL_PROMPT:-0}"
         exec nix --extra-experimental-features "nix-command flakes" develop .#apple-host -c just apple-host-sanity
     fi
-    cargo run -q -p pikaci --bin pikaci -- run pre-merge-pikachat-apple-followup
-    just desktop-ui-test
+    ./scripts/apple-host-record-phase apple-host-sanity.desktop-ui-test rust-prepared -- just desktop-ui-test
     echo "apple-host-sanity complete"
 
 # Canonical nightly Apple-host bundle for the provisioned mini / future thin triggers.
@@ -167,11 +166,15 @@ apple-host-bundle:
         exec nix --extra-experimental-features "nix-command flakes" develop .#apple-host -c just apple-host-bundle
     fi
     just apple-host-sanity
-    just cli-smoke
-    just openclaw-pikachat-deterministic
-    just shared-runtime-regression
-    just ios-ui-test
-    just nightly-primal-ios-interop
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]] && [[ -x "${CARGO_TARGET_DIR:-target}/debug/pikaci" ]]; then
+      ./scripts/apple-host-record-phase apple-host-bundle.pre-merge-pikachat-apple-followup rust-live -- "${CARGO_TARGET_DIR:-target}/debug/pikaci" run pre-merge-pikachat-apple-followup
+    else
+      ./scripts/apple-host-record-phase apple-host-bundle.pre-merge-pikachat-apple-followup rust-live -- cargo run -q -p pikaci --bin pikaci -- run pre-merge-pikachat-apple-followup
+    fi
+    ./scripts/apple-host-record-phase apple-host-bundle.cli-smoke rust-prepared -- just cli-smoke
+    ./scripts/apple-host-record-phase apple-host-bundle.openclaw-pikachat-deterministic rust-prepared -- just openclaw-pikachat-deterministic
+    ./scripts/apple-host-record-phase apple-host-bundle.shared-runtime-regression rust-prepared -- just shared-runtime-regression
+    ./scripts/apple-host-record-phase apple-host-bundle.ios-ui-test apple-native -- just ios-ui-test
     echo "apple-host-bundle complete"
 
 # Deterministic HTTP control-plane contracts (mocked MicroVM spawner).
@@ -252,15 +255,31 @@ nightly-pikachat:
 
 # Nightly lane: iOS interop smoke (nostrconnect:// route + Pika bridge emission).
 nightly-primal-ios-interop:
-    cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]]; then
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-primal primal_nostrconnect_smoke --ignored --nocapture
+    else
+      cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture
+    fi
 
 # openclaw pikachat deterministic contract suite (local relay + scenarios + focused tests).
 openclaw-pikachat-deterministic:
-    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat -- --ignored --nocapture
-    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_rust_bot -- --ignored --nocapture
-    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon -- --ignored --nocapture
-    cargo test -p pikahut --test integration_deterministic openclaw_scenario_audio_echo -- --ignored --nocapture
-    PIKACHAT_TTS_FIXTURE=1 cargo test -p pikachat-sidecar daemon::tests::tts_pcm_publish_reaches_subscriber -- --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]]; then
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic openclaw_scenario_invite_and_chat --ignored --nocapture
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic openclaw_scenario_invite_and_chat_rust_bot --ignored --nocapture
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic openclaw_scenario_invite_and_chat_daemon --ignored --nocapture
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic openclaw_scenario_audio_echo --ignored --nocapture
+      PIKACHAT_TTS_FIXTURE=1 ./scripts/apple-host-run-prepared-entry pikachat-sidecar-package-tests daemon::tests::tts_pcm_publish_reaches_subscriber --nocapture
+    else
+      cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat -- --ignored --nocapture
+      cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_rust_bot -- --ignored --nocapture
+      cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon -- --ignored --nocapture
+      cargo test -p pikahut --test integration_deterministic openclaw_scenario_audio_echo -- --ignored --nocapture
+      PIKACHAT_TTS_FIXTURE=1 cargo test -p pikachat-sidecar daemon::tests::tts_pcm_publish_reaches_subscriber -- --nocapture
+    fi
     npx --yes tsx --test pikachat-openclaw/openclaw/extensions/pikachat-openclaw/src/channel-behavior.test.ts
 
 # Full OpenClaw integration lane (nightly/manual).
@@ -288,7 +307,9 @@ desktop-e2e-local:
 desktop-ui-test:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]]; then
+      ./scripts/apple-host-run-prepared-entry pika-desktop-package-tests
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
       ./tools/cargo-with-xcode test -p pika-desktop
     else
       cargo test -p pika-desktop
@@ -302,16 +323,33 @@ ios-ui-e2e-local:
 #
 # Starts its own pika-relay automatically.
 cli-smoke:
-    cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]]; then
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic cli_smoke_local --ignored --nocapture
+    else
+      cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
+    fi
 
 # Minimum shared-runtime regression set for the app / CLI / daemon extraction boundary.
 shared-runtime-regression:
-    cargo test -p pika-marmot-runtime publish_welcome_rumors_
-    cargo test -p pika-marmot-runtime create_group_and_publish_welcomes_returns_group_and_published_metadata
-    cargo test -p pikachat-sidecar init_group_uses_shared_runtime_helper_and_keeps_expiration_tag
-    cargo test -p pika_core app_background_publish_uses_shared_welcome_pairing
-    cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
-    cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon -- --ignored --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}" ]]; then
+      ./scripts/apple-host-run-prepared-entry pika-marmot-runtime-package-tests publish_welcome_rumors_
+      ./scripts/apple-host-run-prepared-entry pika-marmot-runtime-package-tests create_group_and_publish_welcomes_returns_group_and_published_metadata
+      ./scripts/apple-host-run-prepared-entry pikachat-sidecar-package-tests init_group_uses_shared_runtime_helper_and_keeps_expiration_tag
+      ./scripts/apple-host-run-prepared-entry pika-core-lib-tests app_background_publish_uses_shared_welcome_pairing
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic cli_smoke_local --ignored --nocapture
+      ./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic openclaw_scenario_invite_and_chat_daemon --ignored --nocapture
+    else
+      cargo test -p pika-marmot-runtime publish_welcome_rumors_
+      cargo test -p pika-marmot-runtime create_group_and_publish_welcomes_returns_group_and_published_metadata
+      cargo test -p pikachat-sidecar init_group_uses_shared_runtime_helper_and_keeps_expiration_tag
+      cargo test -p pika_core app_background_publish_uses_shared_welcome_pairing
+      cargo test -p pikahut --test integration_deterministic cli_smoke_local -- --ignored --nocapture
+      cargo test -p pikahut --test integration_deterministic openclaw_scenario_invite_and_chat_daemon -- --ignored --nocapture
+    fi
 
 # Quick smoke test including encrypted media upload/download over Blossom.
 #

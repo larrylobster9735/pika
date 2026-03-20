@@ -10,7 +10,7 @@ read_when:
 This matrix is the canonical ownership map for integration coverage.
 
 - Canonical execution model: integration ownership is selector-first. Most coverage lives under `crates/pikahut/tests/integration_*.rs` selectors that call `pikahut::testing` APIs and scenario modules.
-- Retained non-selector exception: some Apple-hosted lanes are intentionally still non-selector today, most notably the mini-owned nightly XCTest / interop bundle.
+- Retained non-selector exception: some platform-hosted lanes are intentionally still non-selector today, most notably nightly iOS XCTest coverage via `just ios-ui-test`.
 - Compatibility rule: `just` and shell wrappers are retained only as thin selector dispatchers unless this matrix explicitly calls out a retained non-selector lane.
 - Root aggregates and regression bundles are documented below only as non-owner entrypoints; they are not the canonical policy contract.
 - Shared-fixture pooling remains out of scope for this phase (strict fixture mode only).
@@ -66,9 +66,9 @@ Current policy note:
 | `just pre-merge-agent-contracts` | checked-in deterministic agent-contract lane | `integration_deterministic::agent_http_ensure_local`, `integration_deterministic::agent_http_cli_new_local`, `integration_deterministic::agent_http_cli_new_idempotent_local`, `integration_deterministic::agent_http_cli_new_me_recover_local`, `integration_deterministic::agent_launch_provisioning_boundary`, `integration_deterministic::agent_launch_provisioning_failure_boundary`, `integration_deterministic::agent_launch_first_reply_boundary` | deterministic | pre-merge CI-owned: `pre-merge-agent-contracts` | none | Lower-level selectors own mocked control-plane protocol mechanics; the launch selectors own provisioning UX; the first-reply selector owns the first post-launch usable-peer contract under local fixtures plus mocked vm-spawner behavior. |
 | `just nightly-pikachat` | `just openclaw-pikachat-e2e` | `integration_openclaw::openclaw_gateway_e2e` | heavy | nightly-pikachat | openclaw-repo, public-network | Canonical nightly OpenClaw selector. |
 | `just nightly-pika-e2e` | local-only call-path boundary selectors + media smoke | `integration_deterministic::call_over_local_moq_relay_boundary`, `integration_deterministic::call_with_pikachat_daemon_boundary`, `integration_deterministic::cli_smoke_media_local` | heavy | nightly-pika-e2e | public-network | Both local call boundaries are now owned directly by `pikahut` selectors. `cli_smoke_media_local` remains the public-network-dependent part of this lane. |
-| `just nightly-primal-ios-interop` | `cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture` | `integration_primal::primal_nostrconnect_smoke` | heavy | compatibility-only -> `nightly-apple-host-bundle` | host-macos, xcode, public-network | Rust scenario clones into an isolated checkout under scenario state and validates marker/log artifacts without mutating a default local repo. Nightly ownership now sits with the mini-owned Apple bundle. |
-| `just apple-host-sanity` | `cargo run -q -p pikaci --bin pikaci -- run pre-merge-pikachat-apple-followup` + `just desktop-ui-test` | retained non-selector Apple-host sanity bundle | deterministic | pre-merge CI-owned: `check-apple-host-sanity` | host-macos, xcode | Narrow blocking Apple-host sanity on the Mac mini. Keeps the existing `pre-merge-pikachat-apple-followup` contract and adds the native desktop package test as the explicit pre-merge Mac signal. |
-| `just apple-host-bundle` | `just apple-host-sanity` + `just cli-smoke` + `just openclaw-pikachat-deterministic` + `just shared-runtime-regression` + `just ios-ui-test` + `just nightly-primal-ios-interop` | retained non-selector Apple-host nightly bundle | heavy | nightly CI-owned: `nightly-apple-host-bundle` | host-macos, xcode, public-network | Canonical heavy mini-owned Apple coverage. Retains the full iOS XCTest lane and Primal interop under the remote mini wrapper instead of hosted macOS nightly jobs. The nightly bundle extends `apple-host-sanity` and does not rerun `desktop-ui-test` separately. |
+| `just nightly-primal-ios-interop` | `cargo test -p pikahut --test integration_primal primal_nostrconnect_smoke -- --ignored --nocapture` | `integration_primal::primal_nostrconnect_smoke` | heavy | manual-only | host-macos, xcode, public-network | Retained Primal iOS compatibility canary. Rust scenario clones into an isolated checkout under scenario state and validates marker/log artifacts without mutating a default local repo. Kept out of the core Apple nightly because it depends on public network, external Primal build behavior, and cross-app interop timing. |
+| `just apple-host-sanity` | `just desktop-ui-test` | retained non-selector Apple-host smoke lane | deterministic | pre-merge CI-owned: `check-apple-host-sanity` | host-macos, xcode | Tiny blocking Apple-host smoke lane on the Mac mini. Keeps the blocking Mac signal focused on the native desktop package test so pre-merge latency stays acceptable. |
+| `just apple-host-bundle` | `just apple-host-sanity` + `cargo run -q -p pikaci --bin pikaci -- run pre-merge-pikachat-apple-followup` + `just cli-smoke` + `just openclaw-pikachat-deterministic` + `just shared-runtime-regression` + `just ios-ui-test` | retained non-selector Apple-host nightly bundle | heavy | nightly CI-owned: `nightly-apple-host-bundle` | host-macos, xcode | Canonical heavy mini-owned Apple coverage. Retains the full iOS XCTest lane and the Apple-side `pikaci` follow-up and regression work under the remote mini wrapper instead of hosted macOS nightly jobs. |
 | `just primal-ios-lab` | manual tooling + selector contract | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual-only | host-macos, xcode, primal-repo | Manual lab remains intentionally non-CI. |
 | `just primal-ios-lab-patch-primal` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual-only | host-macos, primal-repo | Manual-only helper command. |
 | `just primal-ios-lab-seed-capture` | manual helper | `integration_manual::manual_primal_lab_runbook_contract` | manual | manual-only | host-macos, xcode | Manual-only helper command. |
@@ -81,7 +81,7 @@ Current policy note:
 | `tools/ui-e2e-local --platform desktop` | wrapper | `integration_deterministic::ui_e2e_local_desktop` | deterministic | compatibility-only -> `pre-merge-pikachat` | none | Thin selector launcher. |
 | `tools/interop-rust-baseline` | wrapper (default) | `integration_deterministic::interop_rust_baseline` | heavy | compatibility-only -> manual-only selector | interop-rust-repo | Thin selector launcher. |
 | `tools/interop-rust-baseline --manual` | wrapper (manual) | `integration_manual::manual_interop_rust_runbook_contract` | manual | compatibility-only -> manual-only selector | interop-rust-repo | Thin selector launcher. |
-| `tools/primal-ios-interop-nightly` | wrapper | `integration_primal::primal_nostrconnect_smoke` | heavy | compatibility-only -> `nightly-apple-host-bundle` | selector-specific capabilities | Thin selector launcher. |
+| `tools/primal-ios-interop-nightly` | wrapper | `integration_primal::primal_nostrconnect_smoke` | heavy | compatibility-only -> `just nightly-primal-ios-interop` | selector-specific capabilities | Thin selector launcher for the retained manual-only Primal compatibility smoke. |
 | `pikachat-openclaw/scripts/phase1.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat` | deterministic | compatibility-only -> `pre-merge-pikachat` | none | Thin alias to selector wrapper. |
 | `pikachat-openclaw/scripts/phase2.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_rust_bot` | deterministic | compatibility-only -> `pre-merge-pikachat` | none | Thin alias to selector wrapper. |
 | `pikachat-openclaw/scripts/phase3.sh` | wrapper | `integration_deterministic::openclaw_scenario_invite_and_chat_daemon` | deterministic | compatibility-only -> `pre-merge-pikachat` | none | Thin alias to selector wrapper. |
@@ -104,27 +104,27 @@ Current policy note:
 | `nightly-pikachat` | `integration_openclaw::openclaw_gateway_e2e` |
 | `nightly-pika-e2e` | call-path boundary selectors (`call_over_local_moq_relay_boundary`, `call_with_pikachat_daemon_boundary`, `cli_smoke_media_local`) |
 | `nightly-pika-ui-android` | Android bot/media fixture selector via `integration_deterministic::ui_e2e_local_android` |
-| `nightly-apple-host-bundle` | `just apple-host-bundle` on the Mac mini via the Apple remote wrapper; owns retained `ios-ui-test`, `nightly-primal-ios-interop`, and Apple-host regression reruns |
+| `nightly-apple-host-bundle` | `just apple-host-bundle` on the Mac mini via the Apple remote wrapper; owns retained `ios-ui-test` and Apple-host regression reruns |
 | `apple-mini-validate` | manual-only GitHub dispatch workflow that runs only `just apple-host-sanity` or `just apple-host-bundle` on the Mac mini via the Apple remote wrapper |
 | `integration-manual` | two `integration_manual` runbook selectors |
 
 Apple Silicon contract note:
-`just pre-merge-pikachat` still explicitly composes staged Linux `pre-merge-pikachat-rust` with the `pikaci` target `pre-merge-pikachat-apple-followup`, but GitHub now treats that follow-up as part of the narrower `check-apple-host-sanity` Mac policy instead of the old “all Mac coverage is nightly” blob.
+`just pre-merge-pikachat` still explicitly composes staged Linux `pre-merge-pikachat-rust` with the `pikaci` target `pre-merge-pikachat-apple-followup`, and GitHub now treats that Apple follow-up as part of the nightly `apple-host-bundle` instead of the blocking `check-apple-host-sanity` smoke lane.
 
 ## Non-Owner Entry Points
 
 | Entrypoint | Policy class | Current role |
 | --- | --- | --- |
-| `just apple-host-sanity` | pre-merge CI-owned | Narrow blocking Mac mini sanity bundle: `pre-merge-pikachat-apple-followup` plus `desktop-ui-test`. |
-| `just apple-host-bundle` | nightly CI-owned | Heavy Mac mini nightly bundle: `apple-host-sanity` plus retained iOS XCTest / Primal interop / Apple-host regression coverage. |
+| `just apple-host-sanity` | pre-merge CI-owned | Tiny blocking Mac mini smoke lane: `desktop-ui-test` only. |
+| `just apple-host-bundle` | nightly CI-owned | Heavy Mac mini nightly bundle: `apple-host-sanity` plus `pre-merge-pikachat-apple-followup`, retained iOS XCTest, and Apple-host regression coverage. |
 | `just ios-ui-test` | compatibility-only -> `nightly-apple-host-bundle` | Retained `Pika` XCTest suite on simulator. This remains real nightly coverage, but ownership now sits with the mini-owned nightly Apple bundle instead of a dedicated hosted macOS job. The default retained run excludes the flaky OpenClaw live-network UI E2E case; opt back in with `PIKA_IOS_UI_TEST_INCLUDE_OPENCLAW_E2E=1` or target it directly via `PIKA_IOS_UI_TEST_ONLY_TESTING=...`. |
 | `just android-ui-test` | advisory/convenience | Native Android instrumentation suite for manual/dev use. Current pre-merge only compiles Android test code; it does not execute this suite. |
 | `just pre-merge` | advisory/convenience | Aggregate wrapper over the blocking repo lanes; not itself the canonical enforcement map. |
 | `just nightly` | advisory/convenience | Aggregate wrapper over the current nightly recipes; not a full mirror of the GitHub nightly workflow. |
 | `just e2e-local-relay` | advisory/convenience | Manual bundle for `ios-ui-e2e-local` + `android-ui-e2e-local`; useful for humans, not a lane owner. |
-| `just nightly-primal-ios-interop` | compatibility-only -> `nightly-apple-host-bundle` | Retained Primal iOS interop smoke. Still useful directly for debugging, but nightly ownership now sits with the mini-owned Apple bundle. |
+| `just nightly-primal-ios-interop` | manual-only | Retained Primal iOS interop smoke. Keep it explicitly inventoried as manual compatibility coverage, not part of the core Apple nightly bundle. |
 | `just shared-runtime-regression` | compatibility-only -> `nightly-apple-host-bundle` | High-signal Apple-host rerun set retained inside the nightly mini bundle. |
-| `just desktop-ui-test` | compatibility-only -> `check-apple-host-sanity` | Native desktop package test retained as part of the blocking Mac mini sanity contract. |
+| `just desktop-ui-test` | compatibility-only -> `check-apple-host-sanity` | Native desktop package test retained as the entire blocking Mac mini smoke contract. |
 | `just pre-merge-apple-deterministic` | advisory/convenience | Checked-in Tart/`pikaci` Apple lane entrypoint, but not part of current GitHub pre-merge enforcement. |
 
 ## Migration Notes
@@ -135,7 +135,7 @@ Apple Silicon contract note:
 
 ## Deferred Root CI / `pikaci` Asks
 
-- The blocking Mac signal is now intentionally narrow: `check-apple-host-sanity` owns `just apple-host-sanity` on the mini, while `just pre-merge-pikachat` remains the canonical Linux-first deterministic pikachat lane.
+- The blocking Mac signal is now intentionally tiny: `check-apple-host-sanity` owns `just apple-host-sanity` on the mini, and that lane is just `desktop-ui-test` while `just pre-merge-pikachat` remains the canonical Linux-first deterministic pikachat lane.
 - The heavier retained Apple coverage moved under `nightly-apple-host-bundle`; promoting `ios-ui-e2e-local` into CI would still be a separate policy change, not a wording cleanup.
 
 ## Shared Runtime Regression Set

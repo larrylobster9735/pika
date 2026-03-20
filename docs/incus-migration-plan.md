@@ -289,18 +289,17 @@ We need:
 
 - provider-neutral naming in contracts and modules where possible
 - a clean Incus provider implementation
-- a transitional period where old `microvm` names may remain internally but no new interfaces
-  should hard-code the old model
+- clear boundaries between the managed-agent product path and any remaining non-product microVM work
 
 The goal is to prevent the rest of the app from knowing whether the backing provider is
 `microvm.nix` or Incus.
 
 Current transition status:
 
-- `ProviderKind` now has both `microvm` and `incus`
-- managed-agent request/command contracts can carry provider-neutral selection plus provider-specific params
-- the server routes managed-VM lifecycle calls through a thin provider seam, with the existing microVM backend as the default implementation
-- new managed-environment rows now persist the chosen provider identity and resolved provider config so later status/recover/launch paths do not drift with process env changes
+- the managed-agent product contract has now hard-cut to Incus + OpenClaw only
+- managed-agent request/command contracts no longer preserve the old `microvm` request shape or Pi/ACP runtime selection
+- the server routes managed-agent lifecycle calls only through the Incus provider seam
+- `agent_instances` now persists only the resolved Incus config needed for later status, reset, recover, restore, and launch paths
 - the first Incus dev lane is now real for create, status, delete, and an image-backed guest boot path
 - the Incus dev path currently requires explicit endpoint, project, profile, storage-pool, and image-alias config, and it models each managed environment as one disposable VM root plus one attached persistent custom volume mounted at `/mnt/pika-state`
 - the first managed-agent Incus guest image is Nix-built and imported as a VM image artifact rather than assembled from host-local runner directories
@@ -327,8 +326,63 @@ Current transition status:
   `boot_id` to match the guest's current `/proc/sys/kernel/random/boot_id`
 - the Incus guest image now explicitly opens the OpenClaw gateway port inside the guest so the
   host-side Incus proxy device can reach the gateway over the guest VM IP
-- server startup should remain on the microVM default provider for now, but the allowlisted
-  dashboard flow is no longer blocked on the old microVM customer path
+- the internal product path is now intentionally Incus + OpenClaw only; any remaining microVM work
+  is outside the managed-agent product path
+
+### Lessons From Real Dogfooding
+
+- reset across provider migration must destroy the old environment via the stored row provider
+  first, then reprovision using the new requested policy; otherwise the control plane tries to
+  interpret an old row through the wrong substrate
+- Incus mutating APIs may return either sync or async responses for the same logical operation, so
+  the client must accept both shapes instead of assuming one response mode
+- the current internal OpenClaw ingress works by combining:
+  - an Incus-managed host proxy port on `pika-build`
+  - a guest-side OpenClaw gateway listener
+  - guest firewall allowance for that gateway port
+- that ingress shape is tactical, not the desired long-term product shape; it works today, but it
+  still mutates per-instance proxy devices on demand and should likely be simplified later
+- guest secret injection exists today for the internal lane and currently rides the guest bootstrap
+  path; it needs a more deliberate long-term model for provenance, rotation, and auditability
+- substrate provider selection and guest runtime selection are separate concepts; the old
+  `microvm` naming leaked those together and made the internal contract harder to reason about
+- after dogfooding the internal lane, we intentionally removed the managed-agent microVM / Pi / ACP
+  compatibility layers instead of continuing to pay that tax in product-facing code
+- the customer dashboard path is now Incus-only internally, while any remaining microVM work lives
+  outside the managed-agent product path
+- the final hard cut also removes the live legacy microVM teardown bridge from `pika-server`; old
+  managed-agent microVM rows and VMs must now be cleaned up manually before deploy instead of
+  staying in the live request path forever
+
+### One-Time Hard-Cut Cleanup
+
+Before deploying the schema cut that removes `agent_instances.provider`, operators should:
+
+1. On the pre-cut schema, query `agent_instances` on `pika-server` for rows where
+   `provider='microvm'` and `phase in ('creating', 'ready')`.
+2. Record the matching `owner_npub` and `vm_id` values.
+3. Delete those matching legacy VMs on `pika-build`:
+   - if `vm-spawner` still knows about the VM, use its delete path
+   - if `vm-spawner` returns `404`, stop any lingering `microvm@<vm_id>.service` unit and remove
+     `/var/lib/microvms/<vm_id>` directly
+4. Mark those DB rows `phase='error'` with `vm_id=NULL`, or delete them outright.
+5. Deploy the hard cut only after that query returns zero active legacy rows.
+6. After the migration lands, verify that `agent_instances.provider` is gone and
+   `agent_instances.incus_config` is the surviving config column.
+
+This is intentionally destructive. The surviving managed-agent product path is fresh
+reprovision-on-Incus, not perpetual mixed-substrate compatibility.
+
+### Focused Simplification Debt
+
+The next high-signal simplification targets are:
+
+- simplify Incus OpenClaw ingress so less instance mutation happens on demand and the proxy target
+  is more static and obvious
+- decide on a deliberate guest secret injection model instead of growing more bootstrap-time env
+  stamping ad hoc
+- automate snapshot creation policy for the Incus state volume so recovery-point protection is not
+  purely operator-managed
 
 ### 2. Guest Image Pipeline
 
@@ -537,10 +591,10 @@ Current validation shape:
 
 - `pika-build` is the first real dev target for the Incus lane via the canonical builder host config plus an operator-run image import step
 - the `pika-build` role in this phase is the Incus substrate; the agent API still comes from a `pika-server` process pointed at that Incus endpoint
-- `pika-server` should continue to deploy with `microvm` as the default provider and use explicit request-scoped Incus provisioning for internal canary validation
+- `pika-server` now runs the managed-agent product path as Incus + OpenClaw only
 - the concrete operator path for this phase lives in `docs/incus-dev-lane.md`
 - internal dashboard validation now reaches real create plus ready plus OpenClaw launch/proxy on Incus; delete is still validated through the provider seam and the existing dashboard reset path because there is not yet a public v1 delete endpoint
-- we should not flip `PIKA_AGENT_VM_PROVIDER=incus` globally until the broader product surface is intentionally migrated beyond the internal dashboard lane
+- remaining microVM infrastructure work belongs to separate surfaces such as `pikaci`, not the managed-agent product path
 
 ### Phase 5: Backups, Restore, And Day-2 Operations
 
@@ -802,26 +856,75 @@ Implement a new `pikaci` executor that can:
 
 Current `pika-build` proof status:
 
-- the first real Incus path now uses an env-gated per-lane selector
-  (`PIKACI_REMOTE_LINUX_VM_INCUS_LANES`) on top of `RemoteLinuxVmBackend`
-- the first working backend shape is explicitly Incus-native:
-  build staged workspace outputs on the host, sync the snapshot to `pika-build`, create one
-  ephemeral Incus VM, import the staged output closures into the guest Nix store, run the staged
-  wrapper, pull artifacts, and delete the instance
-- this path is currently validated against bounded follow-up lanes (`pika-actionlint`,
-  `pika-doc-contracts`) on `pika-build`
+- Incus now defaults to the mixed single-host fast path on `pika-build` when
+  `PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST` points at `pika-build` or `localhost`;
+  `PIKACI_REMOTE_LINUX_VM_BACKEND=microvm` remains the rollback escape hatch, and
+  `PIKACI_REMOTE_LINUX_VM_INCUS_LANES` still exists as a narrower debug selector
+- `transfer` remains an explicit fallback via `PIKACI_REMOTE_LINUX_VM_INCUS_MODE=transfer`, and
+  the staged runtime wrappers now keep working there instead of assuming the shared host-store
+  mount exists
+- the winning backend shape is still intentionally mixed-mode rather than a whole-workdir share:
+  sync the snapshot to `pika-build`, share the snapshot plus staged Linux Rust outputs into the
+  guest as readonly `virtiofs` mounts, keep `/artifacts`, `/cargo-home`, and `/cargo-target`
+  guest-local and writable, run the staged wrapper, collect artifacts, and delete the VM
 - the Incus executor now preserves the staged-job read-only workspace contract and persists remote
   backend phase metadata even when an Incus execution fails during runtime bring-up
 - running `pikaci` on `pika-build` itself still needs a localhost fast path instead of SSH for the
   remote work-dir seam, because self-SSH is not guaranteed there
-- the first explicit single-host shared-mount experiment is implemented behind
-  `PIKACI_REMOTE_LINUX_VM_INCUS_MODE=single_host_shared`, but it is not yet a passing dataplane on
-  `pika-build`: Incus VM start currently fails while attaching the shared disk device with QEMU
-  `vhost-user-fs-pci`/virtiofs slot errors, even after shortening instance names and reducing the
-  share set
-- the same on-host validation flow still does not produce a clean microVM comparison baseline yet;
-  the existing remote runner-flake path fails earlier when `pikaci` itself is executed on
-  `pika-build`
+- validated successful Incus runs on `pika-build` now include:
+  `pika-actionlint`, `pika-doc-contracts`, `pika-rust-deps-hygiene`, `pre-merge-pika-rust`,
+  `pre-merge-notifications`, `pre-merge-fixture-rust`, `pre-merge-rmp`,
+  `pre-merge-pikachat-rust`, and the full `pre-merge-pika-followup` target
+  (`pika-android-test-compile`, `pikachat-build`, `pika-desktop-check`, `pika-actionlint`,
+  `pika-doc-contracts`, `pika-rust-deps-hygiene`)
+- `run.json` now records prepare-node timing outside the remote-execution seam, so comparisons can
+  separate total wall time from pre-execution prepare work and executor-local phases
+- current measurements on `pika-build` are:
+  - `pika-actionlint` transfer Incus: about `155s` wall, about `102s` pre-execution prepare, about
+    `51.7s` Incus `prepare_runtime`
+  - `pika-actionlint` fast-path Incus: about `32s` wall, about `7.9s` pre-execution prepare, about
+    `22.2s` Incus `prepare_runtime`
+  - `pika-actionlint` microVM: about `21s` wall, about `14.9s` pre-execution prepare, about `5.5s`
+    guest wait time, so the current smallest-lane comparison no longer supports the old claim that
+    Incus is simply faster than microVM on this host
+  - `pika-doc-contracts` transfer Incus: about `67s` wall, about `8.3s` pre-execution prepare,
+    about `56.3s` Incus `prepare_runtime`
+  - `pika-doc-contracts` fast-path Incus: about `40s` wall, about `8.9s` pre-execution prepare,
+    about `28.6s` Incus `prepare_runtime`
+  - `pika-rust-deps-hygiene` fast-path Incus: about `49s` wall, about `14.1s` pre-execution
+    prepare, about `31.7s` Incus `prepare_runtime`
+  - full `pre-merge-pika-followup` fast-path Incus target: about `95s` wall for six passing jobs,
+    with about `17.0s` total shared prepare time before execution and per-job Incus
+    `prepare_runtime` mostly in the `22s` to `28s` range
+- the old staged workspace-deps blockers are now fixed at the shared reduced-workspace layer:
+  the reduced `pika-core` and `rmp` lockfiles were stale, the reduced `pika-core` source omitted
+  `tests/support` and `config/channels.json`, notifications needed the same bindgen environment as
+  the other desktop-linked lanes, the localhost Incus fast path needed to repoint staged-output
+  symlinks plus expose the host `/nix/store` into the guest for staged runtime wrappers, and the
+  follow-up `cargo machete` check needed to ignore CI fixture manifests under `nix/ci`
+- the staged `pre-merge-rmp` parity blocker is now fixed end-to-end: the reduced RMP workspace now
+  mirrors the generated template dependency surface closely enough for offline Cargo vendor checks,
+  and both fast-path Incus and `transfer` fallback runs reach a passing `rmp-init-smoke-ci`
+- the current remaining blockers are no longer in the Incus executor dataplane:
+  - `pre-merge-agent-contracts` is still red, but it no longer belongs in the
+    Incus-parity bucket:
+    `cargo test -p pika-agent-microvm --lib` passes again, and the remaining
+    `agent_http_ensure_local` failure now reproduces locally before any guest
+    bootstrap because `pika-server` rejects the request with
+    `missing incus.endpoint; set request.incus.endpoint or PIKA_AGENT_INCUS_ENDPOINT`
+    while that deterministic test still only seeds the legacy mock
+    `PIKA_AGENT_MICROVM_SPAWNER_URL` path
+  - `pre-merge-pikachat-openclaw-e2e` still fails on Incus, but the blocker is
+    now precise:
+    the guest-local Node runtime works, the old `libsimdjson.so.29` and
+    `Cannot find module 'hasown'` crashes are gone, and the staged scenario now
+    proves the real remaining gap is account startup in the packaged gateway
+    path because repeated `pikachat --remote ... publish-kp` attempts fail with
+    `connect to daemon .../daemon.sock` `No such file or directory`
+- because of that, the current honest migration read is:
+  staged Linux on `pika-build` now defaults to Incus for the green branch targets, with two
+  explicit automatic-default exclusions still kept off the Incus path:
+  `pre-merge-agent-contracts` and `pre-merge-pikachat-openclaw-e2e`
 
 #### Phase C: Validate Performance And Developer Experience
 

@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, NaiveTime, Utc};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use crate::branch_store::{PendingBranchCiLaneJob, PendingNightlyLaneJob, CI_LANE_LEASE_LOST};
 use crate::ci_manifest::{self, ForgeCiManifest};
 use crate::config::Config;
 use crate::forge;
+use crate::live::CiLiveUpdates;
 use crate::storage::Store;
 
 pub const FORGE_LANE_MANIFEST_PATH: &str = "ci/forge-lanes.toml";
@@ -19,6 +22,18 @@ pub struct CiPassResult {
     pub failed: usize,
     pub nightlies_scheduled: usize,
     pub retries_recovered: usize,
+}
+
+#[derive(Debug)]
+enum ClaimedLaneJob {
+    Branch(PendingBranchCiLaneJob),
+    Nightly(PendingNightlyLaneJob),
+}
+
+#[derive(Debug, Default)]
+struct LaneJobOutcome {
+    succeeded: usize,
+    failed: usize,
 }
 
 pub fn load_manifest_from_default_branch(
@@ -43,12 +58,22 @@ fn load_manifest_at_ref(
     ci_manifest::parse_manifest(&raw)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_ci_pass(store: &Store, config: &Config) -> anyhow::Result<CiPassResult> {
+    run_ci_pass_with_updates(store, config, None)
+}
+
+pub fn run_ci_pass_with_updates(
+    store: &Store,
+    config: &Config,
+    live_updates: Option<&CiLiveUpdates>,
+) -> anyhow::Result<CiPassResult> {
     run_ci_pass_with_timing(
         store,
         config,
         Duration::from_secs(CI_LANE_HEARTBEAT_INTERVAL_SECS),
         CI_LANE_LEASE_SECS,
+        live_updates,
     )
 }
 
@@ -57,8 +82,16 @@ fn run_ci_pass_with_timing(
     config: &Config,
     heartbeat_interval: Duration,
     lease_secs: u64,
+    live_updates: Option<&CiLiveUpdates>,
 ) -> anyhow::Result<CiPassResult> {
-    run_ci_pass_with_timing_at(store, config, heartbeat_interval, lease_secs, Utc::now())
+    run_ci_pass_with_timing_at(
+        store,
+        config,
+        heartbeat_interval,
+        lease_secs,
+        Utc::now(),
+        live_updates,
+    )
 }
 
 fn run_ci_pass_with_timing_at(
@@ -67,10 +100,12 @@ fn run_ci_pass_with_timing_at(
     heartbeat_interval: Duration,
     lease_secs: u64,
     now: DateTime<Utc>,
+    live_updates: Option<&CiLiveUpdates>,
 ) -> anyhow::Result<CiPassResult> {
     let Some(forge_repo) = config.effective_forge_repo() else {
         return Ok(CiPassResult::default());
     };
+    let ci_concurrency = forge_repo.ci_concurrency.filter(|limit| *limit > 0);
 
     let mut result = CiPassResult {
         retries_recovered: store
@@ -86,82 +121,115 @@ fn run_ci_pass_with_timing_at(
         result.nightlies_scheduled = *nightlies_scheduled;
     }
 
-    drain_nightly_jobs(
-        store,
-        &forge_repo,
-        heartbeat_interval,
-        lease_secs,
-        &mut result,
-    )?;
-    drain_branch_jobs(
-        store,
-        &forge_repo,
-        heartbeat_interval,
-        lease_secs,
-        &mut result,
-    )?;
+    let (tx, rx) = mpsc::channel::<anyhow::Result<LaneJobOutcome>>();
+    let mut active_workers = 0_usize;
+
+    loop {
+        while has_capacity(ci_concurrency, active_workers) {
+            let claim_limit = next_claim_limit(store, ci_concurrency, active_workers)?;
+            if claim_limit == 0 {
+                break;
+            }
+            let claimed_jobs = claim_lane_jobs(store, lease_secs, claim_limit)?;
+            if claimed_jobs.is_empty() {
+                break;
+            }
+            for job in claimed_jobs {
+                result.claimed += 1;
+                active_workers += 1;
+                let store = store.clone();
+                let forge_repo = forge_repo.clone();
+                let tx = tx.clone();
+                let live_updates = live_updates.cloned();
+                match &job {
+                    ClaimedLaneJob::Branch(job) => {
+                        if let Some(live_updates) = live_updates.as_ref() {
+                            live_updates.branch_changed(job.branch_id, "lane_claimed");
+                        }
+                    }
+                    ClaimedLaneJob::Nightly(job) => {
+                        if let Some(live_updates) = live_updates.as_ref() {
+                            live_updates.nightly_changed(job.nightly_run_id, "lane_claimed");
+                        }
+                    }
+                }
+                thread::spawn(move || {
+                    let outcome = match job {
+                        ClaimedLaneJob::Branch(job) => execute_branch_job(
+                            &store,
+                            &forge_repo,
+                            job,
+                            heartbeat_interval,
+                            lease_secs,
+                            live_updates.clone(),
+                        ),
+                        ClaimedLaneJob::Nightly(job) => execute_nightly_job(
+                            &store,
+                            &forge_repo,
+                            job,
+                            heartbeat_interval,
+                            lease_secs,
+                            live_updates.clone(),
+                        ),
+                    };
+                    let _ = tx.send(outcome);
+                });
+            }
+        }
+
+        if active_workers == 0 {
+            break;
+        }
+
+        let outcome = rx.recv().context("wait for ci lane worker")??;
+        active_workers -= 1;
+        result.succeeded += outcome.succeeded;
+        result.failed += outcome.failed;
+    }
 
     nightly_schedule_result?;
 
     Ok(result)
 }
 
-fn drain_branch_jobs(
+fn claim_lane_jobs(
     store: &Store,
-    forge_repo: &crate::config::ForgeRepoConfig,
-    heartbeat_interval: Duration,
     lease_secs: u64,
-    result: &mut CiPassResult,
-) -> anyhow::Result<()> {
-    loop {
-        let branch_jobs = store
-            .claim_pending_branch_ci_lane_runs(1, lease_secs)
-            .context("claim pending branch ci lanes")?;
-        if branch_jobs.is_empty() {
-            break;
-        }
-        for job in branch_jobs {
-            result.claimed += 1;
-            execute_branch_job(
-                store,
-                forge_repo,
-                job,
-                heartbeat_interval,
-                lease_secs,
-                result,
-            )?;
-        }
+    available_slots: usize,
+) -> anyhow::Result<Vec<ClaimedLaneJob>> {
+    if available_slots == 0 {
+        return Ok(Vec::new());
     }
-    Ok(())
+    let mut jobs = Vec::new();
+    let nightly_jobs = store
+        .claim_pending_nightly_lane_runs(available_slots, lease_secs)
+        .context("claim pending nightly lanes")?;
+    jobs.extend(nightly_jobs.into_iter().map(ClaimedLaneJob::Nightly));
+    if jobs.len() < available_slots {
+        let branch_jobs = store
+            .claim_pending_branch_ci_lane_runs(available_slots - jobs.len(), lease_secs)
+            .context("claim pending branch ci lanes")?;
+        jobs.extend(branch_jobs.into_iter().map(ClaimedLaneJob::Branch));
+    }
+    Ok(jobs)
 }
 
-fn drain_nightly_jobs(
-    store: &Store,
-    forge_repo: &crate::config::ForgeRepoConfig,
-    heartbeat_interval: Duration,
-    lease_secs: u64,
-    result: &mut CiPassResult,
-) -> anyhow::Result<()> {
-    loop {
-        let nightly_jobs = store
-            .claim_pending_nightly_lane_runs(1, lease_secs)
-            .context("claim pending nightly lanes")?;
-        if nightly_jobs.is_empty() {
-            break;
-        }
-        for job in nightly_jobs {
-            result.claimed += 1;
-            execute_nightly_job(
-                store,
-                forge_repo,
-                job,
-                heartbeat_interval,
-                lease_secs,
-                result,
-            )?;
-        }
+fn has_capacity(ci_concurrency: Option<usize>, active_workers: usize) -> bool {
+    match ci_concurrency {
+        Some(limit) => active_workers < limit,
+        None => true,
     }
-    Ok(())
+}
+
+fn next_claim_limit(
+    store: &Store,
+    ci_concurrency: Option<usize>,
+    active_workers: usize,
+) -> anyhow::Result<usize> {
+    match ci_concurrency {
+        Some(limit) => Ok(limit.saturating_sub(active_workers)),
+        None => store.count_queued_ci_lane_runs(),
+    }
 }
 
 fn execute_branch_job(
@@ -170,14 +238,30 @@ fn execute_branch_job(
     job: PendingBranchCiLaneJob,
     heartbeat_interval: Duration,
     lease_secs: u64,
-    result: &mut CiPassResult,
-) -> anyhow::Result<()> {
+    live_updates: Option<CiLiveUpdates>,
+) -> anyhow::Result<LaneJobOutcome> {
     let exec = forge::run_ci_command_for_head_with_heartbeat(
         forge_repo,
         &job.source_head_sha,
         &job.command,
         heartbeat_interval,
         || store.heartbeat_branch_ci_lane_run(job.lane_run_id, job.claim_token, lease_secs),
+        |event| {
+            match event {
+                forge::CiExecutionEvent::PikaciRunStarted { run_id, target_id } => {
+                    store.record_branch_ci_lane_pikaci_run(
+                        job.lane_run_id,
+                        job.claim_token,
+                        &run_id,
+                        target_id.as_deref(),
+                    )?;
+                    if let Some(live_updates) = live_updates.as_ref() {
+                        live_updates.branch_changed(job.branch_id, "pikaci_run_started");
+                    }
+                }
+            }
+            Ok(())
+        },
     )
     .with_context(|| {
         format!(
@@ -185,6 +269,7 @@ fn execute_branch_job(
             job.lane_id, job.branch_id
         )
     });
+    let mut outcome = LaneJobOutcome::default();
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
@@ -195,35 +280,41 @@ fn execute_branch_job(
                 &exec.log,
             ) {
                 Ok(()) => {}
-                Err(err) if is_lease_lost(&err) => return Ok(()),
+                Err(err) if is_lease_lost(&err) => return Ok(outcome),
                 Err(err) => {
                     return Err(err)
                         .with_context(|| format!("persist branch lane result {}", job.lane_run_id))
                 }
             }
             if exec.success {
-                result.succeeded += 1;
+                outcome.succeeded += 1;
             } else {
-                result.failed += 1;
+                outcome.failed += 1;
+            }
+            if let Some(live_updates) = live_updates.as_ref() {
+                live_updates.branch_changed(job.branch_id, "lane_finished");
             }
         }
-        Err(err) if is_lease_lost(&err) => return Ok(()),
+        Err(err) if is_lease_lost(&err) => return Ok(outcome),
         Err(err) => {
             let log = format!("ci runner error: {}", err);
             match store.finish_branch_ci_lane_run(job.lane_run_id, job.claim_token, "failed", &log)
             {
                 Ok(()) => {}
-                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(()),
+                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(outcome),
                 Err(finish_err) => {
                     return Err(finish_err).with_context(|| {
                         format!("persist branch lane failure {}", job.lane_run_id)
                     })
                 }
             }
-            result.failed += 1;
+            outcome.failed += 1;
+            if let Some(live_updates) = live_updates.as_ref() {
+                live_updates.branch_changed(job.branch_id, "lane_finished");
+            }
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn execute_nightly_job(
@@ -232,14 +323,30 @@ fn execute_nightly_job(
     job: PendingNightlyLaneJob,
     heartbeat_interval: Duration,
     lease_secs: u64,
-    result: &mut CiPassResult,
-) -> anyhow::Result<()> {
+    live_updates: Option<CiLiveUpdates>,
+) -> anyhow::Result<LaneJobOutcome> {
     let exec = forge::run_ci_command_for_head_with_heartbeat(
         forge_repo,
         &job.source_head_sha,
         &job.command,
         heartbeat_interval,
         || store.heartbeat_nightly_lane_run(job.lane_run_id, job.claim_token, lease_secs),
+        |event| {
+            match event {
+                forge::CiExecutionEvent::PikaciRunStarted { run_id, target_id } => {
+                    store.record_nightly_lane_pikaci_run(
+                        job.lane_run_id,
+                        job.claim_token,
+                        &run_id,
+                        target_id.as_deref(),
+                    )?;
+                    if let Some(live_updates) = live_updates.as_ref() {
+                        live_updates.nightly_changed(job.nightly_run_id, "pikaci_run_started");
+                    }
+                }
+            }
+            Ok(())
+        },
     )
     .with_context(|| {
         format!(
@@ -247,13 +354,14 @@ fn execute_nightly_job(
             job.lane_id, job.nightly_run_id
         )
     });
+    let mut outcome = LaneJobOutcome::default();
     match exec {
         Ok(exec) => {
             let status = if exec.success { "success" } else { "failed" };
             match store.finish_nightly_lane_run(job.lane_run_id, job.claim_token, status, &exec.log)
             {
                 Ok(()) => {}
-                Err(err) if is_lease_lost(&err) => return Ok(()),
+                Err(err) if is_lease_lost(&err) => return Ok(outcome),
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!("persist nightly lane result {}", job.lane_run_id)
@@ -261,27 +369,33 @@ fn execute_nightly_job(
                 }
             }
             if exec.success {
-                result.succeeded += 1;
+                outcome.succeeded += 1;
             } else {
-                result.failed += 1;
+                outcome.failed += 1;
+            }
+            if let Some(live_updates) = live_updates.as_ref() {
+                live_updates.nightly_changed(job.nightly_run_id, "lane_finished");
             }
         }
-        Err(err) if is_lease_lost(&err) => return Ok(()),
+        Err(err) if is_lease_lost(&err) => return Ok(outcome),
         Err(err) => {
             let log = format!("ci runner error: {}", err);
             match store.finish_nightly_lane_run(job.lane_run_id, job.claim_token, "failed", &log) {
                 Ok(()) => {}
-                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(()),
+                Err(finish_err) if is_lease_lost(&finish_err) => return Ok(outcome),
                 Err(finish_err) => {
                     return Err(finish_err).with_context(|| {
                         format!("persist nightly lane failure {}", job.lane_run_id)
                     })
                 }
             }
-            result.failed += 1;
+            outcome.failed += 1;
+            if let Some(live_updates) = live_updates.as_ref() {
+                live_updates.nightly_changed(job.nightly_run_id, "lane_finished");
+            }
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn is_lease_lost(err: &anyhow::Error) -> bool {
@@ -381,6 +495,44 @@ mod tests {
             .to_string()
     }
 
+    fn wait_for_log_line_count(
+        path: &std::path::Path,
+        expected: usize,
+        timeout: Duration,
+    ) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents.lines().count() >= expected {
+                    return contents;
+                }
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for {expected} log lines in {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn wait_for_log_contains(path: &std::path::Path, needle: &str, timeout: Duration) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents.contains(needle) {
+                    return contents;
+                }
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for `{needle}` in {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     #[test]
     fn nightly_schedule_creates_durable_history_once_per_slot() {
         let root = tempfile::tempdir().expect("create temp root");
@@ -438,6 +590,7 @@ command = ["./nightly.sh"]
             repo: "sledtools/pika".to_string(),
             canonical_git_dir: bare.to_str().expect("bare path").to_string(),
             default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
             mirror_remote: None,
             mirror_poll_interval_secs: None,
             ci_command: vec!["just".to_string(), "pre-merge".to_string()],
@@ -535,6 +688,7 @@ nightly_schedule_utc = "08:00"
             repo: "sledtools/pika".to_string(),
             canonical_git_dir: bare.to_str().expect("bare path").to_string(),
             default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
             mirror_remote: None,
             mirror_poll_interval_secs: None,
             ci_command: vec!["just".to_string(), "pre-merge".to_string()],
@@ -592,6 +746,8 @@ nightly_schedule_utc = "08:00"
                         entrypoint: "./lane-a.sh".to_string(),
                         command: vec!["./lane-a.sh".to_string()],
                         paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
                     },
                     ForgeLane {
                         id: "lane_b".to_string(),
@@ -599,6 +755,8 @@ nightly_schedule_utc = "08:00"
                         entrypoint: "./lane-b.sh".to_string(),
                         command: vec!["./lane-b.sh".to_string()],
                         paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
                     },
                 ],
             )
@@ -615,6 +773,481 @@ nightly_schedule_utc = "08:00"
         assert_eq!(runs[0].status, "success");
         assert_eq!(runs[0].lanes.len(), 2);
         assert!(runs[0].lanes.iter().all(|lane| lane.status == "success"));
+    }
+
+    #[test]
+    fn run_ci_pass_respects_configured_parallel_branch_cap() {
+        let root = tempfile::tempdir().expect("create temp root");
+        let bare = root.path().join("pika.git");
+        let seed = root.path().join("seed");
+        let db_path = root.path().join("pika-news.db");
+
+        git(
+            root.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git(root.path(), &["init", seed.to_str().expect("seed path")]);
+        git(&seed, &["config", "user.name", "Test User"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        fs::create_dir_all(seed.join("ci")).expect("create ci dir");
+        fs::write(seed.join("README.md"), "hello\n").expect("write readme");
+        let start_log = seed.join("starts.log");
+        for script in ["lane-a.sh", "lane-b.sh", "lane-c.sh"] {
+            fs::write(
+                seed.join(script),
+                format!(
+                    "#!/usr/bin/env bash\nset -euo pipefail\necho {script} >> \"{}\"\nsleep 2\necho {script}-ok\n",
+                    start_log.display()
+                ),
+            )
+            .expect("write lane script");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for script in ["lane-a.sh", "lane-b.sh", "lane-c.sh"] {
+            let mut perms = fs::metadata(seed.join(script))
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(seed.join(script), perms).expect("chmod ci script");
+        }
+        fs::write(
+            seed.join("ci/forge-lanes.toml"),
+            "version = 1\nnightly_schedule_utc = \"08:00\"\n",
+        )
+        .expect("write manifest");
+        git(
+            &seed,
+            &[
+                "add",
+                "README.md",
+                "lane-a.sh",
+                "lane-b.sh",
+                "lane-c.sh",
+                "ci/forge-lanes.toml",
+            ],
+        );
+        git(&seed, &["commit", "-m", "initial"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", bare.to_str().expect("bare path")],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        let head_sha = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let forge_repo = ForgeRepoConfig {
+            repo: "sledtools/pika".to_string(),
+            canonical_git_dir: bare.to_str().expect("bare path").to_string(),
+            default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
+            mirror_remote: None,
+            mirror_poll_interval_secs: None,
+            ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+            hook_url: Some("http://127.0.0.1:9999/news/webhook".to_string()),
+        };
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(forge_repo.clone()),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&crate::branch_store::BranchUpsertInput {
+                repo: forge_repo.repo.clone(),
+                canonical_git_dir: forge_repo.canonical_git_dir.clone(),
+                default_branch: forge_repo.default_branch.clone(),
+                ci_entrypoint: super::FORGE_LANE_MANIFEST_PATH.to_string(),
+                branch_name: "feature/parallel-cap".to_string(),
+                title: "feature/parallel-cap".to_string(),
+                head_sha: head_sha.clone(),
+                merge_base_sha: head_sha.clone(),
+                author_name: None,
+                author_email: None,
+                updated_at: "2026-03-17T00:00:00Z".to_string(),
+            })
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                &head_sha,
+                &[
+                    ForgeLane {
+                        id: "lane_a".to_string(),
+                        title: "lane a".to_string(),
+                        entrypoint: "./lane-a.sh".to_string(),
+                        command: vec!["./lane-a.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "lane_b".to_string(),
+                        title: "lane b".to_string(),
+                        entrypoint: "./lane-b.sh".to_string(),
+                        command: vec!["./lane-b.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "lane_c".to_string(),
+                        title: "lane c".to_string(),
+                        entrypoint: "./lane-c.sh".to_string(),
+                        command: vec!["./lane-c.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                ],
+            )
+            .expect("queue branch suite");
+
+        let runner_store = store.clone();
+        let runner_config = config.clone();
+        let handle = thread::spawn(move || run_ci_pass(&runner_store, &runner_config));
+
+        let started = wait_for_log_line_count(&start_log, 2, Duration::from_secs(5));
+        assert_eq!(started.lines().count(), 2);
+
+        let result = handle.join().expect("join runner").expect("run ci pass");
+        assert_eq!(result.claimed, 3);
+        assert_eq!(result.succeeded, 3);
+    }
+
+    #[test]
+    fn run_ci_pass_starts_all_claimable_branch_lanes_when_unbounded() {
+        let root = tempfile::tempdir().expect("create temp root");
+        let bare = root.path().join("pika.git");
+        let seed = root.path().join("seed");
+        let db_path = root.path().join("pika-news.db");
+
+        git(
+            root.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git(root.path(), &["init", seed.to_str().expect("seed path")]);
+        git(&seed, &["config", "user.name", "Test User"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        fs::create_dir_all(seed.join("ci")).expect("create ci dir");
+        fs::write(seed.join("README.md"), "hello\n").expect("write readme");
+        let start_log = seed.join("starts.log");
+        for script in ["lane-a.sh", "lane-b.sh", "lane-c.sh"] {
+            fs::write(
+                seed.join(script),
+                format!(
+                    "#!/usr/bin/env bash\nset -euo pipefail\necho {script} >> \"{}\"\nsleep 2\necho {script}-ok\n",
+                    start_log.display()
+                ),
+            )
+            .expect("write lane script");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for script in ["lane-a.sh", "lane-b.sh", "lane-c.sh"] {
+            let mut perms = fs::metadata(seed.join(script))
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(seed.join(script), perms).expect("chmod ci script");
+        }
+        fs::write(
+            seed.join("ci/forge-lanes.toml"),
+            "version = 1\nnightly_schedule_utc = \"08:00\"\n",
+        )
+        .expect("write manifest");
+        git(
+            &seed,
+            &[
+                "add",
+                "README.md",
+                "lane-a.sh",
+                "lane-b.sh",
+                "lane-c.sh",
+                "ci/forge-lanes.toml",
+            ],
+        );
+        git(&seed, &["commit", "-m", "initial"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", bare.to_str().expect("bare path")],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        let head_sha = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let forge_repo = ForgeRepoConfig {
+            repo: "sledtools/pika".to_string(),
+            canonical_git_dir: bare.to_str().expect("bare path").to_string(),
+            default_branch: "master".to_string(),
+            ci_concurrency: None,
+            mirror_remote: None,
+            mirror_poll_interval_secs: None,
+            ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+            hook_url: Some("http://127.0.0.1:9999/news/webhook".to_string()),
+        };
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(forge_repo.clone()),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&crate::branch_store::BranchUpsertInput {
+                repo: forge_repo.repo.clone(),
+                canonical_git_dir: forge_repo.canonical_git_dir.clone(),
+                default_branch: forge_repo.default_branch.clone(),
+                ci_entrypoint: super::FORGE_LANE_MANIFEST_PATH.to_string(),
+                branch_name: "feature/unbounded".to_string(),
+                title: "feature/unbounded".to_string(),
+                head_sha: head_sha.clone(),
+                merge_base_sha: head_sha.clone(),
+                author_name: None,
+                author_email: None,
+                updated_at: "2026-03-17T00:00:00Z".to_string(),
+            })
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                &head_sha,
+                &[
+                    ForgeLane {
+                        id: "lane_a".to_string(),
+                        title: "lane a".to_string(),
+                        entrypoint: "./lane-a.sh".to_string(),
+                        command: vec!["./lane-a.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "lane_b".to_string(),
+                        title: "lane b".to_string(),
+                        entrypoint: "./lane-b.sh".to_string(),
+                        command: vec!["./lane-b.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "lane_c".to_string(),
+                        title: "lane c".to_string(),
+                        entrypoint: "./lane-c.sh".to_string(),
+                        command: vec!["./lane-c.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                ],
+            )
+            .expect("queue branch suite");
+
+        let runner_store = store.clone();
+        let runner_config = config.clone();
+        let handle = thread::spawn(move || run_ci_pass(&runner_store, &runner_config));
+
+        let started = wait_for_log_line_count(&start_log, 3, Duration::from_secs(5));
+        assert_eq!(started.lines().count(), 3);
+
+        let result = handle.join().expect("join runner").expect("run ci pass");
+        assert_eq!(result.claimed, 3);
+        assert_eq!(result.succeeded, 3);
+    }
+
+    #[test]
+    fn run_ci_pass_refills_parallel_slots_when_a_lane_finishes_early() {
+        let root = tempfile::tempdir().expect("create temp root");
+        let bare = root.path().join("pika.git");
+        let seed = root.path().join("seed");
+        let db_path = root.path().join("pika-news.db");
+
+        git(
+            root.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git(root.path(), &["init", seed.to_str().expect("seed path")]);
+        git(&seed, &["config", "user.name", "Test User"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        fs::create_dir_all(seed.join("ci")).expect("create ci dir");
+        fs::write(seed.join("README.md"), "hello\n").expect("write readme");
+        let start_log = seed.join("starts.log");
+        fs::write(
+            seed.join("slow.sh"),
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho slow >> \"{}\"\nsleep 3\necho slow-ok\n",
+                start_log.display()
+            ),
+        )
+        .expect("write slow script");
+        fs::write(
+            seed.join("fast-fail.sh"),
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho fast-fail >> \"{}\"\necho fail >&2\nexit 1\n",
+                start_log.display()
+            ),
+        )
+        .expect("write fast fail script");
+        fs::write(
+            seed.join("fast-ok.sh"),
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho fast-ok >> \"{}\"\necho fast-ok\n",
+                start_log.display()
+            ),
+        )
+        .expect("write fast ok script");
+        use std::os::unix::fs::PermissionsExt;
+        for script in ["slow.sh", "fast-fail.sh", "fast-ok.sh"] {
+            let mut perms = fs::metadata(seed.join(script))
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(seed.join(script), perms).expect("chmod script");
+        }
+        fs::write(
+            seed.join("ci/forge-lanes.toml"),
+            "version = 1\nnightly_schedule_utc = \"08:00\"\n",
+        )
+        .expect("write manifest");
+        git(
+            &seed,
+            &[
+                "add",
+                "README.md",
+                "slow.sh",
+                "fast-fail.sh",
+                "fast-ok.sh",
+                "ci/forge-lanes.toml",
+            ],
+        );
+        git(&seed, &["commit", "-m", "initial"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", bare.to_str().expect("bare path")],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        let head_sha = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let forge_repo = ForgeRepoConfig {
+            repo: "sledtools/pika".to_string(),
+            canonical_git_dir: bare.to_str().expect("bare path").to_string(),
+            default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
+            mirror_remote: None,
+            mirror_poll_interval_secs: None,
+            ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+            hook_url: Some("http://127.0.0.1:9999/news/webhook".to_string()),
+        };
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(forge_repo.clone()),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&crate::branch_store::BranchUpsertInput {
+                repo: forge_repo.repo.clone(),
+                canonical_git_dir: forge_repo.canonical_git_dir.clone(),
+                default_branch: forge_repo.default_branch.clone(),
+                ci_entrypoint: super::FORGE_LANE_MANIFEST_PATH.to_string(),
+                branch_name: "feature/refill".to_string(),
+                title: "feature/refill".to_string(),
+                head_sha: head_sha.clone(),
+                merge_base_sha: head_sha.clone(),
+                author_name: None,
+                author_email: None,
+                updated_at: "2026-03-17T00:00:00Z".to_string(),
+            })
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                &head_sha,
+                &[
+                    ForgeLane {
+                        id: "slow".to_string(),
+                        title: "slow".to_string(),
+                        entrypoint: "./slow.sh".to_string(),
+                        command: vec!["./slow.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "fast_fail".to_string(),
+                        title: "fast fail".to_string(),
+                        entrypoint: "./fast-fail.sh".to_string(),
+                        command: vec!["./fast-fail.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    ForgeLane {
+                        id: "fast_ok".to_string(),
+                        title: "fast ok".to_string(),
+                        entrypoint: "./fast-ok.sh".to_string(),
+                        command: vec!["./fast-ok.sh".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                ],
+            )
+            .expect("queue branch suite");
+
+        let runner_store = store.clone();
+        let runner_config = config.clone();
+        let handle = thread::spawn(move || run_ci_pass(&runner_store, &runner_config));
+
+        let started = wait_for_log_contains(&start_log, "fast-ok", Duration::from_secs(5));
+        assert!(started.contains("slow"));
+        assert!(started.contains("fast-fail"));
+        assert!(started.contains("fast-ok"));
+
+        let result = handle.join().expect("join runner").expect("run ci pass");
+        assert_eq!(result.claimed, 3);
+        assert_eq!(result.succeeded, 2);
+        assert_eq!(result.failed, 1);
+        let runs = store
+            .list_branch_ci_runs(branch.branch_id, 4)
+            .expect("list branch runs");
+        assert_eq!(runs[0].status, "failed");
+        assert!(runs[0]
+            .lanes
+            .iter()
+            .all(|lane| matches!(lane.status.as_str(), "success" | "failed")));
     }
 
     #[test]
@@ -669,6 +1302,7 @@ nightly_schedule_utc = "08:00"
             repo: "sledtools/pika".to_string(),
             canonical_git_dir: bare.to_str().expect("bare path").to_string(),
             default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
             mirror_remote: None,
             mirror_poll_interval_secs: None,
             ci_command: vec!["just".to_string(), "pre-merge".to_string()],
@@ -716,6 +1350,8 @@ nightly_schedule_utc = "08:00"
                     entrypoint: "./slow-lane.sh".to_string(),
                     command: vec!["./slow-lane.sh".to_string()],
                     paths: vec![],
+                    concurrency_group: None,
+                    staged_linux_target: None,
                 }],
             )
             .expect("queue branch suite");
@@ -723,8 +1359,14 @@ nightly_schedule_utc = "08:00"
         let runner_store = store.clone();
         let runner_config = config.clone();
         let handle = thread::spawn(move || {
-            run_ci_pass_with_timing(&runner_store, &runner_config, Duration::from_secs(1), 2)
-                .expect("run ci pass with heartbeat")
+            run_ci_pass_with_timing(
+                &runner_store,
+                &runner_config,
+                Duration::from_secs(1),
+                2,
+                None,
+            )
+            .expect("run ci pass with heartbeat")
         });
 
         thread::sleep(Duration::from_millis(2600));
@@ -813,6 +1455,7 @@ command = ["./nightly.sh"]
             repo: "sledtools/pika".to_string(),
             canonical_git_dir: bare.to_str().expect("bare path").to_string(),
             default_branch: "master".to_string(),
+            ci_concurrency: Some(2),
             mirror_remote: None,
             mirror_poll_interval_secs: None,
             ci_command: vec!["just".to_string(), "pre-merge".to_string()],
@@ -860,6 +1503,8 @@ command = ["./nightly.sh"]
                     entrypoint: "./branch-lane.sh".to_string(),
                     command: vec!["./branch-lane.sh".to_string()],
                     paths: vec![],
+                    concurrency_group: None,
+                    staged_linux_target: None,
                 }],
             )
             .expect("queue branch suite");
@@ -868,8 +1513,9 @@ command = ["./nightly.sh"]
             .with_ymd_and_hms(2026, 3, 17, 9, 30, 0)
             .single()
             .expect("fixed timestamp");
-        let result = run_ci_pass_with_timing_at(&store, &config, Duration::from_secs(1), 2, now)
-            .expect("run ci pass");
+        let result =
+            run_ci_pass_with_timing_at(&store, &config, Duration::from_secs(1), 2, now, None)
+                .expect("run ci pass");
         assert_eq!(result.nightlies_scheduled, 1);
 
         let nightly_manifest = load_manifest_from_default_branch(&forge_repo).expect("manifest");

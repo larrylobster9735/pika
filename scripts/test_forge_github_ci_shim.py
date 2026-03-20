@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 
 
@@ -24,6 +25,159 @@ def git(cwd: Path, *args: str) -> str:
 
 
 class ForgeGithubCiShimTests(unittest.TestCase):
+    def test_lane_to_matrix_entry_marks_apple_github_step_as_apple_remote(self) -> None:
+        lane = {
+            "id": "apple_host_sanity",
+            "title": "check-apple-host-sanity",
+            "entrypoint": "./scripts/pikaci-apple-github-step remote-run --just-recipe apple-host-sanity",
+            "command": [
+                "./scripts/pikaci-apple-github-step",
+                "remote-run",
+                "--just-recipe",
+                "apple-host-sanity",
+            ],
+            "concurrency_group": "apple-host",
+        }
+
+        spec = importlib.util.spec_from_file_location("forge_github_ci_shim", SCRIPT)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        shim = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(shim)
+        entry = shim.lane_to_matrix_entry(lane, "branch")
+
+        self.assertTrue(entry["uses_apple_remote"])
+        self.assertEqual(entry["runner"], "ubuntu-latest")
+        self.assertEqual(entry["concurrency_group"], "apple-host")
+
+    def test_branch_selection_narrows_apple_host_sanity_to_smoke_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(repo, "init")
+            git(repo, "config", "user.name", "Test User")
+            git(repo, "config", "user.email", "test@example.com")
+            (repo / "ci").mkdir()
+            (repo / ".github").mkdir()
+            (repo / "crates" / "pikahut" / "src").mkdir(parents=True)
+            (repo / "scripts").mkdir()
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            (repo / ".github" / "pikaci-apple.env").write_text("PIKACI_APPLE_SSH_HOST=pika-mini\n", encoding="utf-8")
+            (repo / "crates" / "pikahut" / "src" / "lib.rs").write_text("pub fn old_scope() {}\n", encoding="utf-8")
+            (repo / "scripts" / "pikaci-apple-remote.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            (repo / "ci" / "forge-lanes.toml").write_text(
+                """
+version = 1
+nightly_schedule_utc = "08:00"
+
+[[branch.lanes]]
+id = "apple_host_sanity"
+title = "check-apple-host-sanity"
+entrypoint = "./scripts/pikaci-apple-remote.sh run --just-recipe apple-host-sanity"
+command = ["./scripts/pikaci-apple-remote.sh", "run", "--just-recipe", "apple-host-sanity"]
+paths = [
+  "ci/forge-lanes.toml",
+  ".github/pikaci-apple.env",
+  "scripts/pikaci-apple-remote.sh",
+  "crates/pika-desktop/**",
+]
+
+[[branch.lanes]]
+id = "pikachat"
+title = "check-pikachat"
+entrypoint = "cargo test -p pikahut"
+command = ["cargo", "test", "-p", "pikahut"]
+paths = ["crates/pikahut/**"]
+
+[[nightly.lanes]]
+id = "nightly"
+title = "nightly"
+entrypoint = "printf nightly"
+command = ["python3", "-c", "print('nightly')"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            git(
+                repo,
+                "add",
+                "README.md",
+                ".github/pikaci-apple.env",
+                "crates/pikahut/src/lib.rs",
+                "scripts/pikaci-apple-remote.sh",
+                "ci/forge-lanes.toml",
+            )
+            git(repo, "commit", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD")
+
+            (repo / ".github" / "pikaci-apple.env").write_text(
+                "PIKACI_APPLE_SSH_HOST=pika-mini.tailnet.ts.net\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", ".github/pikaci-apple.env")
+            git(repo, "commit", "-m", "apple smoke infra change")
+            head = git(repo, "rev-parse", "HEAD")
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    "select",
+                    "--mode",
+                    "branch",
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                    "--compare-repo-root",
+                    str(repo),
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "FORGE_GITHUB_CI_REPO_ROOT": str(repo)},
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["changed_paths"], [".github/pikaci-apple.env"])
+            self.assertEqual([lane["id"] for lane in payload["include"]], ["apple_host_sanity"])
+
+            apple_env_commit = head
+            (repo / "crates" / "pikahut" / "src" / "lib.rs").write_text(
+                "pub fn old_scope() { println!(\"changed\"); }\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", "crates/pikahut/src/lib.rs")
+            git(repo, "commit", "-m", "pikahut only change")
+            head = git(repo, "rev-parse", "HEAD")
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    "select",
+                    "--mode",
+                    "branch",
+                    "--base",
+                    apple_env_commit,
+                    "--head",
+                    head,
+                    "--compare-repo-root",
+                    str(repo),
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "FORGE_GITHUB_CI_REPO_ROOT": str(repo)},
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertIn("crates/pikahut/src/lib.rs", payload["changed_paths"])
+            self.assertNotIn(
+                "apple_host_sanity",
+                [lane["id"] for lane in payload["include"]],
+            )
+
     def test_branch_selection_uses_merge_base_for_unsynced_fork_pr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -273,6 +427,135 @@ command = ["python3", "-c", "print('nightly')"]
             self.assertEqual(payload["changed_paths"], ["foo.rs"])
             self.assertEqual([lane["id"] for lane in payload["include"]], ["root_rust"])
 
+    def test_staged_linux_target_resolves_to_remote_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(repo, "init")
+            git(repo, "config", "user.name", "Test User")
+            git(repo, "config", "user.email", "test@example.com")
+            (repo / "ci").mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "guide.md").write_text("docs\n", encoding="utf-8")
+            (repo / "ci" / "forge-lanes.toml").write_text(
+                """
+version = 1
+nightly_schedule_utc = "08:00"
+
+[[branch.lanes]]
+id = "linux"
+title = "linux"
+staged_linux_target = "pre-merge-pika-rust"
+paths = ["docs/**"]
+
+[[nightly.lanes]]
+id = "nightly"
+title = "nightly"
+entrypoint = "./nightly.sh"
+command = ["./nightly.sh"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", "docs/guide.md", "ci/forge-lanes.toml")
+            git(repo, "commit", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD")
+
+            (repo / "docs" / "guide.md").write_text("changed\n", encoding="utf-8")
+            git(repo, "add", "docs/guide.md")
+            git(repo, "commit", "-m", "docs change")
+            head = git(repo, "rev-parse", "HEAD")
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    "select",
+                    "--mode",
+                    "branch",
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                    "--compare-repo-root",
+                    str(repo),
+                    "--head-repo-root",
+                    str(repo),
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "FORGE_GITHUB_CI_REPO_ROOT": str(repo)},
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertEqual([lane["id"] for lane in payload["include"]], ["linux"])
+            self.assertEqual(
+                payload["include"][0]["command"],
+                ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-pika-rust"],
+            )
+
+    def test_run_supports_staged_linux_target_only_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(repo, "init")
+            git(repo, "config", "user.name", "Test User")
+            git(repo, "config", "user.email", "test@example.com")
+            (repo / "ci").mkdir()
+            (repo / "scripts").mkdir()
+            marker = repo / "ran.txt"
+            (repo / "scripts" / "pikaci-staged-linux-remote.sh").write_text(
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+printf "%s %s\\n" "$1" "$2" > "{marker}"
+""",
+                encoding="utf-8",
+            )
+            (repo / "ci" / "forge-lanes.toml").write_text(
+                """
+version = 1
+nightly_schedule_utc = "08:00"
+
+[[branch.lanes]]
+id = "x"
+title = "x"
+staged_linux_target = "pre-merge-pika-rust"
+
+[[nightly.lanes]]
+id = "nightly"
+title = "nightly"
+entrypoint = "./nightly.sh"
+command = ["./nightly.sh"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["chmod", "+x", str(repo / "scripts" / "pikaci-staged-linux-remote.sh")],
+                check=True,
+            )
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    "run",
+                    "--mode",
+                    "branch",
+                    "--lane-id",
+                    "x",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "FORGE_GITHUB_CI_REPO_ROOT": str(repo)},
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertIn(
+                "./scripts/pikaci-staged-linux-remote.sh run pre-merge-pika-rust",
+                completed.stdout,
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "run pre-merge-pika-rust\n")
+
     def test_branch_selection_uses_branch_head_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -419,14 +702,102 @@ command = ["python3", "-c", "print('nightly')"]
             ids = [lane["id"] for lane in payload["include"]]
             self.assertEqual(ids, ["override_lane"])
 
+    def test_checked_in_branch_catalog_matches_expected_pre_merge_shadow_jobs(self) -> None:
+        completed = subprocess.run(
+            ["python3", str(SCRIPT), "select", "--mode", "branch", "--all"],
+            cwd=REPO_ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        payload = json.loads(completed.stdout)
+        lanes = payload["include"]
+        self.assertEqual(
+            [lane["id"] for lane in lanes],
+            [
+                "pika_rust",
+                "pika_followup",
+                "notifications",
+                "agent_contracts",
+                "rmp",
+                "pikachat",
+                "apple_host_sanity",
+                "pikachat_openclaw_e2e",
+                "fixture",
+            ],
+        )
+        commands = {lane["id"]: lane["command"] for lane in lanes}
+        groups = {lane["id"]: lane["concurrency_group"] for lane in lanes}
+        self.assertEqual(
+            commands["pika_rust"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-pika-rust"],
+        )
+        self.assertEqual(groups["pika_rust"], "staged-linux:pre-merge-pika-rust")
+        self.assertEqual(
+            commands["pika_followup"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-pika-followup"],
+        )
+        self.assertEqual(groups["pika_followup"], "staged-linux:pre-merge-pika-followup")
+        self.assertEqual(
+            commands["notifications"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-notifications"],
+        )
+        self.assertEqual(groups["notifications"], "staged-linux:pre-merge-notifications")
+        self.assertEqual(
+            commands["agent_contracts"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-agent-contracts"],
+        )
+        self.assertEqual(groups["agent_contracts"], "staged-linux:pre-merge-agent-contracts")
+        self.assertEqual(
+            commands["rmp"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-rmp"],
+        )
+        self.assertEqual(groups["rmp"], "staged-linux:pre-merge-rmp")
+        self.assertEqual(
+            commands["pikachat"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-pikachat-rust"],
+        )
+        self.assertEqual(groups["pikachat"], "staged-linux:pre-merge-pikachat-rust")
+        self.assertEqual(
+            commands["pikachat_openclaw_e2e"],
+            [
+                "./scripts/pikaci-staged-linux-remote.sh",
+                "run",
+                "pre-merge-pikachat-openclaw-e2e",
+            ],
+        )
+        self.assertEqual(
+            groups["pikachat_openclaw_e2e"],
+            "staged-linux:pre-merge-pikachat-openclaw-e2e",
+        )
+        self.assertEqual(
+            commands["fixture"],
+            ["./scripts/pikaci-staged-linux-remote.sh", "run", "pre-merge-fixture-rust"],
+        )
+        self.assertEqual(groups["fixture"], "staged-linux:pre-merge-fixture-rust")
+        self.assertEqual(
+            commands["apple_host_sanity"],
+            [
+                "./scripts/pikaci-apple-github-step",
+                "remote-run",
+                "--just-recipe",
+                "apple-host-sanity",
+            ],
+        )
+        self.assertEqual(groups["apple_host_sanity"], "apple-host")
+
     def test_workflow_uses_pull_request_not_pull_request_target(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "pre-merge.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("pull_request:\n", workflow)
         self.assertNotIn("pull_request_target:", workflow)
+        self.assertNotIn("dorny/paths-filter", workflow)
         self.assertIn("path: pr", workflow)
         self.assertIn("FORGE_GITHUB_CI_REPO_ROOT", workflow)
+        self.assertIn('fromJSON(needs.select-branch.outputs.matrix)', workflow)
+        self.assertIn('forge-github-ci-shim.py" select', workflow)
+        self.assertIn('forge-github-ci-shim.py" run', workflow)
         self.assertIn("--compare-repo-root \"$GITHUB_WORKSPACE\"", workflow)
         self.assertIn("--head-repo-root \"$GITHUB_WORKSPACE/pr\"", workflow)
 

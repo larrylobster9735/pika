@@ -1331,12 +1331,27 @@ impl Store {
                 .query_row(
                     "SELECT 1
                      FROM chat_allowlist
-                     WHERE npub = ?1 AND active = 1 AND can_forge_write = 1",
+                     WHERE npub = ?1 AND can_forge_write = 1",
                     params![npub],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()
                 .context("query forge writer allowlist entry")?
+                .is_some();
+            Ok(active)
+        })
+    }
+
+    pub fn has_chat_allowlist_forge_writers(&self) -> anyhow::Result<bool> {
+        self.with_connection(|conn| {
+            let active = conn
+                .query_row(
+                    "SELECT 1 FROM chat_allowlist WHERE can_forge_write = 1 LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .context("query forge writer allowlist entries")?
                 .is_some();
             Ok(active)
         })
@@ -2469,6 +2484,16 @@ fn migrations() -> Vec<Migration> {
             name: "0016_ci_rerun_provenance",
             sql: include_str!("../migrations/0016_ci_rerun_provenance.sql"),
         },
+        Migration {
+            version: 17,
+            name: "0017_ci_lane_concurrency_groups",
+            sql: include_str!("../migrations/0017_ci_lane_concurrency_groups.sql"),
+        },
+        Migration {
+            version: 18,
+            name: "0018_ci_lane_pikaci_metadata",
+            sql: include_str!("../migrations/0018_ci_lane_pikaci_metadata.sql"),
+        },
     ]
 }
 
@@ -3232,6 +3257,7 @@ mod tests {
         let store = Store::open(&db_path).expect("open store");
 
         assert!(!store.has_active_chat_allowlist_entries().unwrap());
+        assert!(!store.has_chat_allowlist_forge_writers().unwrap());
         assert!(!store.is_chat_allowlist_active("npub1missing").unwrap());
         assert!(!store
             .is_chat_allowlist_forge_writer("npub1missing")
@@ -3253,6 +3279,7 @@ mod tests {
         );
 
         assert!(store.has_active_chat_allowlist_entries().unwrap());
+        assert!(store.has_chat_allowlist_forge_writers().unwrap());
         assert!(store.is_chat_allowlist_active("npub1alice").unwrap());
         assert!(store.is_chat_allowlist_forge_writer("npub1alice").unwrap());
 
@@ -3269,9 +3296,33 @@ mod tests {
         assert!(!updated.can_forge_write);
         assert!(!store.is_chat_allowlist_active("npub1alice").unwrap());
         assert!(!store.is_chat_allowlist_forge_writer("npub1alice").unwrap());
+        assert!(!store.has_chat_allowlist_forge_writers().unwrap());
 
         let active = store.list_active_chat_allowlist_npubs().unwrap();
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn inactive_forge_writer_still_has_forge_write_access() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .upsert_chat_allowlist_entry(
+                "npub1forgeonly",
+                false,
+                true,
+                Some("forge only"),
+                "npub1admin",
+            )
+            .expect("upsert forge-only allowlist entry");
+
+        assert!(!store.has_active_chat_allowlist_entries().unwrap());
+        assert!(store.has_chat_allowlist_forge_writers().unwrap());
+        assert!(!store.is_chat_allowlist_active("npub1forgeonly").unwrap());
+        assert!(store
+            .is_chat_allowlist_forge_writer("npub1forgeonly")
+            .unwrap());
     }
 
     #[test]

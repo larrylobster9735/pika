@@ -58,6 +58,8 @@ pub struct ForgeRepoConfig {
     #[serde(default = "default_default_branch")]
     pub default_branch: String,
     #[serde(default)]
+    pub ci_concurrency: Option<usize>,
+    #[serde(default)]
     pub mirror_remote: Option<String>,
     #[serde(default)]
     pub mirror_poll_interval_secs: Option<u64>,
@@ -79,6 +81,9 @@ impl Config {
             }
             if forge.default_branch.trim().is_empty() {
                 forge.default_branch = DEFAULT_DEFAULT_BRANCH.to_string();
+            }
+            if forge.ci_concurrency == Some(0) {
+                forge.ci_concurrency = None;
             }
             if forge.ci_command.is_empty() {
                 forge.ci_command = default_ci_command();
@@ -221,6 +226,7 @@ canonical_git_dir = "/srv/test.git"
         assert_eq!(forge.repo, super::DEFAULT_FORGE_REPO);
         assert_eq!(forge.default_branch, super::DEFAULT_DEFAULT_BRANCH);
         assert_eq!(forge.ci_command, vec!["just", "pre-merge"]);
+        assert_eq!(forge.ci_concurrency, None);
         assert_eq!(forge.mirror_poll_interval_secs, None);
         assert_eq!(
             forge.hook_url.as_deref(),

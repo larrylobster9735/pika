@@ -31,9 +31,8 @@ prepare_snapshot_root=""
 source "$script_dir/lib/pikaci-tools.sh"
 
 export_remote_defaults() {
-  resolve_pikaci_tools "$repo_root"
+  load_pikaci_staged_linux_remote_defaults "$repo_root"
   log_pikaci_tool_resolution "staged-linux-remote"
-  eval "$("$PIKACI_BIN" staged-linux-remote-defaults)"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_BINARY="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_BINARY:-$default_ssh_binary}"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_NIX_BINARY="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_NIX_BINARY:-$default_ssh_nix_binary}"
   export PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST="${PIKACI_PREPARED_OUTPUT_FULFILL_SSH_HOST:-$default_ssh_host}"
@@ -43,8 +42,7 @@ export_remote_defaults() {
 }
 
 resolve_target() {
-  local target_name="$1"
-  eval "$("$PIKACI_BIN" staged-linux-target-info "$target_name")"
+  load_pikaci_staged_linux_target_info "$1"
 }
 
 prepare_lane() {
@@ -81,6 +79,7 @@ prepare_lane() {
 run_lane() {
   export_remote_defaults
   resolve_target "$1"
+  local output_mode="${2:-human}"
 
   export PIKACI_PRE_MERGE_PIKA_RUST_SUBPROCESS_FULFILL=1
   export PIKACI_PREPARED_OUTPUT_FULFILL_INVOCATION=external_wrapper_command_v1
@@ -89,7 +88,7 @@ run_lane() {
   cd "$repo_root"
   export PIKACI_PREPARED_OUTPUT_FULFILL_BINARY
   export PIKACI_PREPARED_OUTPUT_FULFILL_LAUNCHER_BINARY
-  exec "$PIKACI_BIN" run "$target_id"
+  exec "$PIKACI_BIN" run "$target_id" --output "$output_mode"
 }
 
 case "${1:-}" in
@@ -102,12 +101,21 @@ case "${1:-}" in
     prepare_lane "$2"
     ;;
   run)
-    if [[ $# -ne 2 ]]; then
+    if [[ $# -ne 2 && $# -ne 4 ]]; then
       echo "error: expected a target for \`run\`" >&2
       usage >&2
       exit 2
     fi
-    run_lane "$2"
+    if [[ $# -eq 4 ]]; then
+      if [[ "$3" != "--output" ]]; then
+        echo "error: expected optional \`--output <human|json|jsonl>\`" >&2
+        usage >&2
+        exit 2
+      fi
+      run_lane "$2" "$4"
+    else
+      run_lane "$2"
+    fi
     ;;
   -h|--help)
     usage

@@ -65,6 +65,10 @@ run_id=""
 ssh_host="${PIKACI_APPLE_SSH_HOST:-}"
 ssh_user="${PIKACI_APPLE_SSH_USER:-}"
 ssh_binary="${PIKACI_APPLE_SSH_BINARY:-ssh}"
+ssh_binary_defaulted=1
+if [[ -n "${PIKACI_APPLE_SSH_BINARY:-}" ]]; then
+  ssh_binary_defaulted=0
+fi
 remote_root="${PIKACI_APPLE_REMOTE_ROOT:-.cache/pikaci-apple}"
 artifact_dir=""
 just_recipe="${PIKACI_APPLE_JUST_RECIPE:-apple-host-bundle}"
@@ -72,6 +76,7 @@ keep_runs="${PIKACI_APPLE_KEEP_RUNS:-3}"
 keep_prepared="${PIKACI_APPLE_KEEP_PREPARED:-2}"
 lock_timeout_sec="${PIKACI_APPLE_LOCK_TIMEOUT_SEC:-0}"
 github_output=""
+ssh_key_override="${PIKACI_APPLE_SSH_KEY:-}"
 
 prepare_profile_for_recipe() {
   case "$1" in
@@ -107,6 +112,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssh-binary)
       ssh_binary="${2:?missing value for --ssh-binary}"
+      ssh_binary_defaulted=0
       shift 2
       ;;
     --remote-root)
@@ -179,7 +185,7 @@ artifact_dir="${artifact_dir:-$repo_root/.pikaci/apple-remote/$run_id}"
 mkdir -p "$artifact_dir"
 
 tmp_dir="$(mktemp -d)"
-prepared_schema_version=3
+prepared_schema_version=5
 bundle_ref="refs/pikaci-apple/${command}/${run_id}"
 bundle_path="$tmp_dir/source.bundle"
 ssh_target="${ssh_user}@${ssh_host}"
@@ -187,20 +193,61 @@ bundle_created=0
 prepared_probe="unknown"
 upload_skipped=0
 desired_prepare_profile="$(prepare_profile_for_recipe "$just_recipe")"
+ssh_wrapper=""
+ssh_key_file=""
 
 cleanup() {
   set +e
   if [[ "$bundle_created" -eq 1 ]]; then
     git update-ref -d "$bundle_ref" >/dev/null 2>&1 || true
   fi
+  rm -f "$ssh_wrapper" "$ssh_key_file"
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
+
+prepare_ssh_binary() {
+  if [[ "$ssh_binary_defaulted" -ne 1 || -z "$ssh_key_override" ]]; then
+    return
+  fi
+
+  ssh_key_file="$(mktemp "${TMPDIR:-/tmp}/pikaci-apple-ssh-key.XXXXXX")"
+  ssh_wrapper="$(mktemp "${TMPDIR:-/tmp}/pikaci-apple-ssh-wrapper.XXXXXX")"
+  chmod 600 "$ssh_key_file"
+  printf '%s\n' "$ssh_key_override" >"$ssh_key_file"
+  cat >"$ssh_wrapper" <<EOF
+#!/usr/bin/env bash
+exec ssh \\
+  -i $(printf '%q' "$ssh_key_file") \\
+  -o IdentityAgent=none \\
+  -o IdentitiesOnly=yes \\
+  -o PreferredAuthentications=publickey \\
+  -o BatchMode=yes \\
+  "\$@"
+EOF
+  chmod 700 "$ssh_wrapper"
+  ssh_binary="$ssh_wrapper"
+}
+
+prepare_ssh_binary
+
+ensure_source_history_available() {
+  local is_shallow
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false\n')"
+  if [[ "$is_shallow" != "true" ]]; then
+    return
+  fi
+
+  # GitHub pull_request_target checkouts default to depth=1 from the base-branch
+  # workflow. Unshallow first so the bundle contains the full cherry-picked stack.
+  git fetch --quiet --no-tags --prune --unshallow origin
+}
 
 create_source_bundle() {
   if [[ "$bundle_created" -eq 1 ]]; then
     return
   fi
+  ensure_source_history_available
   git update-ref "$bundle_ref" "$resolved_commit"
   git bundle create "$bundle_path" "$bundle_ref" >/dev/null
   git update-ref -d "$bundle_ref" >/dev/null 2>&1 || true
@@ -352,9 +399,11 @@ prepared_worktree_dir="${prepared_dir}/worktree"
 prepared_ref="refs/pikaci-apple/prepared/${resolved_commit}"
 prepared_marker="${prepared_dir}/prepared.env"
 prepare_phase_file="${prepared_dir}/prepare-phases.tsv"
+rust_manifest_file="${prepared_dir}/rust-prepared-manifest.json"
 artifacts_dir="${run_dir}/artifacts"
 logs_dir="${run_dir}/logs"
 remote_artifact_path="${run_dir}/artifact.tgz"
+bundle_phase_file="${artifacts_dir}/bundle_phases.tsv"
 prepare_status="unknown"
 prepare_duration_sec=0
 bundle_duration_sec=0
@@ -375,31 +424,26 @@ prepare_profile_satisfies() {
 }
 
 mkdir -p "$artifacts_dir" "$logs_dir"
-exec > >(tee -a "${logs_dir}/remote.log") 2>&1
+run_locked_body() {
+  exec > >(tee -a "${logs_dir}/remote.log") 2>&1
 
-exec 9>"$lock_file"
-if ! lockf -s -t "$lock_timeout_sec" 9; then
-  echo "error: Apple host is busy; could not acquire run lock ${lock_file} within ${lock_timeout_sec}s" >&2
-  exit 75
-fi
+  cleanup() {
+    set +e
+    rm -f "$bundle_path"
+  }
+  trap cleanup EXIT
 
-cleanup() {
-  set +e
-  rm -f "$bundle_path"
-}
-trap cleanup EXIT
+  remote_q() {
+    printf "'%s'" "${1//\'/\'\"\'\"\'}"
+  }
 
-remote_q() {
-  printf "'%s'" "${1//\'/\'\"\'\"\'}"
-}
+  ensure_mirror() {
+    if [[ ! -d "$mirror_dir" ]]; then
+      git init --bare "$mirror_dir" >/dev/null
+    fi
+  }
 
-ensure_mirror() {
-  if [[ ! -d "$mirror_dir" ]]; then
-    git init --bare "$mirror_dir" >/dev/null
-  fi
-}
-
-ensure_prepared_checkout() {
+  ensure_prepared_checkout() {
   local should_prewarm=0
   local prepare_started_at
   local marker_schema_version=""
@@ -492,9 +536,9 @@ PREPARED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
   touch "$prepared_dir"
   prepare_duration_sec="$(( $(date +%s) - prepare_started_at ))"
-}
+  }
 
-prune_runs() {
+  prune_runs() {
   python3 - "$resolved_remote_root/runs" "$run_id" "$keep_runs" <<'PY'
 from pathlib import Path
 import shutil
@@ -512,9 +556,9 @@ for stale in run_dirs[keep:]:
         continue
     shutil.rmtree(stale, ignore_errors=True)
 PY
-}
+  }
 
-prune_prepared() {
+  prune_prepared() {
   python3 - "$mirror_dir" "$prepared_root" "$resolved_commit" "$keep_prepared" <<'PY'
 from pathlib import Path
 import shutil
@@ -551,68 +595,112 @@ for stale in prepared_dirs[keep:]:
         )
     shutil.rmtree(stale, ignore_errors=True)
 PY
-}
+  }
 
-ensure_prepared_checkout
+  ensure_prepared_checkout
 
-printf '%s\n' "$prepare_status" > "${artifacts_dir}/prepare_status.txt"
-printf '%s\n' "$prepare_duration_sec" > "${artifacts_dir}/prepare_duration_sec.txt"
-printf '%s\n' "$prepared_worktree_dir" > "${artifacts_dir}/prepared_worktree_dir.txt"
-printf '%s\n' "$desired_prepare_profile" > "${artifacts_dir}/prepare_profile.txt"
-printf '%s\n' "$resolved_commit" > "${artifacts_dir}/revision.txt"
-printf '%s\n' "$command" > "${artifacts_dir}/command.txt"
-if [[ -f "$prepare_phase_file" ]]; then
-  cp "$prepare_phase_file" "${artifacts_dir}/prepare_phases.tsv"
-fi
-
-if [[ "$command" == "run" ]]; then
-  cd "$prepared_worktree_dir"
-  bundle_started_at="$(date +%s)"
-  bundle_exit=0
-  set +e
-  if [[ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]]; then
-    # shellcheck disable=SC1091
-    source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+  printf '%s\n' "$prepare_status" > "${artifacts_dir}/prepare_status.txt"
+  printf '%s\n' "$prepare_duration_sec" > "${artifacts_dir}/prepare_duration_sec.txt"
+  printf '%s\n' "$prepared_worktree_dir" > "${artifacts_dir}/prepared_worktree_dir.txt"
+  printf '%s\n' "$desired_prepare_profile" > "${artifacts_dir}/prepare_profile.txt"
+  printf '%s\n' "$resolved_commit" > "${artifacts_dir}/revision.txt"
+  printf '%s\n' "$command" > "${artifacts_dir}/command.txt"
+  if [[ -f "$prepare_phase_file" ]]; then
+    cp "$prepare_phase_file" "${artifacts_dir}/prepare_phases.tsv"
   fi
-  export PIKA_XCODE_INSTALL_PROMPT=0
+  if [[ -f "$rust_manifest_file" ]]; then
+    cp "$rust_manifest_file" "${artifacts_dir}/rust_prepared_manifest.json"
+  fi
+
+  if [[ "$command" == "run" ]]; then
+    cd "$prepared_worktree_dir"
+    bundle_started_at="$(date +%s)"
+    bundle_exit=0
+    set +e
+    if [[ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]]; then
+      # shellcheck disable=SC1091
+      source /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    fi
+    export PIKA_XCODE_INSTALL_PROMPT=0
   export CARGO_TARGET_DIR="$shared_target_dir"
   export PIKACI_APPLE_PREPARED_PROFILE="$desired_prepare_profile"
+  export PIKACI_APPLE_RUST_PREPARED_MANIFEST="$rust_manifest_file"
+  export PIKACI_APPLE_PHASE_REPORT="$bundle_phase_file"
+  : >"$bundle_phase_file"
   if [[ "$desired_prepare_profile" == "bundle" ]]; then
     export PIKACI_IOS_UI_TEST_USE_PREPARED=1
   fi
-  nix --extra-experimental-features "nix-command flakes" develop .#apple-host -c just "$just_recipe"
-  bundle_exit=$?
-  set -e
-  bundle_duration_sec="$(( $(date +%s) - bundle_started_at ))"
-  printf '%s\n' "just --unstable ${just_recipe}" > "${artifacts_dir}/bundle-command.txt"
-  printf '%s\n' "$bundle_duration_sec" > "${artifacts_dir}/bundle_duration_sec.txt"
-  printf '%s\n' "$bundle_exit" > "${artifacts_dir}/exit_code.txt"
-else
-  bundle_exit=0
-  printf '%s\n' "prepare-only" > "${artifacts_dir}/bundle-command.txt"
-  printf '%s\n' "$bundle_duration_sec" > "${artifacts_dir}/bundle_duration_sec.txt"
-  printf '%s\n' "$bundle_exit" > "${artifacts_dir}/exit_code.txt"
-fi
+    nix --extra-experimental-features "nix-command flakes" develop .#apple-host -c just "$just_recipe"
+    bundle_exit=$?
+    set -e
+    bundle_duration_sec="$(( $(date +%s) - bundle_started_at ))"
+    printf '%s\n' "just --unstable ${just_recipe}" > "${artifacts_dir}/bundle-command.txt"
+    printf '%s\n' "$bundle_duration_sec" > "${artifacts_dir}/bundle_duration_sec.txt"
+    printf '%s\n' "$bundle_exit" > "${artifacts_dir}/exit_code.txt"
+  else
+    bundle_exit=0
+    printf '%s\n' "prepare-only" > "${artifacts_dir}/bundle-command.txt"
+    printf '%s\n' "$bundle_duration_sec" > "${artifacts_dir}/bundle_duration_sec.txt"
+    printf '%s\n' "$bundle_exit" > "${artifacts_dir}/exit_code.txt"
+  fi
 
-{
-  sw_vers || true
-  uname -a
-  df -h /
-  du -sh "$shared_target_dir" 2>/dev/null || true
-  du -sh "${prepared_worktree_dir}/.pikaci" 2>/dev/null || true
-  du -sh "${prepared_worktree_dir}/ios/build" 2>/dev/null || true
-} > "${artifacts_dir}/system.txt"
+  {
+    sw_vers || true
+    uname -a
+    df -h /
+    du -sh "$shared_target_dir" 2>/dev/null || true
+    du -sh "${prepared_worktree_dir}/.pikaci" 2>/dev/null || true
+    du -sh "${prepared_worktree_dir}/ios/build" 2>/dev/null || true
+  } > "${artifacts_dir}/system.txt"
 
-if [[ -d "${prepared_worktree_dir}/ios/build/Logs/Test" ]]; then
-  tar -C "${prepared_worktree_dir}/ios/build/Logs" -czf "${artifacts_dir}/ios-test-logs.tgz" Test
-fi
+  if [[ -d "${prepared_worktree_dir}/ios/build/Logs/Test" ]]; then
+    tar -C "${prepared_worktree_dir}/ios/build/Logs" -czf "${artifacts_dir}/ios-test-logs.tgz" Test
+  fi
 
-tar -C "$run_dir" -czf "$remote_artifact_path" artifacts logs
+  tar -C "$run_dir" -czf "$remote_artifact_path" artifacts logs
 
-prune_runs
-prune_prepared
+  prune_runs
+  prune_prepared
 
-exit "$bundle_exit"
+  exit "$bundle_exit"
+}
+
+export resolved_remote_root command run_id bundle_ref resolved_commit keep_runs keep_prepared \
+  lock_timeout_sec prepared_schema_version skip_source_import just_recipe desired_prepare_profile \
+  run_dir bundle_path mirror_dir shared_target_dir lock_file prepared_root prepared_dir \
+  prepared_worktree_dir prepared_ref prepared_marker prepare_phase_file rust_manifest_file \
+  artifacts_dir logs_dir remote_artifact_path bundle_phase_file \
+  prepare_status prepare_duration_sec bundle_duration_sec
+export -f prepare_profile_rank prepare_profile_satisfies run_locked_body
+
+python3 - "$lock_file" "$lock_timeout_sec" <<'PY'
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+lock_file = sys.argv[1]
+timeout_sec = int(sys.argv[2])
+lock_fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+deadline = time.time() + timeout_sec
+
+while True:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.time() >= deadline:
+            print(
+                f"error: Apple host is busy; could not acquire run lock {lock_file} within {timeout_sec}s",
+                file=sys.stderr,
+            )
+            sys.exit(75)
+        time.sleep(1)
+
+proc = subprocess.run(["bash", "-lc", "run_locked_body"], close_fds=True)
+sys.exit(proc.returncode)
+PY
 REMOTE_RUN
   remote_exit_local=${PIPESTATUS[0]}
   set -e
