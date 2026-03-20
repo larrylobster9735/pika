@@ -1436,7 +1436,13 @@ fn pikachat_apple_followup_jobs() -> Vec<JobSpec> {
             timeout_secs: 1800,
             writable_workspace: false,
             guest_command: GuestCommand::HostShellCommand {
-                command: "cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture",
+                command: concat!(
+                    "if [[ -n \"${PIKACI_APPLE_RUST_PREPARED_MANIFEST:-}\" ]]; then ",
+                    "./scripts/apple-host-run-prepared-entry pikahut-integration-deterministic ui_e2e_local_desktop --ignored --nocapture; ",
+                    "else ",
+                    "cargo test -p pikahut --test integration_deterministic ui_e2e_local_desktop -- --ignored --nocapture; ",
+                    "fi"
+                ),
             },
             staged_linux_rust_lane: None,
         },
