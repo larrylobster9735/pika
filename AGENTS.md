@@ -17,6 +17,12 @@ Rerun only if asked, if you switch worktrees, or if the first run failed.
 - Run `cargo fmt` to format Rust code before committing.
 - Always add tests for changes when possible.
 
+## Forge Workflow
+
+- Canonical Git and the forge web UI now live on `git.pikachat.org`.
+- Push branches to `git@git.pikachat.org:pika.git`.
+- Use `ph` for forge interaction where appropriate: `ph status`, `ph wait`, `ph logs`, `ph merge`, `ph close`.
+
 ## Just Command Contract
 
 - Treat the visible root `just` surface as curated for humans; new root recipes should be rare and high-signal.

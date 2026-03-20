@@ -4,6 +4,7 @@ let
   servicePort = 8788;
   serviceUser = "pika-news";
   serviceGroup = "pika-news";
+  gitUser = "git";
   serviceStateDir = "/var/lib/pika-news";
   canonicalGitDir = "${serviceStateDir}/pika.git";
   adminIdentities = import ../lib/admin-identities.nix;
@@ -17,6 +18,10 @@ let
 
     ${pkgs.coreutils}/bin/chown -R ${serviceUser}:${serviceGroup} "$repo"
     ${pkgs.findutils}/bin/find "$repo" -type d -exec ${pkgs.coreutils}/bin/chmod 2775 {} +
+    ${pkgs.findutils}/bin/find "$repo" -type f -exec ${pkgs.coreutils}/bin/chmod ug+rw,o-rwx {} +
+    if [ -d "$repo/.githooks" ]; then
+      ${pkgs.findutils}/bin/find "$repo/.githooks" -type f -exec ${pkgs.coreutils}/bin/chmod 0775 {} +
+    fi
     ${pkgs.coreutils}/bin/chmod 0664 "$repo"/HEAD "$repo"/config "$repo"/description 2>/dev/null || true
     ${pkgs.git}/bin/git --git-dir="$repo" config core.sharedRepository group
   '';
@@ -84,6 +89,14 @@ in
     group = serviceGroup;
     home = serviceStateDir;
     createHome = true;
+  };
+
+  users.users."${gitUser}" = {
+    isSystemUser = true;
+    group = serviceGroup;
+    home = serviceStateDir;
+    createHome = false;
+    shell = "${pkgs.git}/bin/git-shell";
   };
   users.groups."${serviceGroup}" = {};
 
