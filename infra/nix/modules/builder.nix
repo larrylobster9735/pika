@@ -7,6 +7,18 @@ let
   newsPort = 8788;
   microvmBackupEnvFile = "/etc/microvm-backup.env";
   microvmBackupStatusFileName = "backup-status.v1.json";
+  justinAuthorizedKeys = [
+    "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOvnevaL7FO+n13yukLu23WNfzRUPzZ2e3X/BBQLieapAAAABHNzaDo= justin@yubikey-primary"
+    "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIMrMVMYKXjA7KuxacP6RexsSfXrkQhwOKwGAfJExDxYZAAAABHNzaDo= justin@yubikey-backup"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK9qcRB7tF1e8M9CX8zoPfNmQgWqvnee0SKASlM0aMlm mail@justinmoon.com"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHycGqFnrf8+1dmmI9CWRaADWrXMvnKWqx0UkpIFgXv1 infra"
+  ];
+  benAuthorizedKeys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuWEkTPjRZTq4AH+bw4+vL4KXx1R3GeMfS8SDna0r5f ben@ben-x1"
+  ];
+  paulAuthorizedKeys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHqbHvWlrXRkTc0403ubkqNE/Ge4YbPvKwWuRBoLPVAW paul@paul.lol"
+  ];
 in
 {
   imports = [
@@ -203,9 +215,14 @@ in
   # ── Caddy: reverse proxy for pika-news ─────────────────────────────────
   services.caddy = {
     enable = true;
-    virtualHosts."news.pikachat.org" = {
+    virtualHosts."git.pikachat.org" = {
       extraConfig = ''
         reverse_proxy 127.0.0.1:${toString newsPort}
+      '';
+    };
+    virtualHosts."news.pikachat.org" = {
+      extraConfig = ''
+        respond "pika forge moved to https://git.pikachat.org" 410
       '';
     };
   };
@@ -225,27 +242,21 @@ in
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     shell = pkgs.bash;
-    openssh.authorizedKeys.keys = [
-      "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOvnevaL7FO+n13yukLu23WNfzRUPzZ2e3X/BBQLieapAAAABHNzaDo= justin@yubikey-primary"
-      "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIMrMVMYKXjA7KuxacP6RexsSfXrkQhwOKwGAfJExDxYZAAAABHNzaDo= justin@yubikey-backup"
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK9qcRB7tF1e8M9CX8zoPfNmQgWqvnee0SKASlM0aMlm mail@justinmoon.com"
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHycGqFnrf8+1dmmI9CWRaADWrXMvnKWqx0UkpIFgXv1 infra"
-    ];
+    openssh.authorizedKeys.keys = justinAuthorizedKeys;
   };
 
   users.users.ben = {
     isNormalUser = true;
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuWEkTPjRZTq4AH+bw4+vL4KXx1R3GeMfS8SDna0r5f ben@ben-x1"
-    ];
+    openssh.authorizedKeys.keys = benAuthorizedKeys;
   };
 
   users.users.paul = {
     isNormalUser = true;
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHqbHvWlrXRkTc0403ubkqNE/Ge4YbPvKwWuRBoLPVAW paul@paul.lol"
-    ];
+    openssh.authorizedKeys.keys = paulAuthorizedKeys;
   };
+
+  users.users.git.openssh.authorizedKeys.keys =
+    justinAuthorizedKeys ++ benAuthorizedKeys ++ paulAuthorizedKeys;
 
   security.sudo.wheelNeedsPassword = false;
 

@@ -325,7 +325,7 @@ mod tests {
             .expect("insert forge-only allowlist entry");
         let auth = AuthState::new(&[], &[], store.clone());
         let challenge = auth.create_challenge();
-        let verify_url = "https://news.pikachat.org/news/auth/verify";
+        let verify_url = "https://git.pikachat.org/news/auth/verify";
         let event = EventBuilder::new(Kind::Custom(27235), challenge.clone())
             .tags([
                 Tag::custom(TagKind::custom("u"), [verify_url]),

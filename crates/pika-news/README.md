@@ -2,6 +2,11 @@
 
 `pika-news` turns the canonical `pika` bare repo into a browser-first branch forge with tutorial-style review pages.
 
+Hosted forge:
+
+- Web UI: `https://git.pikachat.org/news`
+- Canonical Git remote: `git@git.pikachat.org:pika.git`
+
 ## Config file (`pika-news.toml`)
 
 ```toml
@@ -30,6 +35,7 @@ bootstrap_admin_npubs = ["npub1..."]
 - `forge_repo.mirror_remote`: outbound mirror remote name in the canonical bare repo, for example `github`.
 - `forge_repo.mirror_poll_interval_secs`: hosted background mirror cadence in seconds. Set `0` to disable background mirroring and keep manual sync only.
 - `ci/forge-lanes.toml`: checked-in source of truth for canonical pre-merge lane selection and nightly lane definitions. Branch pushes are evaluated against the branch head's proposed manifest; nightly uses the default branch manifest.
+- `forge_repo.hook_url`: internal canonical-bare-repo hook target. This is used by the forge-managed Git hook path, not by GitHub repo webhooks.
 - `poll_interval_secs`: interval used by hosted mode repair scans of the canonical bare repo.
 - `model`: Anthropic model name for tutorial generation.
 - `api_key_env`: environment variable containing the API key.
@@ -49,6 +55,7 @@ bootstrap_admin_npubs = ["npub1..."]
 - GitHub mirrors the same manifest through `scripts/forge-github-ci-shim.py` and `.github/workflows/pre-merge.yml`, but that path is advisory only.
 - GitHub Actions release and TestFlight workflows remain in place, but GitHub is no longer the canonical control plane for day-to-day pre-merge or nightly CI.
 - Hosted mirror sync needs the configured Git remote plus whatever credentials that remote requires. For a GitHub HTTPS remote, set the env named by `github_token_env` so the admin page and manual sync controls can report failures cleanly.
+- GitHub repo webhooks are not required for normal forge operation. The canonical forge uses the bare repo's installed hooks plus outbound mirroring to GitHub.
 
 ## Hosted Deploy And QA
 

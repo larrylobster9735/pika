@@ -1,6 +1,12 @@
 Run `./scripts/agent-brief` once at the start of each new agent session in this worktree (not every turn).
 Rerun only if asked, if you switch worktrees, or if the first run failed.
 
+For this project, canonical Git lives on `git.pikachat.org`. Prefer pushing branches to the forge
+remote and using `ph` for agent-facing forge actions like status, wait, logs, merge, and close.
+Do not silently rename remotes or rewrite a user's remote layout unless they explicitly ask; if the
+current remote setup is not forge-native, call it out and recommend using `origin` for
+`git@git.pikachat.org:pika.git`.
+
 ## Related codebases
 
 | Repo | Description |
@@ -16,6 +22,12 @@ Rerun only if asked, if you switch worktrees, or if the first run failed.
 - Use `just checks::pre-commit-full` only when you want the slower richer local follow-up tier.
 - Run `cargo fmt` to format Rust code before committing.
 - Always add tests for changes when possible.
+
+## Forge Workflow
+
+- Canonical Git and the forge web UI now live on `git.pikachat.org`.
+- Push branches to `git@git.pikachat.org:pika.git`.
+- Use `ph` for forge interaction where appropriate: `ph status`, `ph wait`, `ph logs`, `ph merge`, `ph close`.
 
 ## Just Command Contract
 

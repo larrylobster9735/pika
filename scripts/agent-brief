@@ -39,6 +39,10 @@ titles+=("pikachat help")
 cmds+=("cargo run -q -p pikachat -- --help")
 descs+=("Agent-native CLI for Pika messaging (one-shot + daemon mode).")
 
+titles+=("ph help")
+cmds+=("cargo run -q -p ph -- --help")
+descs+=("Thin forge control-plane client for branch CI, logs, merge, and close.")
+
 # --- Canonical run CLI ---
 
 titles+=("pika-run help")

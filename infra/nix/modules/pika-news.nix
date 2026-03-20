@@ -4,6 +4,7 @@ let
   servicePort = 8788;
   serviceUser = "pika-news";
   serviceGroup = "pika-news";
+  gitUser = "git";
   serviceStateDir = "/var/lib/pika-news";
   canonicalGitDir = "${serviceStateDir}/pika.git";
   adminIdentities = import ../lib/admin-identities.nix;
@@ -15,8 +16,13 @@ let
       exit 0
     fi
 
-    ${pkgs.coreutils}/bin/chown -R ${serviceUser}:${serviceGroup} "$repo"
+    ${pkgs.coreutils}/bin/chown -R ${gitUser}:${serviceGroup} "$repo"
     ${pkgs.findutils}/bin/find "$repo" -type d -exec ${pkgs.coreutils}/bin/chmod 2775 {} +
+    ${pkgs.findutils}/bin/find "$repo" -type f -exec ${pkgs.coreutils}/bin/chmod ug+rw,o-rwx {} +
+    if [ -d "$repo/.githooks" ]; then
+      ${pkgs.coreutils}/bin/chown -R ${serviceUser}:${serviceGroup} "$repo/.githooks"
+      ${pkgs.findutils}/bin/find "$repo/.githooks" -type f -exec ${pkgs.coreutils}/bin/chmod 0775 {} +
+    fi
     ${pkgs.coreutils}/bin/chmod 0664 "$repo"/HEAD "$repo"/config "$repo"/description 2>/dev/null || true
     ${pkgs.git}/bin/git --git-dir="$repo" config core.sharedRepository group
   '';
@@ -83,7 +89,15 @@ in
     isSystemUser = true;
     group = serviceGroup;
     home = serviceStateDir;
-    createHome = true;
+    createHome = false;
+  };
+
+  users.users."${gitUser}" = {
+    isSystemUser = true;
+    group = serviceGroup;
+    home = serviceStateDir;
+    createHome = false;
+    shell = "${pkgs.git}/bin/git-shell";
   };
   users.groups."${serviceGroup}" = {};
 
@@ -142,5 +156,6 @@ in
 
   systemd.tmpfiles.rules = [
     "d ${serviceStateDir} 0750 ${serviceUser} ${serviceGroup} -"
+    "z ${serviceStateDir} 0750 ${serviceUser} ${serviceGroup} -"
   ];
 }

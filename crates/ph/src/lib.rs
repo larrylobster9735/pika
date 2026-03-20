@@ -13,7 +13,7 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const DEFAULT_BASE_URL: &str = "https://news.pikachat.org";
+const DEFAULT_BASE_URL: &str = "https://git.pikachat.org";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 
 pub fn run() -> anyhow::Result<()> {
@@ -1004,7 +1004,7 @@ mod tests {
         save_session(
             state_dir.path(),
             &Session {
-                base_url: "https://news.pikachat.org".to_string(),
+                base_url: "https://git.pikachat.org".to_string(),
                 token: "token".to_string(),
                 npub: "npub1test".to_string(),
                 is_admin: false,

@@ -26,7 +26,7 @@ guessing which surfaces matter.
 
 ## Branch Push
 
-1. Push a non-`master` branch to the canonical forge remote.
+1. Push a non-`master` branch to the canonical forge remote at `git@git.pikachat.org:pika.git`.
 2. Open `/news`.
 3. Confirm the branch appears near the top of the open branch feed.
 4. Open the branch page and confirm:
@@ -77,6 +77,7 @@ guessing which surfaces matter.
    - last success or last failure
    - lagging ref count
 5. If mirror auth is intentionally missing, confirm the admin issue text is actionable.
+6. Do not expect any GitHub repo webhook to drive this flow; canonical ingestion comes from the forge-managed bare-repo hooks.
 
 ## Nightly Visibility
 
