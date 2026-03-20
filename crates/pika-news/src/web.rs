@@ -271,13 +271,13 @@ struct MediaLinkView {
     label: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct PageNoticeView {
     tone: String,
     message: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct CiRunView {
     id: i64,
     source_head_sha: String,
@@ -290,7 +290,7 @@ struct CiRunView {
     lanes: Vec<CiLaneView>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct CiLaneView {
     id: i64,
     lane_id: String,
@@ -307,7 +307,7 @@ struct CiLaneView {
     finished_at: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct NightlyLaneView {
     id: i64,
     lane_id: String,
@@ -354,6 +354,45 @@ struct NightlyLiveTemplate {
 #[derive(serde::Serialize)]
 struct LiveHtmlPayload {
     html: String,
+}
+
+#[derive(serde::Serialize)]
+struct ForgeBranchResolveResponse {
+    branch_id: i64,
+    repo: String,
+    branch_name: String,
+    branch_state: String,
+}
+
+#[derive(serde::Serialize)]
+struct ForgeBranchSummaryResponse {
+    branch_id: i64,
+    repo: String,
+    branch_name: String,
+    title: String,
+    branch_state: String,
+    updated_at: String,
+    target_branch: String,
+    head_sha: String,
+    merge_base_sha: String,
+    merge_commit_sha: Option<String>,
+    tutorial_status: String,
+    ci_status: String,
+    error_message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ForgeBranchDetailResponse {
+    branch: ForgeBranchSummaryResponse,
+    ci_runs: Vec<CiRunView>,
+}
+
+#[derive(serde::Serialize)]
+struct ForgeBranchLogsResponse {
+    branch_id: i64,
+    branch_name: String,
+    run_id: i64,
+    lane: CiLaneView,
 }
 
 fn now_string() -> String {
@@ -896,6 +935,26 @@ pub async fn serve(
         .route("/news/api/inbox/dismiss", post(api_inbox_dismiss_handler))
         .route("/news/api/me", get(api_me_handler))
         .route(
+            "/news/api/forge/branch/resolve",
+            get(api_forge_branch_resolve_handler),
+        )
+        .route(
+            "/news/api/forge/branch/:branch_id",
+            get(api_forge_branch_detail_handler),
+        )
+        .route(
+            "/news/api/forge/branch/:branch_id/logs",
+            get(api_forge_branch_logs_handler),
+        )
+        .route(
+            "/news/api/forge/branch/:branch_id/merge",
+            post(merge_handler),
+        )
+        .route(
+            "/news/api/forge/branch/:branch_id/close",
+            post(close_handler),
+        )
+        .route(
             "/news/api/admin/allowlist",
             get(api_admin_allowlist_handler).post(api_admin_allowlist_upsert_handler),
         )
@@ -1093,55 +1152,17 @@ async fn detail_page(
     branch_id: i64,
     review_mode: bool,
 ) -> axum::response::Response {
-    let detail_store = state.store.clone();
-    let runs_store = state.store.clone();
-    let detail = match tokio::task::spawn_blocking(move || {
-        detail_store.get_branch_detail(branch_id)
-    })
-    .await
-    {
-        Ok(Ok(Some(record))) => record,
-        Ok(Ok(None)) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("branch {} not found", branch_id),
-            )
-                .into_response();
-        }
-        Ok(Err(err)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to query branch detail: {}", err),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("detail worker task failed: {}", err),
-            )
-                .into_response();
-        }
-    };
-    let ci_runs =
-        match tokio::task::spawn_blocking(move || runs_store.list_branch_ci_runs(branch_id, 8))
-            .await
-        {
-            Ok(Ok(runs)) => runs,
-            Ok(Err(err)) => {
+    let (detail, ci_runs) =
+        match load_branch_detail_and_runs(Arc::clone(&state), branch_id, 8).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to query branch ci runs: {}", err),
+                    StatusCode::NOT_FOUND,
+                    format!("branch {} not found", branch_id),
                 )
                     .into_response();
             }
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("ci worker task failed: {}", err),
-                )
-                    .into_response();
-            }
+            Err((status, message)) => return (status, message).into_response(),
         };
 
     match render_detail_template_with_notices(
@@ -1164,6 +1185,55 @@ async fn detail_page(
         )
             .into_response(),
     }
+}
+
+async fn load_branch_detail_and_runs(
+    state: Arc<AppState>,
+    branch_id: i64,
+    run_limit: usize,
+) -> Result<Option<(BranchDetailRecord, Vec<BranchCiRunRecord>)>, (StatusCode, String)> {
+    let detail_store = state.store.clone();
+    let runs_store = state.store.clone();
+    let detail = match tokio::task::spawn_blocking(move || {
+        detail_store.get_branch_detail(branch_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(record))) => record,
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(err)) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to query branch detail: {}", err),
+            ));
+        }
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("detail worker task failed: {}", err),
+            ));
+        }
+    };
+    let ci_runs = match tokio::task::spawn_blocking(move || {
+        runs_store.list_branch_ci_runs(branch_id, run_limit)
+    })
+    .await
+    {
+        Ok(Ok(runs)) => runs,
+        Ok(Err(err)) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to query branch ci runs: {}", err),
+            ));
+        }
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ci worker task failed: {}", err),
+            ));
+        }
+    };
+    Ok(Some((detail, ci_runs)))
 }
 
 struct BranchCiLiveSnapshot {
@@ -1596,21 +1666,7 @@ fn render_branch_ci_live_html(
         tutorial_status: record.tutorial_status.clone(),
         ci_status: record.ci_status.clone(),
         live_active: branch_ci_runs_are_active(ci_runs),
-        ci_runs: ci_runs
-            .iter()
-            .cloned()
-            .map(|run| CiRunView {
-                id: run.id,
-                source_head_sha: run.source_head_sha,
-                status: run.status,
-                lane_count: run.lane_count,
-                rerun_of_run_id: run.rerun_of_run_id,
-                created_at: run.created_at,
-                started_at: run.started_at,
-                finished_at: run.finished_at,
-                lanes: run.lanes.into_iter().map(map_ci_lane_view).collect(),
-            })
-            .collect(),
+        ci_runs: ci_runs.iter().cloned().map(map_ci_run_view).collect(),
         page_notices: page_notices.to_vec(),
         latest_failed_lane_count,
     }
@@ -1648,6 +1704,20 @@ fn render_nightly_live_html(
     .context("render nightly live template")
 }
 
+fn map_ci_run_view(run: BranchCiRunRecord) -> CiRunView {
+    CiRunView {
+        id: run.id,
+        source_head_sha: run.source_head_sha,
+        status: run.status,
+        lane_count: run.lane_count,
+        rerun_of_run_id: run.rerun_of_run_id,
+        created_at: run.created_at,
+        started_at: run.started_at,
+        finished_at: run.finished_at,
+        lanes: run.lanes.into_iter().map(map_ci_lane_view).collect(),
+    }
+}
+
 fn map_ci_lane_view(lane: BranchCiLaneRecord) -> CiLaneView {
     CiLaneView {
         id: lane.id,
@@ -1682,6 +1752,87 @@ fn map_nightly_lane_view(lane: NightlyLaneRecord) -> NightlyLaneView {
         started_at: lane.started_at,
         finished_at: lane.finished_at,
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ForgeBranchResolveQuery {
+    branch_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ForgeBranchLogsQuery {
+    lane: Option<String>,
+    lane_run_id: Option<i64>,
+}
+
+fn map_forge_branch_summary(detail: BranchDetailRecord) -> ForgeBranchSummaryResponse {
+    ForgeBranchSummaryResponse {
+        branch_id: detail.branch_id,
+        repo: detail.repo,
+        branch_name: detail.branch_name,
+        title: detail.title,
+        branch_state: detail.branch_state,
+        updated_at: detail.updated_at,
+        target_branch: detail.target_branch,
+        head_sha: detail.head_sha,
+        merge_base_sha: detail.merge_base_sha,
+        merge_commit_sha: detail.merge_commit_sha,
+        tutorial_status: detail.tutorial_status,
+        ci_status: detail.ci_status,
+        error_message: detail.error_message,
+    }
+}
+
+fn select_branch_log_lane(
+    ci_runs: &[BranchCiRunRecord],
+    lane_id: Option<&str>,
+    lane_run_id: Option<i64>,
+) -> Option<(i64, BranchCiLaneRecord)> {
+    if let Some(lane_run_id) = lane_run_id {
+        return ci_runs.iter().find_map(|run| {
+            run.lanes
+                .iter()
+                .find(|lane| lane.id == lane_run_id)
+                .cloned()
+                .map(|lane| (run.id, lane))
+        });
+    }
+    if let Some(lane_id) = lane_id {
+        return ci_runs.iter().find_map(|run| {
+            run.lanes
+                .iter()
+                .find(|lane| lane.lane_id == lane_id)
+                .cloned()
+                .map(|lane| (run.id, lane))
+        });
+    }
+    ci_runs
+        .iter()
+        .find_map(|run| {
+            run.lanes
+                .iter()
+                .find(|lane| lane.status == "failed")
+                .cloned()
+                .map(|lane| (run.id, lane))
+        })
+        .or_else(|| {
+            ci_runs.iter().find_map(|run| {
+                run.lanes
+                    .iter()
+                    .find(|lane| {
+                        lane.log_text
+                            .as_ref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                    })
+                    .cloned()
+                    .map(|lane| (run.id, lane))
+            })
+        })
+        .or_else(|| {
+            ci_runs
+                .first()
+                .and_then(|run| run.lanes.first().cloned().map(|lane| (run.id, lane)))
+        })
 }
 
 async fn merge_handler(
@@ -2027,13 +2178,126 @@ async fn rerun_nightly_lane_handler(
     }
 }
 
+async fn api_forge_branch_resolve_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ForgeBranchResolveQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_auth(&state.auth, &headers) {
+        return resp;
+    }
+    let branch_name = query.branch_name.trim().to_string();
+    if branch_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "branch_name is required"})),
+        )
+            .into_response();
+    }
+    let repo = state
+        .config
+        .effective_forge_repo()
+        .map(|repo| repo.repo)
+        .unwrap_or_else(|| "sledtools/pika".to_string());
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.find_branch_by_name(&repo, &branch_name)).await
+    {
+        Ok(Ok(Some(branch))) => Json(ForgeBranchResolveResponse {
+            branch_id: branch.branch_id,
+            repo: branch.repo,
+            branch_name: branch.branch_name,
+            branch_state: branch.branch_state,
+        })
+        .into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "branch not found"})),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_forge_branch_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_auth(&state.auth, &headers) {
+        return resp;
+    }
+    match load_branch_detail_and_runs(Arc::clone(&state), branch_id, 8).await {
+        Ok(Some((detail, ci_runs))) => Json(ForgeBranchDetailResponse {
+            branch: map_forge_branch_summary(detail),
+            ci_runs: ci_runs.into_iter().map(map_ci_run_view).collect(),
+        })
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "branch not found"})),
+        )
+            .into_response(),
+        Err((status, message)) => {
+            (status, Json(serde_json::json!({"error": message}))).into_response()
+        }
+    }
+}
+
+async fn api_forge_branch_logs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch_id): Path<i64>,
+    Query(query): Query<ForgeBranchLogsQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_auth(&state.auth, &headers) {
+        return resp;
+    }
+    match load_branch_detail_and_runs(Arc::clone(&state), branch_id, 8).await {
+        Ok(Some((detail, ci_runs))) => {
+            let Some((run_id, lane)) =
+                select_branch_log_lane(&ci_runs, query.lane.as_deref(), query.lane_run_id)
+            else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "no matching lane logs found"})),
+                )
+                    .into_response();
+            };
+            Json(ForgeBranchLogsResponse {
+                branch_id: detail.branch_id,
+                branch_name: detail.branch_name,
+                run_id,
+                lane: map_ci_lane_view(lane),
+            })
+            .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "branch not found"})),
+        )
+            .into_response(),
+        Err((status, message)) => {
+            (status, Json(serde_json::json!({"error": message}))).into_response()
+        }
+    }
+}
+
 // --- Auth handlers ---
 
 async fn auth_challenge_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !state.auth.chat_enabled() {
+    if !state.auth.auth_enabled() {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "chat not enabled"})),
+            Json(serde_json::json!({"error": "auth not enabled"})),
         )
             .into_response();
     }
@@ -2050,10 +2314,10 @@ async fn auth_verify_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<VerifyRequest>,
 ) -> impl IntoResponse {
-    if !state.auth.chat_enabled() {
+    if !state.auth.auth_enabled() {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "chat not enabled"})),
+            Json(serde_json::json!({"error": "auth not enabled"})),
         )
             .into_response();
     }
@@ -3157,19 +3421,21 @@ mod tests {
 
     use askama::Template;
     use axum::body::to_bytes;
-    use axum::extract::{Path, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use tokio::sync::Notify;
 
     use super::{
-        branch_ci_stream_handler, build_mirror_health_status, collect_forge_startup_issues,
-        current_forge_runtime_issues, inbox_review_handler, load_branch_ci_live_snapshot,
-        load_nightly_live_snapshot, markdown_to_safe_html, next_branch_ci_live_snapshot,
-        next_nightly_live_snapshot, nightly_stream_handler, render_detail_template,
-        render_nightly_template, rerun_branch_ci_lane_handler, rerun_nightly_lane_handler,
+        api_forge_branch_detail_handler, api_forge_branch_logs_handler,
+        api_forge_branch_resolve_handler, auth_challenge_handler, branch_ci_stream_handler,
+        build_mirror_health_status, collect_forge_startup_issues, current_forge_runtime_issues,
+        inbox_review_handler, load_branch_ci_live_snapshot, load_nightly_live_snapshot,
+        markdown_to_safe_html, next_branch_ci_live_snapshot, next_nightly_live_snapshot,
+        nightly_stream_handler, render_detail_template, render_nightly_template,
+        rerun_branch_ci_lane_handler, rerun_nightly_lane_handler,
         should_backfill_managed_allowlist_entry, verify_signature, AppState, CiLiveUpdates,
-        ForgeHealthState,
+        ForgeBranchLogsQuery, ForgeBranchResolveQuery, ForgeHealthState,
     };
     use crate::auth::AuthState;
     use crate::branch_store::{BranchUpsertInput, MirrorStatusRecord, MirrorSyncRunRecord};
@@ -3608,6 +3874,359 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("/news/inbox")
         );
+    }
+
+    #[tokio::test]
+    async fn api_forge_branch_resolve_returns_open_branch() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/api-resolve", "head-resolve"))
+            .expect("insert branch");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: None,
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let headers = trusted_headers(&store, TRUSTED_NPUB);
+        let state = test_state(store, config);
+
+        let response = api_forge_branch_resolve_handler(
+            State(state),
+            Query(ForgeBranchResolveQuery {
+                branch_name: "feature/api-resolve".to_string(),
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(json["branch_id"], branch.branch_id);
+        assert_eq!(json["branch_name"], "feature/api-resolve");
+        assert_eq!(json["branch_state"], "open");
+    }
+
+    #[tokio::test]
+    async fn api_forge_branch_resolve_returns_closed_branch_history() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/api-history", "head-history"))
+            .expect("insert branch");
+        store
+            .mark_branch_closed(branch.branch_id, TRUSTED_NPUB)
+            .expect("close branch");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: None,
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let headers = trusted_headers(&store, TRUSTED_NPUB);
+        let state = test_state(store, config);
+
+        let response = api_forge_branch_resolve_handler(
+            State(state),
+            Query(ForgeBranchResolveQuery {
+                branch_name: "feature/api-history".to_string(),
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(json["branch_id"], branch.branch_id);
+        assert_eq!(json["branch_name"], "feature/api-history");
+        assert_eq!(json["branch_state"], "closed");
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_handler_allows_forge_only_auth_mode() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .upsert_chat_allowlist_entry(
+                TRUSTED_NPUB,
+                false,
+                true,
+                Some("forge-only"),
+                "npub1admin",
+            )
+            .expect("upsert forge-only allowlist entry");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: None,
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let state = test_state(store, config);
+
+        let response = auth_challenge_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_forge_branch_detail_returns_ci_summary() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/api-detail", "head-detail"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-detail",
+                &[crate::ci_manifest::ForgeLane {
+                    id: "pika".to_string(),
+                    title: "check-pika".to_string(),
+                    entrypoint: "just checks::pre-merge-pika".to_string(),
+                    command: vec!["just".to_string(), "checks::pre-merge-pika".to_string()],
+                    paths: vec![],
+                    concurrency_group: None,
+                    staged_linux_target: Some("pre-merge-pika-rust".to_string()),
+                }],
+            )
+            .expect("queue ci");
+        let claimed = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim lane")
+            .into_iter()
+            .next()
+            .expect("claimed lane");
+        store
+            .record_branch_ci_lane_pikaci_run(
+                claimed.lane_run_id,
+                claimed.claim_token,
+                "pikaci-api-detail",
+                Some("pre-merge-pika-rust"),
+            )
+            .expect("record pikaci metadata");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: None,
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let headers = trusted_headers(&store, TRUSTED_NPUB);
+        let state = test_state(store, config);
+
+        let response =
+            api_forge_branch_detail_handler(State(state), Path(branch.branch_id), headers)
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(json["branch"]["branch_name"], "feature/api-detail");
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][0]["pikaci_run_id"],
+            "pikaci-api-detail"
+        );
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][0]["pikaci_target_id"],
+            "pre-merge-pika-rust"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_forge_branch_logs_defaults_to_latest_failed_lane() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/api-logs", "head-logs"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-logs",
+                &[
+                    crate::ci_manifest::ForgeLane {
+                        id: "pika".to_string(),
+                        title: "check-pika".to_string(),
+                        entrypoint: "just checks::pre-merge-pika".to_string(),
+                        command: vec!["just".to_string(), "checks::pre-merge-pika".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    crate::ci_manifest::ForgeLane {
+                        id: "fixture".to_string(),
+                        title: "check-fixture".to_string(),
+                        entrypoint: "just checks::pre-merge-fixture".to_string(),
+                        command: vec!["just".to_string(), "checks::pre-merge-fixture".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                ],
+            )
+            .expect("queue ci");
+        let claimed = store
+            .claim_pending_branch_ci_lane_runs(2, 120)
+            .expect("claim lanes");
+        let success_lane = claimed
+            .iter()
+            .find(|lane| lane.lane_id == "pika")
+            .expect("success lane");
+        store
+            .finish_branch_ci_lane_run(
+                success_lane.lane_run_id,
+                success_lane.claim_token,
+                "success",
+                "ok",
+            )
+            .expect("finish success lane");
+        let failed_lane = claimed
+            .iter()
+            .find(|lane| lane.lane_id == "fixture")
+            .expect("failed lane");
+        store
+            .finish_branch_ci_lane_run(
+                failed_lane.lane_run_id,
+                failed_lane.claim_token,
+                "failed",
+                "fixture boom",
+            )
+            .expect("finish failed lane");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: None,
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let headers = trusted_headers(&store, TRUSTED_NPUB);
+        let state = test_state(store, config);
+
+        let response = api_forge_branch_logs_handler(
+            State(state),
+            Path(branch.branch_id),
+            Query(ForgeBranchLogsQuery {
+                lane: None,
+                lane_run_id: None,
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(json["lane"]["lane_id"], "fixture");
+        assert_eq!(json["lane"]["status"], "failed");
+        assert_eq!(json["lane"]["log_text"], "fixture boom");
     }
 
     #[tokio::test]

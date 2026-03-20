@@ -1,0 +1,23 @@
+[package]
+name = "ph"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ph"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+nostr = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json", "native-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
