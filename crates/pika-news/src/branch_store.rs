@@ -80,6 +80,14 @@ pub struct BranchDetailRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct OpenBranchLookupRecord {
+    pub branch_id: i64,
+    pub repo: String,
+    pub branch_name: String,
+    pub branch_state: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct BranchCiRunRecord {
     pub id: i64,
     pub source_head_sha: String,
@@ -559,6 +567,36 @@ impl Store {
             )
             .optional()
             .context("query branch detail")
+        })
+    }
+
+    pub fn find_open_branch_by_name(
+        &self,
+        repo: &str,
+        branch_name: &str,
+    ) -> anyhow::Result<Option<OpenBranchLookupRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT br.id, r.repo, br.branch_name, br.state
+                 FROM branch_records br
+                 JOIN repos r ON r.id = br.repo_id
+                 WHERE r.repo = ?1
+                   AND br.branch_name = ?2
+                   AND br.state = 'open'
+                 ORDER BY br.id DESC
+                 LIMIT 1",
+                params![repo, branch_name],
+                |row| {
+                    Ok(OpenBranchLookupRecord {
+                        branch_id: row.get(0)?,
+                        repo: row.get(1)?,
+                        branch_name: row.get(2)?,
+                        branch_state: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("query open branch by name")
         })
     }
 
