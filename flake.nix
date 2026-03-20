@@ -216,6 +216,27 @@
             mainProgram = "pikaci";
           };
         };
+      mkPhPkg = pkgs: src:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "ph";
+          version = "0.1.0";
+          inherit src;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "hypernote-mdx-0.3.0" = "sha256-SBhXVXPyCvxs+VudVLYitaioS8jwYSsE0k2SwPU+9GY=";
+              "mdk-core-0.7.1" = "sha256-miLjRESuTN2Je1wIaTUbEEDQ69jeJI3bKdX15Sjw63Q=";
+              "moq-lite-0.14.0" = "sha256-CVoVjbuezyC21gl/pEnU/S/2oRaDlvn2st7WBoUnWo8=";
+            };
+          };
+          cargoBuildFlags = [ "-p" "ph" ];
+          cargoTestFlags = [ "-p" "ph" ];
+          doCheck = false;
+          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
+          meta = {
+            mainProgram = "ph";
+          };
+        };
       mkPikachatPkg = pkgs: src:
         pkgs.rustPlatform.buildRustPackage {
           pname = "pikachat";
@@ -628,6 +649,7 @@
         linuxEglVendorPath = if pkgs.stdenv.isLinux then "${pkgs.mesa.drivers}/share/glvnd/egl_vendor.d" else "";
         linuxVulkanIcdPath = if pkgs.stdenv.isLinux then "${pkgs.mesa.drivers}/share/vulkan/icd.d" else "";
         pikaciPkg = mkPikaciPkg pkgs (mkPikaciSrc pkgs.lib);
+        phPkg = mkPhPkg pkgs (mkPikaciSrc pkgs.lib);
         pikachatPkgHost = mkPikachatPkg pkgs (
           pkgs.lib.fileset.toSource {
             root = ./.;
@@ -711,6 +733,7 @@
             pkgs.pkg-config
             pkgs.cargo-machete
             pkgs.cargo-watch
+            phPkg
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.xcodegen
             pkgs.xcodes
@@ -933,6 +956,7 @@ EOF
         packages =
           {
             pikaci = pikaciPkg;
+            ph = phPkg;
             default = pikaciPkg;
             rustToolchain = rustToolchain;
             pikachat = pikachatPkgHost;
@@ -952,6 +976,9 @@ EOF
         apps = {
           pikaci = flake-utils.lib.mkApp {
             drv = pikaciPkg;
+          };
+          ph = flake-utils.lib.mkApp {
+            drv = phPkg;
           };
           default = flake-utils.lib.mkApp {
             drv = pikaciPkg;
