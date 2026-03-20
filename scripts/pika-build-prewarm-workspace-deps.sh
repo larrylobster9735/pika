@@ -6,8 +6,7 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 source "$script_dir/lib/pikaci-tools.sh"
 
 load_remote_defaults() {
-  resolve_pikaci_tools "$repo_root"
-  eval "$("$PIKACI_BIN" staged-linux-remote-defaults)"
+  load_pikaci_staged_linux_remote_defaults "$repo_root"
 }
 
 usage() {

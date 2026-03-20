@@ -23,15 +23,16 @@ use crate::executor::{
     sync_snapshot_to_remote,
 };
 use crate::model::{
-    ExecuteNode, JobRecord, JobSpec, PlanExecutorKind, PlanNodeRecord, PlanScope, PrepareNode,
-    PreparedOutputConsumerKind, PreparedOutputExposure, PreparedOutputExposureAccess,
+    ExecuteNode, JobLogMetadata, JobRecord, JobSpec, PlanExecutorKind, PlanNodeRecord, PlanScope,
+    PrepareNode, PreparedOutputConsumerKind, PreparedOutputExposure, PreparedOutputExposureAccess,
     PreparedOutputExposureKind, PreparedOutputFulfillmentLaunchRequest,
     PreparedOutputFulfillmentResult, PreparedOutputFulfillmentStatus,
     PreparedOutputFulfillmentTransportPathContract, PreparedOutputFulfillmentTransportRequest,
     PreparedOutputHandoff, PreparedOutputHandoffProtocol, PreparedOutputInvocationMode,
     PreparedOutputLauncherTransportMode, PreparedOutputRemoteExposureRequest,
-    PreparedOutputResidency, PreparedOutputsRecord, RealizedPreparedOutputRecord, RunPlanRecord,
-    RunRecord, RunStatus, RunnerKind, StagedLinuxRustLane, StagedLinuxRustTarget,
+    PreparedOutputResidency, PreparedOutputsRecord, RealizedPreparedOutputRecord,
+    RunLifecycleEvent, RunLogsMetadata, RunPlanRecord, RunRecord, RunStatus, RunnerKind,
+    StagedLinuxRustLane, StagedLinuxRustTarget,
 };
 use crate::snapshot::{
     SnapshotProfile, compute_source_fingerprint_with_profile, create_snapshot_with_profile,
@@ -75,6 +76,8 @@ pub struct RunMetadata {
     pub filters: Vec<String>,
     pub message: Option<String>,
 }
+
+type RunLifecycleReporter<'a> = dyn FnMut(RunLifecycleEvent) -> anyhow::Result<()> + 'a;
 
 const STAGED_LINUX_RUST_SUBPROCESS_MODE_ENV: &str = "PIKACI_PRE_MERGE_PIKA_RUST_SUBPROCESS_FULFILL";
 const STAGED_LINUX_RUST_SUBPROCESS_MODE_NAME: &str =
@@ -120,10 +123,26 @@ pub fn run_jobs_with_metadata(
     options: &RunOptions,
     metadata: RunMetadata,
 ) -> anyhow::Result<RunRecord> {
+    run_jobs_with_metadata_and_reporter(jobs, options, metadata, &mut |_| Ok(()))
+}
+
+pub fn run_jobs_with_metadata_and_reporter(
+    jobs: &[JobSpec],
+    options: &RunOptions,
+    metadata: RunMetadata,
+    reporter: &mut RunLifecycleReporter<'_>,
+) -> anyhow::Result<RunRecord> {
     let prepared = prepare_run(options)?;
+    reporter(RunLifecycleEvent::RunStarted {
+        run_id: prepared.run_id.clone(),
+        created_at: prepared.created_at.clone(),
+        rerun_of: metadata.rerun_of.clone(),
+        target_id: metadata.target_id.clone(),
+        target_description: metadata.target_description.clone(),
+    })?;
     run_host_setup_commands(jobs, &options.source_root, &prepared.run_dir)?;
     let snapshot = prepare_snapshot_source(jobs, options, &prepared, &metadata)?;
-    run_jobs_against_snapshot(jobs, &prepared, &snapshot, metadata)
+    run_jobs_against_snapshot(jobs, &prepared, &snapshot, metadata, Some(reporter))
 }
 
 fn snapshot_profile_for_jobs(jobs: &[JobSpec]) -> SnapshotProfile {
@@ -151,6 +170,16 @@ pub fn rerun_jobs_with_metadata(
     options: &RunOptions,
     metadata: RunMetadata,
 ) -> anyhow::Result<RunRecord> {
+    rerun_jobs_with_metadata_and_reporter(jobs, previous, options, metadata, &mut |_| Ok(()))
+}
+
+pub fn rerun_jobs_with_metadata_and_reporter(
+    jobs: &[JobSpec],
+    previous: &RunRecord,
+    options: &RunOptions,
+    metadata: RunMetadata,
+    reporter: &mut RunLifecycleReporter<'_>,
+) -> anyhow::Result<RunRecord> {
     if previous.snapshot_dir.is_empty() {
         return Err(anyhow!(
             "run `{}` has no snapshot to rerun",
@@ -177,7 +206,14 @@ pub fn rerun_jobs_with_metadata(
     }
 
     let prepared = prepare_run(options)?;
-    run_jobs_against_snapshot(jobs, &prepared, &snapshot, metadata)
+    reporter(RunLifecycleEvent::RunStarted {
+        run_id: prepared.run_id.clone(),
+        created_at: prepared.created_at.clone(),
+        rerun_of: metadata.rerun_of.clone(),
+        target_id: metadata.target_id.clone(),
+        target_description: metadata.target_description.clone(),
+    })?;
+    run_jobs_against_snapshot(jobs, &prepared, &snapshot, metadata, Some(reporter))
 }
 
 fn run_jobs_against_snapshot(
@@ -185,6 +221,7 @@ fn run_jobs_against_snapshot(
     prepared: &PreparedRun,
     snapshot: &SnapshotSource,
     metadata: RunMetadata,
+    mut reporter: Option<&mut RunLifecycleReporter<'_>>,
 ) -> anyhow::Result<RunRecord> {
     let plan = build_run_plan(jobs, prepared, snapshot, &metadata)?;
     let prepared_output_consumer_kind = configured_prepared_output_consumer_kind()?;
@@ -319,6 +356,11 @@ fn run_jobs_against_snapshot(
             run_record.status = RunStatus::Failed;
             run_record.finished_at = Some(Utc::now().to_rfc3339());
             write_run_record(&prepared.run_dir, &run_record)?;
+            if let Some(reporter) = reporter.as_mut() {
+                reporter(RunLifecycleEvent::RunFinished {
+                    run: Box::new(run_record.clone()),
+                })?;
+            }
             return Ok(run_record);
         }
     };
@@ -350,6 +392,25 @@ fn run_jobs_against_snapshot(
             write_job_record(&planned_job.ctx.job_dir, &running_record)?;
             upsert_run_job_record(&mut run_record, running_record);
             write_run_record(&prepared.run_dir, &run_record)?;
+            if let Some(reporter) = reporter.as_mut() {
+                reporter(RunLifecycleEvent::JobStarted {
+                    run_id: prepared.run_id.clone(),
+                    job: Box::new(
+                        run_record
+                            .jobs
+                            .iter()
+                            .find(|job| job.id == planned_job.job.id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "missing running job record for `{}` in run `{}`",
+                                    planned_job.job.id,
+                                    prepared.run_id
+                                )
+                            })?,
+                    ),
+                })?;
+            }
 
             let tx = tx.clone();
             let planned_job_for_thread = planned_job.clone();
@@ -395,13 +456,19 @@ fn run_jobs_against_snapshot(
             stop_scheduling = true;
         }
         completed_node_ids.insert(planned_job.execute_node_id.clone());
-        upsert_run_job_record(&mut run_record, job_record);
+        upsert_run_job_record(&mut run_record, job_record.clone());
         run_record.status = if run_failed {
             RunStatus::Failed
         } else {
             RunStatus::Running
         };
         write_run_record(&prepared.run_dir, &run_record)?;
+        if let Some(reporter) = reporter.as_mut() {
+            reporter(RunLifecycleEvent::JobFinished {
+                run_id: prepared.run_id.clone(),
+                job: Box::new(job_record),
+            })?;
+        }
     }
 
     if run_failed {
@@ -425,6 +492,11 @@ fn run_jobs_against_snapshot(
     };
     run_record.finished_at = Some(Utc::now().to_rfc3339());
     write_run_record(&prepared.run_dir, &run_record)?;
+    if let Some(reporter) = reporter.as_mut() {
+        reporter(RunLifecycleEvent::RunFinished {
+            run: Box::new(run_record.clone()),
+        })?;
+    }
     Ok(run_record)
 }
 
@@ -432,10 +504,25 @@ pub fn record_skipped_run(
     options: &RunOptions,
     metadata: RunMetadata,
 ) -> anyhow::Result<RunRecord> {
+    record_skipped_run_with_reporter(options, metadata, &mut |_| Ok(()))
+}
+
+pub fn record_skipped_run_with_reporter(
+    options: &RunOptions,
+    metadata: RunMetadata,
+    reporter: &mut RunLifecycleReporter<'_>,
+) -> anyhow::Result<RunRecord> {
     let run_id = new_run_id();
     let created_at = Utc::now().to_rfc3339();
     let run_dir = options.state_root.join("runs").join(&run_id);
     fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    reporter(RunLifecycleEvent::RunStarted {
+        run_id: run_id.clone(),
+        created_at: created_at.clone(),
+        rerun_of: metadata.rerun_of.clone(),
+        target_id: metadata.target_id.clone(),
+        target_description: metadata.target_description.clone(),
+    })?;
 
     let run_record = RunRecord {
         run_id,
@@ -467,6 +554,9 @@ pub fn record_skipped_run(
         jobs: Vec::new(),
     };
     write_run_record(&run_dir, &run_record)?;
+    reporter(RunLifecycleEvent::RunFinished {
+        run: Box::new(run_record.clone()),
+    })?;
     Ok(run_record)
 }
 
@@ -667,6 +757,29 @@ pub fn load_logs(
     Ok(Logs { host, guest })
 }
 
+pub fn load_logs_metadata(
+    state_root: &Path,
+    run_id: &str,
+    job_id: Option<&str>,
+) -> anyhow::Result<RunLogsMetadata> {
+    let run = load_run_record(state_root, run_id)?;
+    let jobs = if let Some(job_id) = job_id {
+        let job = run
+            .jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| anyhow!("job `{job_id}` not found in run `{run_id}`"))?;
+        vec![job_log_metadata(job)]
+    } else {
+        run.jobs.iter().map(job_log_metadata).collect()
+    };
+    Ok(RunLogsMetadata {
+        run_id: run.run_id,
+        status: run.status,
+        jobs,
+    })
+}
+
 pub fn load_run_record(state_root: &Path, run_id: &str) -> anyhow::Result<RunRecord> {
     let path = state_root.join("runs").join(run_id).join("run.json");
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -675,6 +788,16 @@ pub fn load_run_record(state_root: &Path, run_id: &str) -> anyhow::Result<RunRec
 
 fn write_run_record(run_dir: &Path, record: &RunRecord) -> anyhow::Result<()> {
     write_json(run_dir.join("run.json"), record)
+}
+
+fn job_log_metadata(job: &JobRecord) -> JobLogMetadata {
+    JobLogMetadata {
+        id: job.id.clone(),
+        host_log_path: job.host_log_path.clone(),
+        guest_log_path: job.guest_log_path.clone(),
+        host_log_exists: Path::new(&job.host_log_path).is_file(),
+        guest_log_exists: Path::new(&job.guest_log_path).is_file(),
+    }
 }
 
 fn write_run_plan_record(run_dir: &Path, record: &RunPlanRecord) -> anyhow::Result<PathBuf> {
@@ -4080,7 +4203,8 @@ mod tests {
         configured_prepared_output_invocation_mode,
         configured_prepared_output_launcher_transport_mode, consume_prepared_output_handoff,
         fulfill_prepared_output_request, fulfill_prepared_output_request_result, gc_runs,
-        load_prepared_output_fulfillment_launch_request, load_prepared_output_fulfillment_result,
+        load_logs_metadata, load_prepared_output_fulfillment_launch_request,
+        load_prepared_output_fulfillment_result,
         load_prepared_output_fulfillment_transport_request, load_prepared_output_request,
         mark_prepare_failure, parallel_execute_cap_for_jobs, parse_bool_env_flag, prepare_run,
         prepare_snapshot_source, prepared_output_fulfillment_launcher_program,
@@ -4095,20 +4219,22 @@ mod tests {
         resolve_run_prepared_output_launcher_transport_remote_helper_program,
         resolve_run_prepared_output_launcher_transport_remote_launcher_program,
         resolve_run_prepared_output_launcher_transport_remote_work_dir,
-        selected_prepared_output_consumer, staged_linux_rust_remote_realization,
-        upsert_prepared_output_record, validate_prepared_output_consumer_for_jobs,
-        write_host_local_snapshot_cache_state, write_json,
-        write_prepared_output_fulfillment_result, write_run_plan_record,
+        run_jobs_with_metadata_and_reporter, selected_prepared_output_consumer,
+        staged_linux_rust_remote_realization, upsert_prepared_output_record,
+        validate_prepared_output_consumer_for_jobs, write_host_local_snapshot_cache_state,
+        write_json, write_prepared_output_fulfillment_result, write_run_plan_record,
+        write_run_record,
     };
     use crate::model::{
-        ExecuteNode, GuestCommand, JobSpec, PlanExecutorKind, PlanNodeRecord, PlanScope,
+        ExecuteNode, GuestCommand, JobRecord, JobSpec, PlanExecutorKind, PlanNodeRecord, PlanScope,
         PrepareNode, PreparedOutputConsumerKind, PreparedOutputExposure,
         PreparedOutputExposureAccess, PreparedOutputExposureKind, PreparedOutputFulfillmentResult,
         PreparedOutputFulfillmentStatus, PreparedOutputFulfillmentTransportPathContract,
         PreparedOutputHandoff, PreparedOutputHandoffProtocol, PreparedOutputInvocationMode,
         PreparedOutputLauncherTransportMode, PreparedOutputRemoteExposureRequest,
         PreparedOutputResidency, PreparedOutputsRecord, RealizedPreparedOutputRecord,
-        RemoteLinuxVmBackend, RunPlanRecord, RunRecord, RunStatus, StagedLinuxRustLane,
+        RemoteLinuxVmBackend, RunLifecycleEvent, RunPlanRecord, RunRecord, RunStatus,
+        StagedLinuxRustLane,
     };
     use crate::snapshot::{SnapshotProfile, compute_source_fingerprint_with_profile};
 
@@ -4169,6 +4295,134 @@ mod tests {
         assert!(runs_root.join("20260307T000003Z-cccc0003").exists());
         assert!(!runs_root.join("20260307T000002Z-bbbb0002").exists());
         assert!(!runs_root.join("20260307T000001Z-aaaa0001").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_jobs_with_reporter_emits_immediate_run_id_and_lifecycle_events() {
+        let root =
+            std::env::temp_dir().join(format!("pikaci-run-events-test-{}", uuid::Uuid::new_v4()));
+        let source_root = root.join("source");
+        fs::create_dir_all(&source_root).expect("create source root");
+        fs::write(source_root.join("README.md"), "hello\n").expect("write source file");
+        let options = RunOptions {
+            source_root,
+            state_root: root.join("state"),
+        };
+        let jobs = vec![JobSpec {
+            id: "host-echo",
+            description: "Run a trivial host-local command",
+            timeout_secs: 30,
+            writable_workspace: false,
+            guest_command: GuestCommand::HostShellCommand {
+                command: "printf 'ok\\n'",
+            },
+            staged_linux_rust_lane: None,
+        }];
+        let metadata = RunMetadata {
+            target_id: Some("host-echo".to_string()),
+            target_description: Some("Run a trivial host-local command".to_string()),
+            ..RunMetadata::default()
+        };
+        let mut events = Vec::new();
+        let run = run_jobs_with_metadata_and_reporter(&jobs, &options, metadata, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .expect("run jobs");
+
+        assert!(matches!(
+            events.first(),
+            Some(RunLifecycleEvent::RunStarted { run_id, .. }) if run_id == &run.run_id
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(RunLifecycleEvent::JobStarted { run_id, job })
+                if run_id == &run.run_id && job.id == "host-echo" && job.status == RunStatus::Running
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(RunLifecycleEvent::JobFinished { run_id, job })
+                if run_id == &run.run_id && job.id == "host-echo" && job.status == RunStatus::Passed
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(RunLifecycleEvent::RunFinished { run: finished_run })
+                if finished_run.run_id == run.run_id && finished_run.status == RunStatus::Passed
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_logs_metadata_reports_job_log_paths() {
+        let root =
+            std::env::temp_dir().join(format!("pikaci-log-metadata-test-{}", uuid::Uuid::new_v4()));
+        let run_dir = root.join("runs").join("20260319T000000Z-abcd1234");
+        let job_dir = run_dir.join("jobs").join("job-one");
+        fs::create_dir_all(&job_dir).expect("create job dir");
+        let host_log_path = job_dir.join("host.log");
+        let guest_log_path = job_dir.join("guest.log");
+        fs::write(&host_log_path, "host\n").expect("write host log");
+        fs::write(&guest_log_path, "guest\n").expect("write guest log");
+        write_run_record(
+            &run_dir,
+            &RunRecord {
+                run_id: "20260319T000000Z-abcd1234".to_string(),
+                status: RunStatus::Failed,
+                rerun_of: None,
+                target_id: Some("pre-merge-pika-rust".to_string()),
+                target_description: Some("test".to_string()),
+                source_root: "/tmp/source".to_string(),
+                snapshot_dir: "/tmp/snapshot".to_string(),
+                git_head: None,
+                git_dirty: None,
+                created_at: "2026-03-19T00:00:00Z".to_string(),
+                finished_at: Some("2026-03-19T00:00:05Z".to_string()),
+                plan_path: None,
+                prepared_outputs_path: None,
+                prepared_output_consumer: None,
+                prepared_output_mode: None,
+                prepared_output_invocation_mode: None,
+                prepared_output_invocation_wrapper_program: None,
+                prepared_output_launcher_transport_mode: None,
+                prepared_output_launcher_transport_program: None,
+                prepared_output_launcher_transport_host: None,
+                prepared_output_launcher_transport_remote_launcher_program: None,
+                prepared_output_launcher_transport_remote_helper_program: None,
+                prepared_output_launcher_transport_remote_work_dir: None,
+                changed_files: vec![],
+                filters: vec![],
+                message: None,
+                jobs: vec![JobRecord {
+                    id: "job-one".to_string(),
+                    description: "job".to_string(),
+                    status: RunStatus::Failed,
+                    executor: "host_local".to_string(),
+                    plan_node_id: None,
+                    timeout_secs: 30,
+                    host_log_path: host_log_path.display().to_string(),
+                    guest_log_path: guest_log_path.display().to_string(),
+                    started_at: "2026-03-19T00:00:00Z".to_string(),
+                    finished_at: Some("2026-03-19T00:00:05Z".to_string()),
+                    exit_code: Some(1),
+                    message: Some("boom".to_string()),
+                    remote_linux_vm_execution: None,
+                }],
+            },
+        )
+        .expect("write run record");
+
+        let metadata = load_logs_metadata(&root, "20260319T000000Z-abcd1234", Some("job-one"))
+            .expect("load log metadata");
+
+        assert_eq!(metadata.run_id, "20260319T000000Z-abcd1234");
+        assert_eq!(metadata.status, RunStatus::Failed);
+        assert_eq!(metadata.jobs.len(), 1);
+        assert_eq!(metadata.jobs[0].id, "job-one");
+        assert!(metadata.jobs[0].host_log_exists);
+        assert!(metadata.jobs[0].guest_log_exists);
 
         let _ = fs::remove_dir_all(&root);
     }

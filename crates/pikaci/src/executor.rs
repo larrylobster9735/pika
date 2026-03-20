@@ -282,7 +282,7 @@ impl Drop for HostLocalCacheLockGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct StagedLinuxRemoteDefaults {
     pub ssh_binary: &'static str,
     pub ssh_nix_binary: &'static str,
