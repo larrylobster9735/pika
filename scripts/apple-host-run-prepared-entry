@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        sys.stderr.write(
+            "usage: ./scripts/apple-host-run-prepared-entry <entry> [extra test args...]\n"
+        )
+        return 2
+
+    manifest_env = os.environ.get("PIKACI_APPLE_RUST_PREPARED_MANIFEST", "")
+    if not manifest_env:
+        sys.stderr.write("error: PIKACI_APPLE_RUST_PREPARED_MANIFEST is not set\n")
+        return 2
+
+    manifest_path = pathlib.Path(manifest_env)
+    if not manifest_path.exists():
+        sys.stderr.write(f"error: prepared manifest not found: {manifest_path}\n")
+        return 2
+
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    entry_id = sys.argv[1]
+    extra_args = sys.argv[2:]
+    entry = manifest.get("entries", {}).get(entry_id)
+    if entry is None:
+        sys.stderr.write(f"error: prepared manifest missing entry: {entry_id}\n")
+        return 2
+
+    executables = entry.get("executables", [])
+    default_args = entry.get("default_args", [])
+    if not executables:
+        sys.stderr.write(f"error: prepared entry {entry_id} has no executables\n")
+        return 2
+
+    env = os.environ.copy()
+    for executable in executables:
+        subprocess.run([executable, *default_args, *extra_args], check=True, env=env)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

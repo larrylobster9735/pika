@@ -185,7 +185,7 @@ artifact_dir="${artifact_dir:-$repo_root/.pikaci/apple-remote/$run_id}"
 mkdir -p "$artifact_dir"
 
 tmp_dir="$(mktemp -d)"
-prepared_schema_version=3
+prepared_schema_version=5
 bundle_ref="refs/pikaci-apple/${command}/${run_id}"
 bundle_path="$tmp_dir/source.bundle"
 ssh_target="${ssh_user}@${ssh_host}"
@@ -399,6 +399,7 @@ prepared_worktree_dir="${prepared_dir}/worktree"
 prepared_ref="refs/pikaci-apple/prepared/${resolved_commit}"
 prepared_marker="${prepared_dir}/prepared.env"
 prepare_phase_file="${prepared_dir}/prepare-phases.tsv"
+rust_manifest_file="${prepared_dir}/rust-prepared-manifest.json"
 artifacts_dir="${run_dir}/artifacts"
 logs_dir="${run_dir}/logs"
 remote_artifact_path="${run_dir}/artifact.tgz"
@@ -611,6 +612,9 @@ printf '%s\n' "$command" > "${artifacts_dir}/command.txt"
 if [[ -f "$prepare_phase_file" ]]; then
   cp "$prepare_phase_file" "${artifacts_dir}/prepare_phases.tsv"
 fi
+if [[ -f "$rust_manifest_file" ]]; then
+  cp "$rust_manifest_file" "${artifacts_dir}/rust_prepared_manifest.json"
+fi
 
 if [[ "$command" == "run" ]]; then
   cd "$prepared_worktree_dir"
@@ -624,6 +628,7 @@ if [[ "$command" == "run" ]]; then
   export PIKA_XCODE_INSTALL_PROMPT=0
   export CARGO_TARGET_DIR="$shared_target_dir"
   export PIKACI_APPLE_PREPARED_PROFILE="$desired_prepare_profile"
+  export PIKACI_APPLE_RUST_PREPARED_MANIFEST="$rust_manifest_file"
   if [[ "$desired_prepare_profile" == "bundle" ]]; then
     export PIKACI_IOS_UI_TEST_USE_PREPARED=1
   fi

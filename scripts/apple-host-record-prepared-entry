@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Record one prepared Apple Rust binary/test entry into a manifest."
+    )
+    parser.add_argument("--manifest", required=True, help="Path to manifest JSON file")
+    parser.add_argument("--entry", required=True, help="Logical entry id")
+    parser.add_argument(
+        "--binary",
+        help="Record one existing binary path directly instead of running a cargo command",
+    )
+    parser.add_argument(
+        "--default-arg",
+        action="append",
+        default=[],
+        help="Default argument to append when this entry is executed",
+    )
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Cargo command that emits --message-format=json compiler artifacts",
+    )
+    args = parser.parse_args()
+    if args.binary and args.command:
+        parser.error("--binary cannot be combined with a cargo command")
+    if not args.binary:
+        if not args.command:
+            parser.error("expected --binary or a cargo command")
+        if args.command[0] == "--":
+            args.command = args.command[1:]
+        if not args.command:
+            parser.error("expected a cargo command after --")
+    return args
+
+
+def load_manifest(path: pathlib.Path) -> dict:
+    if not path.exists():
+        return {"schema_version": 1, "entries": {}}
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_manifest(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        tmp_path = pathlib.Path(handle.name)
+    tmp_path.replace(path)
+
+
+def stage_executables(
+    manifest_path: pathlib.Path, entry_id: str, executables: list[str]
+) -> list[str]:
+    stage_root = manifest_path.parent / "rust-prepared-executables" / entry_id
+    shutil.rmtree(stage_root, ignore_errors=True)
+    stage_root.mkdir(parents=True, exist_ok=True)
+
+    staged_paths: list[str] = []
+    for index, executable in enumerate(executables):
+        source_path = pathlib.Path(executable).resolve()
+        if not source_path.exists():
+            raise SystemExit(f"error: prepared executable not found: {source_path}")
+        staged_path = stage_root / f"{index:02d}-{source_path.name}"
+        shutil.copy2(source_path, staged_path)
+        staged_paths.append(str(staged_path))
+    return staged_paths
+
+
+def collect_executables(command: list[str]) -> list[str]:
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert proc.stdout is not None
+    executables: list[str] = []
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        executable = payload.get("executable")
+        profile = payload.get("profile") or {}
+        if (
+            payload.get("reason") == "compiler-artifact"
+            and executable
+            and profile.get("test") is True
+        ):
+            executables.append(executable)
+    return_code = proc.wait()
+    if return_code != 0:
+        raise SystemExit(return_code)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for executable in executables:
+        if executable in seen:
+            continue
+        seen.add(executable)
+        deduped.append(executable)
+    if not deduped:
+        raise SystemExit("error: no prepared executables were recorded")
+    return deduped
+
+
+def main() -> int:
+    args = parse_args()
+    manifest_path = pathlib.Path(args.manifest)
+    if args.binary:
+        executables = [str(pathlib.Path(args.binary).resolve())]
+    else:
+        executables = collect_executables(args.command)
+    staged_executables = stage_executables(manifest_path, args.entry, executables)
+
+    manifest = load_manifest(manifest_path)
+    manifest["schema_version"] = 2
+    entries = manifest.setdefault("entries", {})
+    entries[args.entry] = {
+        "executables": staged_executables,
+        "default_args": args.default_arg,
+    }
+    write_manifest(manifest_path, manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
