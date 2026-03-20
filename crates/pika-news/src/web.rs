@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +48,66 @@ struct AppState {
     live_updates: CiLiveUpdates,
     webhook_secret: Option<String>,
     forge_health: Arc<Mutex<ForgeHealthState>>,
+}
+
+fn maybe_start_background_ci_pass(
+    state: Arc<AppState>,
+    notify: Arc<Notify>,
+    ci_running: Arc<AtomicBool>,
+) {
+    if ci_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let state_for_ci = Arc::clone(&state);
+        let ci_result = tokio::task::spawn_blocking(move || {
+            ci::run_ci_pass_with_updates(
+                &state_for_ci.store,
+                &state_for_ci.config,
+                Some(&state_for_ci.live_updates),
+            )
+        })
+        .await;
+
+        match ci_result {
+            Ok(Ok(ci)) => {
+                if ci.claimed > 0 || ci.nightlies_scheduled > 0 || ci.retries_recovered > 0 {
+                    eprintln!(
+                        "ci: claimed={} succeeded={} failed={} nightlies_scheduled={} retries_recovered={}",
+                        ci.claimed,
+                        ci.succeeded,
+                        ci.failed,
+                        ci.nightlies_scheduled,
+                        ci.retries_recovered
+                    );
+                }
+                if let Ok(mut health) = state.forge_health.lock() {
+                    let active =
+                        ci.claimed > 0 || ci.nightlies_scheduled > 0 || ci.retries_recovered > 0;
+                    health.ci.mark_success(ci_summary(&ci), active);
+                }
+            }
+            Ok(Err(err)) => {
+                eprintln!("pika-news ci runner error: {}", err);
+                if let Ok(mut health) = state.forge_health.lock() {
+                    health.ci.mark_error(err.to_string());
+                }
+            }
+            Err(err) => {
+                eprintln!("pika-news ci runner task join error: {}", err);
+                if let Ok(mut health) = state.forge_health.lock() {
+                    health.ci.mark_error(err.to_string());
+                }
+            }
+        }
+
+        ci_running.store(false, Ordering::Release);
+        notify.notify_one();
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -759,6 +820,7 @@ pub async fn serve(
 
     let background_state = Arc::clone(&state);
     let background_notify = Arc::clone(&poll_notify);
+    let background_ci_running = Arc::new(AtomicBool::new(false));
     tokio::spawn(async move {
         loop {
             let state = Arc::clone(&background_state);
@@ -772,17 +834,12 @@ pub async fn serve(
                         Some(&state.live_updates),
                     ),
                     worker::run_generation_pass(&state.store, &state.config),
-                    ci::run_ci_pass_with_updates(
-                        &state.store,
-                        &state.config,
-                        Some(&state.live_updates),
-                    ),
                     mirror::run_background_mirror_pass(&state.store, &state.config),
                 )
             })
             .await
             {
-                Ok((issues, poll_result, worker_result, ci_result, mirror_result)) => {
+                Ok((issues, poll_result, worker_result, mirror_result)) => {
                     if let Ok(mut health) = background_state.forge_health.lock() {
                         health.replace_issues(issues);
                     }
@@ -808,6 +865,9 @@ pub async fn serve(
                                     || pr.head_sha_changes > 0
                                     || pr.stale_closed > 0;
                                 health.poller.mark_success(poller_summary(&pr), active);
+                            }
+                            if pr.queued_ci_runs > 0 {
+                                background_notify.notify_one();
                             }
                         }
                         Err(err) => {
@@ -842,35 +902,6 @@ pub async fn serve(
                             }
                         }
                     }
-                    match ci_result {
-                        Ok(ci) => {
-                            if ci.claimed > 0
-                                || ci.nightlies_scheduled > 0
-                                || ci.retries_recovered > 0
-                            {
-                                eprintln!(
-                                    "ci: claimed={} succeeded={} failed={} nightlies_scheduled={} retries_recovered={}",
-                                    ci.claimed,
-                                    ci.succeeded,
-                                    ci.failed,
-                                    ci.nightlies_scheduled,
-                                    ci.retries_recovered
-                                );
-                            }
-                            if let Ok(mut health) = background_state.forge_health.lock() {
-                                let active = ci.claimed > 0
-                                    || ci.nightlies_scheduled > 0
-                                    || ci.retries_recovered > 0;
-                                health.ci.mark_success(ci_summary(&ci), active);
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("pika-news ci runner error: {}", err);
-                            if let Ok(mut health) = background_state.forge_health.lock() {
-                                health.ci.mark_error(err.to_string());
-                            }
-                        }
-                    }
                     match mirror_result {
                         Ok(mirror)
                             if mirror.attempted
@@ -893,6 +924,11 @@ pub async fn serve(
                     eprintln!("pika-news background task join error: {}", err);
                 }
             }
+            maybe_start_background_ci_pass(
+                Arc::clone(&background_state),
+                Arc::clone(&background_notify),
+                Arc::clone(&background_ci_running),
+            );
             // Wait for the poll interval OR an early wake-up from a webhook.
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)) => {}
