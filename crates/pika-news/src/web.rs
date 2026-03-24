@@ -27,6 +27,9 @@ use crate::branch_store::{
     NightlyFeedItem, NightlyLaneRecord, NightlyRunRecord,
 };
 use crate::ci;
+use crate::ci_state::{
+    CiLaneExecutionReason, CiLaneFailureKind, CiTargetHealthSnapshot, CiTargetHealthState,
+};
 use crate::config::Config;
 use crate::forge;
 use crate::live::{CiLiveUpdate, CiLiveUpdates};
@@ -443,8 +446,15 @@ struct CiLaneView {
     entrypoint: String,
     status: String,
     status_tone: String,
+    execution_reason: String,
+    execution_reason_label: String,
+    failure_kind: Option<String>,
+    failure_kind_label: Option<String>,
     pikaci_run_id: Option<String>,
     pikaci_target_id: Option<String>,
+    ci_target_key: Option<String>,
+    target_health_state: Option<String>,
+    target_health_summary: Option<String>,
     log_text: Option<String>,
     retry_count: i64,
     rerun_of_lane_run_id: Option<i64>,
@@ -465,8 +475,15 @@ struct NightlyLaneView {
     status: String,
     status_badge_class: String,
     is_failed: bool,
+    execution_reason: String,
+    execution_reason_label: String,
+    failure_kind: Option<String>,
+    failure_kind_label: Option<String>,
     pikaci_run_id: Option<String>,
     pikaci_target_id: Option<String>,
+    ci_target_key: Option<String>,
+    target_health_state: Option<String>,
+    target_health_summary: Option<String>,
     log_text: Option<String>,
     retry_count: i64,
     rerun_of_lane_run_id: Option<i64>,
@@ -660,6 +677,7 @@ fn ci_status_tone(status: &str) -> &'static str {
         | "waiting"
         | "waiting_for_capacity"
         | "blocked_by_concurrency_group"
+        | "target_unhealthy"
         | "blocked_by_target_health"
         | "needs_attention" => "warning",
         _ => "neutral",
@@ -2274,15 +2292,27 @@ fn map_ci_run_view(run: BranchCiRunRecord) -> CiRunView {
 }
 
 fn map_ci_lane_view(lane: BranchCiLaneRecord) -> CiLaneView {
-    let operator_hint = lane_operator_hint(
-        &lane.status,
-        &lane.created_at,
-        lane.started_at.as_deref(),
-        lane.finished_at.as_deref(),
-        lane.last_heartbeat_at.as_deref(),
-        lane.lease_expires_at.as_deref(),
-    );
+    let target_health_summary =
+        lane_target_health_summary(lane.ci_target_key.as_deref(), lane.target_health.as_ref());
+    let operator_hint = lane_operator_hint(&LaneHintContext {
+        status: &lane.status,
+        execution_reason: lane.execution_reason,
+        failure_kind: lane.failure_kind,
+        ci_target_key: lane.ci_target_key.as_deref(),
+        target_health: lane.target_health.as_ref(),
+        created_at: &lane.created_at,
+        started_at: lane.started_at.as_deref(),
+        finished_at: lane.finished_at.as_deref(),
+        last_heartbeat_at: lane.last_heartbeat_at.as_deref(),
+        lease_expires_at: lane.lease_expires_at.as_deref(),
+    });
     let status_tone = ci_status_tone(&lane.status).to_string();
+    let failure_kind = lane.failure_kind.map(|kind| kind.as_str().to_string());
+    let failure_kind_label = lane.failure_kind.map(|kind| kind.label().to_string());
+    let target_health_state = lane
+        .target_health
+        .as_ref()
+        .map(|snapshot| snapshot.effective_state(Utc::now()).as_str().to_string());
     CiLaneView {
         id: lane.id,
         lane_id: lane.lane_id,
@@ -2290,8 +2320,15 @@ fn map_ci_lane_view(lane: BranchCiLaneRecord) -> CiLaneView {
         entrypoint: lane.entrypoint,
         status: lane.status,
         status_tone,
+        execution_reason: lane.execution_reason.as_str().to_string(),
+        execution_reason_label: lane.execution_reason.label().to_string(),
+        failure_kind,
+        failure_kind_label,
         pikaci_run_id: lane.pikaci_run_id,
         pikaci_target_id: lane.pikaci_target_id,
+        ci_target_key: lane.ci_target_key,
+        target_health_state,
+        target_health_summary,
         log_text: lane.log_text,
         retry_count: lane.retry_count,
         rerun_of_lane_run_id: lane.rerun_of_lane_run_id,
@@ -2332,14 +2369,26 @@ fn map_ci_summary_run(run: &BranchCiRunRecord) -> CiSummaryRunView {
 fn map_nightly_lane_view(lane: NightlyLaneRecord) -> NightlyLaneView {
     let status_badge_class = lane_status_badge_class(&lane.status).to_string();
     let is_failed = lane.status == "failed";
-    let operator_hint = lane_operator_hint(
-        &lane.status,
-        &lane.created_at,
-        lane.started_at.as_deref(),
-        lane.finished_at.as_deref(),
-        lane.last_heartbeat_at.as_deref(),
-        lane.lease_expires_at.as_deref(),
-    );
+    let target_health_summary =
+        lane_target_health_summary(lane.ci_target_key.as_deref(), lane.target_health.as_ref());
+    let operator_hint = lane_operator_hint(&LaneHintContext {
+        status: &lane.status,
+        execution_reason: lane.execution_reason,
+        failure_kind: lane.failure_kind,
+        ci_target_key: lane.ci_target_key.as_deref(),
+        target_health: lane.target_health.as_ref(),
+        created_at: &lane.created_at,
+        started_at: lane.started_at.as_deref(),
+        finished_at: lane.finished_at.as_deref(),
+        last_heartbeat_at: lane.last_heartbeat_at.as_deref(),
+        lease_expires_at: lane.lease_expires_at.as_deref(),
+    });
+    let failure_kind = lane.failure_kind.map(|kind| kind.as_str().to_string());
+    let failure_kind_label = lane.failure_kind.map(|kind| kind.label().to_string());
+    let target_health_state = lane
+        .target_health
+        .as_ref()
+        .map(|snapshot| snapshot.effective_state(Utc::now()).as_str().to_string());
     NightlyLaneView {
         id: lane.id,
         lane_id: lane.lane_id,
@@ -2348,8 +2397,15 @@ fn map_nightly_lane_view(lane: NightlyLaneRecord) -> NightlyLaneView {
         status: lane.status,
         status_badge_class,
         is_failed,
+        execution_reason: lane.execution_reason.as_str().to_string(),
+        execution_reason_label: lane.execution_reason.label().to_string(),
+        failure_kind,
+        failure_kind_label,
         pikaci_run_id: lane.pikaci_run_id,
         pikaci_target_id: lane.pikaci_target_id,
+        ci_target_key: lane.ci_target_key,
+        target_health_state,
+        target_health_summary,
         log_text: lane.log_text,
         retry_count: lane.retry_count,
         rerun_of_lane_run_id: lane.rerun_of_lane_run_id,
@@ -2384,28 +2440,63 @@ fn parse_ci_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         })
 }
 
-fn lane_operator_hint(
-    status: &str,
-    created_at: &str,
-    started_at: Option<&str>,
-    finished_at: Option<&str>,
-    last_heartbeat_at: Option<&str>,
-    lease_expires_at: Option<&str>,
-) -> Option<String> {
-    match status {
-        "queued" => {
-            let age = parse_ci_timestamp(created_at)
-                .map(|created| Utc::now().signed_duration_since(created).num_minutes());
-            if age.is_some_and(|minutes| minutes >= 15) {
-                Some(format!(
-                    "Queued too long since {created_at}. Wake CI or requeue if the scheduler is wedged."
-                ))
-            } else {
-                Some(format!("Queued since {created_at}."))
+struct LaneHintContext<'a> {
+    status: &'a str,
+    execution_reason: CiLaneExecutionReason,
+    failure_kind: Option<CiLaneFailureKind>,
+    ci_target_key: Option<&'a str>,
+    target_health: Option<&'a CiTargetHealthSnapshot>,
+    created_at: &'a str,
+    started_at: Option<&'a str>,
+    finished_at: Option<&'a str>,
+    last_heartbeat_at: Option<&'a str>,
+    lease_expires_at: Option<&'a str>,
+}
+
+fn lane_operator_hint(context: &LaneHintContext<'_>) -> Option<String> {
+    match context.status {
+        "queued" => match context.execution_reason {
+            CiLaneExecutionReason::BlockedByConcurrencyGroup => {
+                Some("Blocked by another lane in the same concurrency group.".to_string())
             }
-        }
+            CiLaneExecutionReason::WaitingForCapacity => Some(
+                "Waiting for scheduler capacity. Other runnable lanes are already consuming the active worker slots."
+                    .to_string(),
+            ),
+            CiLaneExecutionReason::TargetUnhealthy => {
+                let target = context.ci_target_key.unwrap_or("unknown-target");
+                let detail = context
+                    .target_health
+                    .and_then(|snapshot| {
+                        snapshot.cooloff_active_until(Utc::now()).map(|cooloff_until| {
+                            format!(
+                                " after {} consecutive infra failures until {}",
+                                snapshot.consecutive_infra_failure_count, cooloff_until
+                            )
+                        })
+                    })
+                    .unwrap_or_default();
+                Some(format!("Target {target} is currently unhealthy{detail}."))
+            }
+            CiLaneExecutionReason::StaleRecovered => Some(
+                "Recovered after a stale lease expired. This lane is ready to be reclaimed."
+                    .to_string(),
+            ),
+            _ => {
+                let age = parse_ci_timestamp(context.created_at)
+                    .map(|created| Utc::now().signed_duration_since(created).num_minutes());
+                if age.is_some_and(|minutes| minutes >= 15) {
+                    Some(format!(
+                        "Queued too long since {}. Wake CI or requeue if the scheduler is wedged.",
+                        context.created_at
+                    ))
+                } else {
+                    Some(format!("Queued since {}.", context.created_at))
+                }
+            }
+        },
         "running" => {
-            let lease_note = lease_expires_at.map_or_else(
+            let lease_note = context.lease_expires_at.map_or_else(
                 || "Running with no lease metadata.".to_string(),
                 |lease| {
                     let prefix = match parse_ci_timestamp(lease) {
@@ -2417,20 +2508,47 @@ fn lane_operator_hint(
                     format!("{prefix} until {lease}.")
                 },
             );
-            let heartbeat_note = last_heartbeat_at
+            let heartbeat_note = context
+                .last_heartbeat_at
                 .map(|heartbeat| format!(" Last heartbeat {heartbeat}."))
                 .unwrap_or_default();
             Some(format!("{lease_note}{heartbeat_note}"))
         }
-        "failed" => Some(match finished_at {
-            Some(finished_at) => format!("Failed at {finished_at}."),
-            None => "Failed.".to_string(),
-        }),
+        "failed" => {
+            let failure_detail = context
+                .failure_kind
+                .map(|kind| format!(" Classified as {}.", kind.label()))
+                .unwrap_or_default();
+            Some(match context.finished_at {
+                Some(finished_at) => format!("Failed at {finished_at}.{failure_detail}"),
+                None => format!("Failed.{failure_detail}"),
+            })
+        }
         "success" | "skipped" => None,
-        _ => started_at
+        _ => context
+            .started_at
             .map(|started_at| format!("State updated after start at {started_at}."))
-            .or_else(|| Some(format!("Current state: {status}."))),
+            .or_else(|| Some(format!("Current state: {}.", context.status))),
     }
+}
+
+fn lane_target_health_summary(
+    ci_target_key: Option<&str>,
+    target_health: Option<&CiTargetHealthSnapshot>,
+) -> Option<String> {
+    let snapshot = target_health?;
+    if snapshot.effective_state(Utc::now()) != CiTargetHealthState::Unhealthy {
+        return None;
+    }
+    let target = ci_target_key.unwrap_or(&snapshot.target_id);
+    let cooloff_suffix = snapshot
+        .cooloff_active_until(Utc::now())
+        .map(|cooloff_until| format!(" · cooloff until {cooloff_until}"))
+        .unwrap_or_default();
+    Some(format!(
+        "target {target} unhealthy · consecutive infra failures {}{cooloff_suffix}",
+        snapshot.consecutive_infra_failure_count
+    ))
 }
 #[derive(serde::Deserialize)]
 struct ForgeBranchResolveQuery {
@@ -5202,6 +5320,132 @@ mod tests {
             json["ci_runs"][0]["lanes"][0]["pikaci_target_id"],
             "pre-merge-pika-rust"
         );
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][0]["execution_reason"],
+            "running"
+        );
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][0]["ci_target_key"],
+            "pre-merge-pika-rust"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_forge_branch_detail_exposes_waiting_and_unhealthy_lane_state() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/api-waiting", "head-waiting"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-waiting",
+                &[
+                    crate::ci_manifest::ForgeLane {
+                        id: "wait-capacity".to_string(),
+                        title: "wait-capacity".to_string(),
+                        entrypoint: "just checks::wait-capacity".to_string(),
+                        command: vec!["just".to_string(), "checks::wait-capacity".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    crate::ci_manifest::ForgeLane {
+                        id: "apple-sanity".to_string(),
+                        title: "apple-sanity".to_string(),
+                        entrypoint: "just checks::apple-sanity".to_string(),
+                        command: vec!["just".to_string(), "checks::apple-sanity".to_string()],
+                        paths: vec![],
+                        concurrency_group: Some("apple-host".to_string()),
+                        staged_linux_target: Some("apple-host".to_string()),
+                    },
+                ],
+            )
+            .expect("queue ci");
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET execution_reason = 'waiting_for_capacity'
+                     WHERE lane_id = 'wait-capacity'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET execution_reason = 'target_unhealthy'
+                     WHERE lane_id = 'apple-sanity'",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO ci_target_health(
+                        target_id,
+                        state,
+                        consecutive_infra_failure_count,
+                        last_failure_at,
+                        last_failure_kind,
+                        cooloff_until,
+                        updated_at
+                     ) VALUES (?1, 'unhealthy', 2, CURRENT_TIMESTAMP, 'infrastructure', datetime('now', '+15 minutes'), CURRENT_TIMESTAMP)",
+                    rusqlite::params!["apple-host"],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("set waiting/unhealthy state");
+        let config = Config {
+            repos: vec!["sledtools/pika".to_string()],
+            forge_repo: Some(ForgeRepoConfig {
+                repo: "sledtools/pika".to_string(),
+                canonical_git_dir: "/tmp/pika.git".to_string(),
+                default_branch: "master".to_string(),
+                ci_concurrency: Some(1),
+                mirror_remote: None,
+                mirror_poll_interval_secs: None,
+                ci_command: vec!["just".to_string(), "pre-merge".to_string()],
+                hook_url: None,
+            }),
+            poll_interval_secs: 60,
+            model: "test-model".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            github_token_env: "GITHUB_TOKEN".to_string(),
+            merged_lookback_hours: 72,
+            worker_concurrency: 1,
+            retry_backoff_secs: 120,
+            webhook_secret_env: "PIKA_NEWS_WEBHOOK_SECRET".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8787,
+            allowed_npubs: vec![],
+            bootstrap_admin_npubs: vec![],
+        };
+        let headers = trusted_headers(&store, TRUSTED_NPUB);
+        let state = test_state(store, config);
+
+        let response =
+            api_forge_branch_detail_handler(State(state), Path(branch.branch_id), headers)
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][0]["execution_reason"],
+            "waiting_for_capacity"
+        );
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][1]["execution_reason"],
+            "target_unhealthy"
+        );
+        assert_eq!(
+            json["ci_runs"][0]["lanes"][1]["target_health_state"],
+            "unhealthy"
+        );
+        assert!(json["ci_runs"][0]["lanes"][1]["target_health_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("apple-host"));
     }
 
     #[tokio::test]
@@ -6447,6 +6691,85 @@ paths = ["README.md", "feature.txt", "ci/forge-lanes.toml"]
         assert!(ci_rendered.contains("pikaci run"));
         assert!(ci_rendered.contains("pikaci-run-branch-ui"));
         assert!(ci_rendered.contains("pre-merge-pika-rust"));
+    }
+
+    #[test]
+    fn branch_ci_page_renders_waiting_and_unhealthy_lane_state() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/state-ui", "head-state-ui"))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-state-ui",
+                &[
+                    crate::ci_manifest::ForgeLane {
+                        id: "wait-capacity".to_string(),
+                        title: "wait-capacity".to_string(),
+                        entrypoint: "just checks::wait-capacity".to_string(),
+                        command: vec!["just".to_string(), "checks::wait-capacity".to_string()],
+                        paths: vec![],
+                        concurrency_group: None,
+                        staged_linux_target: None,
+                    },
+                    crate::ci_manifest::ForgeLane {
+                        id: "apple-sanity".to_string(),
+                        title: "apple-sanity".to_string(),
+                        entrypoint: "just checks::apple-sanity".to_string(),
+                        command: vec!["just".to_string(), "checks::apple-sanity".to_string()],
+                        paths: vec![],
+                        concurrency_group: Some("apple-host".to_string()),
+                        staged_linux_target: Some("apple-host".to_string()),
+                    },
+                ],
+            )
+            .expect("queue ci");
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET execution_reason = 'waiting_for_capacity'
+                     WHERE lane_id = 'wait-capacity'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET execution_reason = 'target_unhealthy'
+                     WHERE lane_id = 'apple-sanity'",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO ci_target_health(
+                        target_id,
+                        state,
+                        consecutive_infra_failure_count,
+                        last_failure_at,
+                        last_failure_kind,
+                        cooloff_until,
+                        updated_at
+                     ) VALUES (?1, 'unhealthy', 2, CURRENT_TIMESTAMP, 'infrastructure', datetime('now', '+15 minutes'), CURRENT_TIMESTAMP)",
+                    rusqlite::params!["apple-host"],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("set waiting/unhealthy state");
+
+        let detail = store
+            .get_branch_detail(branch.branch_id)
+            .expect("branch detail")
+            .expect("detail");
+        let ci_runs = store
+            .list_branch_ci_runs(branch.branch_id, 8)
+            .expect("branch ci runs");
+        let rendered = render_branch_ci_template_with_notices(detail, ci_runs, Vec::new(), false)
+            .expect("render branch ci template")
+            .render()
+            .expect("render branch ci html");
+        assert!(rendered.contains("waiting for scheduler capacity"));
+        assert!(rendered.contains("target apple-host unhealthy"));
     }
 
     #[test]

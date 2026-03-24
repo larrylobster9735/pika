@@ -1,10 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 use anyhow::{bail, Context};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::ci_manifest::ForgeLane;
+use crate::ci_state::{
+    classify_ci_failure, configured_target_key_for_lane, next_target_cooloff_until,
+    CiLaneExecutionReason, CiLaneFailureKind, CiLaneStatus, CiTargetHealthSnapshot,
+    CiTargetHealthState, CI_TARGET_HEALTH_INFRA_FAILURE_THRESHOLD,
+};
 use crate::storage::Store;
 
 pub const CI_LANE_LEASE_LOST: &str = "ci lane lease lost";
@@ -107,8 +113,12 @@ pub struct BranchCiLaneRecord {
     pub title: String,
     pub entrypoint: String,
     pub status: String,
+    pub execution_reason: CiLaneExecutionReason,
+    pub failure_kind: Option<CiLaneFailureKind>,
     pub pikaci_run_id: Option<String>,
     pub pikaci_target_id: Option<String>,
+    pub ci_target_key: Option<String>,
+    pub target_health: Option<CiTargetHealthSnapshot>,
     pub log_text: Option<String>,
     pub retry_count: i64,
     pub rerun_of_lane_run_id: Option<i64>,
@@ -168,8 +178,12 @@ pub struct NightlyLaneRecord {
     pub title: String,
     pub entrypoint: String,
     pub status: String,
+    pub execution_reason: CiLaneExecutionReason,
+    pub failure_kind: Option<CiLaneFailureKind>,
     pub pikaci_run_id: Option<String>,
     pub pikaci_target_id: Option<String>,
+    pub ci_target_key: Option<String>,
+    pub target_health: Option<CiTargetHealthSnapshot>,
     pub log_text: Option<String>,
     pub retry_count: i64,
     pub rerun_of_lane_run_id: Option<i64>,
@@ -243,6 +257,7 @@ struct BranchLaneRerunSource {
     entrypoint: String,
     command_json: String,
     concurrency_group: Option<String>,
+    ci_target_key: Option<String>,
     status: String,
 }
 
@@ -266,6 +281,7 @@ struct NightlyLaneRerunSource {
     entrypoint: String,
     command_json: String,
     concurrency_group: Option<String>,
+    ci_target_key: Option<String>,
     status: String,
 }
 
@@ -741,6 +757,7 @@ impl Store {
             for lane in lanes {
                 let command_json =
                     serde_json::to_string(&lane.command).context("serialize branch lane command")?;
+                let ci_target_key = configured_target_key_for_lane(lane);
                 tx.execute(
                     "INSERT INTO branch_ci_run_lanes(
                         branch_ci_run_id,
@@ -749,15 +766,18 @@ impl Store {
                         entrypoint,
                         command_json,
                         concurrency_group,
+                        ci_target_key,
+                        execution_reason,
                         status
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'queued')",
                     params![
                         suite_id,
                         lane.id,
                         lane.title,
                         lane.entrypoint,
                         command_json,
-                        lane.concurrency_group
+                        lane.concurrency_group,
+                        ci_target_key,
                     ],
                 )
                 .with_context(|| format!("insert branch ci lane for suite {}", suite_id))?;
@@ -936,6 +956,7 @@ impl Store {
             for lane in lanes {
                 let command_json =
                     serde_json::to_string(&lane.command).context("serialize nightly lane command")?;
+                let ci_target_key = configured_target_key_for_lane(lane);
                 tx.execute(
                     "INSERT INTO nightly_run_lanes(
                         nightly_run_id,
@@ -944,15 +965,18 @@ impl Store {
                         entrypoint,
                         command_json,
                         concurrency_group,
+                        ci_target_key,
+                        execution_reason,
                         status
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'queued')",
                     params![
                         nightly_run_id,
                         lane.id,
                         lane.title,
                         lane.entrypoint,
                         command_json,
-                        lane.concurrency_group
+                        lane.concurrency_group,
+                        ci_target_key,
                     ],
                 )
                 .with_context(|| format!("insert nightly lane for run {}", nightly_run_id))?;
@@ -981,6 +1005,7 @@ impl Store {
                             lane.entrypoint,
                             lane.command_json,
                             lane.concurrency_group,
+                            lane.ci_target_key,
                             lane.status
                      FROM branch_ci_run_lanes lane
                      JOIN branch_ci_runs suite ON suite.id = lane.branch_ci_run_id
@@ -996,7 +1021,8 @@ impl Store {
                             entrypoint: row.get(5)?,
                             command_json: row.get(6)?,
                             concurrency_group: row.get(7)?,
-                            status: row.get(8)?,
+                            ci_target_key: row.get(8)?,
+                            status: row.get(9)?,
                         })
                     },
                 )
@@ -1042,9 +1068,11 @@ impl Store {
                     entrypoint,
                     command_json,
                     concurrency_group,
+                    ci_target_key,
+                    execution_reason,
                     status,
                     rerun_of_lane_run_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'queued', ?8)",
                 params![
                     rerun_suite_id,
                     row.lane_id,
@@ -1052,6 +1080,7 @@ impl Store {
                     row.entrypoint,
                     row.command_json,
                     row.concurrency_group,
+                    row.ci_target_key,
                     lane_run_id
                 ],
             )
@@ -1082,6 +1111,7 @@ impl Store {
                             lane.entrypoint,
                             lane.command_json,
                             lane.concurrency_group,
+                            lane.ci_target_key,
                             lane.status
                      FROM nightly_run_lanes lane
                      JOIN nightly_runs nightly ON nightly.id = lane.nightly_run_id
@@ -1098,7 +1128,8 @@ impl Store {
                             entrypoint: row.get(6)?,
                             command_json: row.get(7)?,
                             concurrency_group: row.get(8)?,
-                            status: row.get(9)?,
+                            ci_target_key: row.get(9)?,
+                            status: row.get(10)?,
                         })
                     },
                 )
@@ -1143,9 +1174,11 @@ impl Store {
                     entrypoint,
                     command_json,
                     concurrency_group,
+                    ci_target_key,
+                    execution_reason,
                     status,
                     rerun_of_lane_run_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'queued', ?8)",
                 params![
                     rerun_run_id,
                     row.lane_id,
@@ -1153,6 +1186,7 @@ impl Store {
                     row.entrypoint,
                     row.command_json,
                     row.concurrency_group,
+                    row.ci_target_key,
                     lane_run_id
                 ],
             )
@@ -1179,7 +1213,8 @@ impl Store {
                             lane.lane_id,
                             lane.status,
                             lane.claim_token,
-                            lane.log_text
+                            lane.log_text,
+                            lane.execution_reason
                      FROM branch_ci_run_lanes lane
                      JOIN branch_ci_runs suite ON suite.id = lane.branch_ci_run_id
                      WHERE lane.id = ?1 AND suite.branch_id = ?2",
@@ -1207,6 +1242,7 @@ impl Store {
             tx.execute(
                 "UPDATE branch_ci_run_lanes
                  SET status = 'failed',
+                     failure_kind = NULL,
                      log_text = ?1,
                      finished_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL,
@@ -1237,7 +1273,8 @@ impl Store {
                             lane.lane_id,
                             lane.status,
                             lane.claim_token,
-                            lane.log_text
+                            lane.log_text,
+                            lane.execution_reason
                      FROM branch_ci_run_lanes lane
                      JOIN branch_ci_runs suite ON suite.id = lane.branch_ci_run_id
                      WHERE lane.id = ?1 AND suite.branch_id = ?2",
@@ -1267,6 +1304,8 @@ impl Store {
             tx.execute(
                 "UPDATE branch_ci_run_lanes
                  SET status = 'queued',
+                     execution_reason = 'queued',
+                     failure_kind = NULL,
                      log_text = NULL,
                      pikaci_run_id = NULL,
                      pikaci_target_id = NULL,
@@ -1312,6 +1351,8 @@ impl Store {
                 .execute(
                     "UPDATE branch_ci_run_lanes
                      SET status = 'queued',
+                         execution_reason = 'queued',
+                         failure_kind = NULL,
                          log_text = NULL,
                          pikaci_run_id = NULL,
                          pikaci_target_id = NULL,
@@ -1350,7 +1391,8 @@ impl Store {
                             lane.lane_id,
                             lane.status,
                             lane.claim_token,
-                            lane.log_text
+                            lane.log_text,
+                            lane.execution_reason
                      FROM nightly_run_lanes lane
                      JOIN nightly_runs nightly ON nightly.id = lane.nightly_run_id
                      WHERE lane.id = ?1 AND nightly.id = ?2",
@@ -1378,6 +1420,7 @@ impl Store {
             tx.execute(
                 "UPDATE nightly_run_lanes
                  SET status = 'failed',
+                     failure_kind = NULL,
                      log_text = ?1,
                      finished_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL,
@@ -1408,7 +1451,8 @@ impl Store {
                             lane.lane_id,
                             lane.status,
                             lane.claim_token,
-                            lane.log_text
+                            lane.log_text,
+                            lane.execution_reason
                      FROM nightly_run_lanes lane
                      JOIN nightly_runs nightly ON nightly.id = lane.nightly_run_id
                      WHERE lane.id = ?1 AND nightly.id = ?2",
@@ -1438,6 +1482,8 @@ impl Store {
             tx.execute(
                 "UPDATE nightly_run_lanes
                  SET status = 'queued',
+                     execution_reason = 'queued',
+                     failure_kind = NULL,
                      log_text = NULL,
                      pikaci_run_id = NULL,
                      pikaci_target_id = NULL,
@@ -1479,6 +1525,8 @@ impl Store {
                 .execute(
                     "UPDATE nightly_run_lanes
                      SET status = 'queued',
+                         execution_reason = 'queued',
+                         failure_kind = NULL,
                          log_text = NULL,
                          pikaci_run_id = NULL,
                          pikaci_target_id = NULL,
@@ -1966,6 +2014,8 @@ impl Store {
                 .execute(
                     "UPDATE branch_ci_run_lanes
                      SET status = 'queued',
+                         execution_reason = 'stale_recovered',
+                         failure_kind = NULL,
                          log_text = NULL,
                          pikaci_run_id = NULL,
                          pikaci_target_id = NULL,
@@ -1984,6 +2034,8 @@ impl Store {
                 .execute(
                     "UPDATE nightly_run_lanes
                      SET status = 'queued',
+                         execution_reason = 'stale_recovered',
+                         failure_kind = NULL,
                          log_text = NULL,
                          pikaci_run_id = NULL,
                          pikaci_target_id = NULL,
@@ -2050,6 +2102,21 @@ impl Store {
         })
     }
 
+    pub fn refresh_ci_lane_execution_reasons(
+        &self,
+        ci_concurrency: Option<usize>,
+    ) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("start refresh ci execution reasons transaction")?;
+            refresh_ci_lane_execution_reasons_tx(&tx, ci_concurrency)?;
+            tx.commit()
+                .context("commit refresh ci execution reasons transaction")?;
+            Ok(())
+        })
+    }
+
     pub fn claim_pending_branch_ci_lane_runs(
         &self,
         limit: usize,
@@ -2065,11 +2132,13 @@ impl Store {
             let lease_window = format!("+{} seconds", lease_secs);
             let mut running_groups =
                 running_concurrency_groups(&tx).context("load running ci concurrency groups")?;
+            let unhealthy_targets =
+                current_unhealthy_target_ids(&tx, Utc::now()).context("load unhealthy ci targets")?;
             let mut jobs = Vec::new();
             {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT lane.id, lane.claim_token, lane.branch_ci_run_id, suite.branch_id, suite.source_head_sha, lane.lane_id, lane.title, lane.entrypoint, lane.command_json, lane.concurrency_group
+                        "SELECT lane.id, lane.claim_token, lane.branch_ci_run_id, suite.branch_id, suite.source_head_sha, lane.lane_id, lane.title, lane.entrypoint, lane.command_json, lane.concurrency_group, lane.ci_target_key
                          FROM branch_ci_run_lanes lane
                          JOIN branch_ci_runs suite ON suite.id = lane.branch_ci_run_id
                          WHERE lane.status = 'queued'
@@ -2081,6 +2150,7 @@ impl Store {
                         let command_json: String = row.get(8)?;
                         let command: Vec<String> =
                             serde_json::from_str(&command_json).unwrap_or_default();
+                        let _ci_target_key: Option<String> = row.get(10)?;
                         Ok(PendingBranchCiLaneJob {
                             lane_run_id: row.get(0)?,
                             claim_token: row.get::<_, i64>(1)? + 1,
@@ -2100,6 +2170,19 @@ impl Store {
                     candidates.push(row.context("read queued branch ci lane row")?);
                 }
                 for job in candidates {
+                    let target_key = tx
+                        .query_row(
+                            "SELECT ci_target_key FROM branch_ci_run_lanes WHERE id = ?1",
+                            params![job.lane_run_id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .with_context(|| format!("lookup target key for branch lane {}", job.lane_run_id))?;
+                    if target_key
+                        .as_deref()
+                        .is_some_and(|target| unhealthy_targets.contains(target))
+                    {
+                        continue;
+                    }
                     if let Some(group) = job.concurrency_group.as_deref() {
                         if running_groups.contains(group) {
                             continue;
@@ -2109,6 +2192,8 @@ impl Store {
                         .execute(
                         "UPDATE branch_ci_run_lanes
                          SET status = 'running',
+                             execution_reason = 'running',
+                             failure_kind = NULL,
                              log_text = NULL,
                              pikaci_run_id = NULL,
                              pikaci_target_id = NULL,
@@ -2183,32 +2268,69 @@ impl Store {
         status: &str,
         log_text: &str,
     ) -> anyhow::Result<()> {
+        let failure_kind = if status == CiLaneStatus::Failed.as_str() {
+            Some(classify_ci_failure(log_text))
+        } else {
+            None
+        };
+        self.finish_branch_ci_lane_run_with_kind(
+            lane_run_id,
+            claim_token,
+            status,
+            log_text,
+            failure_kind,
+        )
+    }
+
+    pub fn finish_branch_ci_lane_run_with_kind(
+        &self,
+        lane_run_id: i64,
+        claim_token: i64,
+        status: &str,
+        log_text: &str,
+        failure_kind: Option<CiLaneFailureKind>,
+    ) -> anyhow::Result<()> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start finish branch ci lane transaction")?;
-            let suite_id: i64 = tx
+            let (suite_id, ci_target_key): (i64, Option<String>) = tx
                 .query_row(
-                    "SELECT branch_ci_run_id FROM branch_ci_run_lanes WHERE id = ?1",
+                    "SELECT branch_ci_run_id, ci_target_key FROM branch_ci_run_lanes WHERE id = ?1",
                     params![lane_run_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .with_context(|| format!("lookup branch ci suite for lane {}", lane_run_id))?;
             let updated = tx
                 .execute(
                     "UPDATE branch_ci_run_lanes
                  SET status = ?1,
-                     log_text = ?2,
+                     failure_kind = ?2,
+                     log_text = ?3,
+                     execution_reason = 'running',
                      finished_at = CURRENT_TIMESTAMP,
                      last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL
-                 WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
-                    params![status, log_text, lane_run_id, claim_token],
+                 WHERE id = ?4 AND status = 'running' AND claim_token = ?5",
+                    params![
+                        status,
+                        failure_kind.map(|kind| kind.as_str()),
+                        log_text,
+                        lane_run_id,
+                        claim_token
+                    ],
                 )
                 .with_context(|| format!("finish branch ci lane {}", lane_run_id))?;
             if updated == 0 {
                 bail!("{CI_LANE_LEASE_LOST}");
             }
+            update_target_health_after_lane_finish(
+                &tx,
+                ci_target_key.as_deref(),
+                status,
+                failure_kind,
+                Utc::now(),
+            )?;
             update_branch_ci_suite_status(&tx, suite_id)?;
             tx.commit()
                 .context("commit finish branch ci lane transaction")?;
@@ -2228,7 +2350,8 @@ impl Store {
                 .execute(
                     "UPDATE branch_ci_run_lanes
                      SET pikaci_run_id = ?1,
-                         pikaci_target_id = ?2
+                         pikaci_target_id = ?2,
+                         ci_target_key = COALESCE(ci_target_key, ?2)
                      WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
                     params![pikaci_run_id, pikaci_target_id, lane_run_id, claim_token],
                 )
@@ -2255,11 +2378,13 @@ impl Store {
             let lease_window = format!("+{} seconds", lease_secs);
             let mut running_groups =
                 running_concurrency_groups(&tx).context("load running ci concurrency groups")?;
+            let unhealthy_targets =
+                current_unhealthy_target_ids(&tx, Utc::now()).context("load unhealthy ci targets")?;
             let mut jobs = Vec::new();
             {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT lane.id, lane.claim_token, lane.nightly_run_id, nightly.source_head_sha, lane.lane_id, lane.command_json, lane.concurrency_group
+                        "SELECT lane.id, lane.claim_token, lane.nightly_run_id, nightly.source_head_sha, lane.lane_id, lane.command_json, lane.concurrency_group, lane.ci_target_key
                          FROM nightly_run_lanes lane
                          JOIN nightly_runs nightly ON nightly.id = lane.nightly_run_id
                          WHERE lane.status = 'queued'
@@ -2271,6 +2396,7 @@ impl Store {
                         let command_json: String = row.get(5)?;
                         let command: Vec<String> =
                             serde_json::from_str(&command_json).unwrap_or_default();
+                        let _ci_target_key: Option<String> = row.get(7)?;
                         Ok(PendingNightlyLaneJob {
                             lane_run_id: row.get(0)?,
                             claim_token: row.get::<_, i64>(1)? + 1,
@@ -2287,6 +2413,19 @@ impl Store {
                     candidates.push(row.context("read queued nightly lane row")?);
                 }
                 for job in candidates {
+                    let target_key = tx
+                        .query_row(
+                            "SELECT ci_target_key FROM nightly_run_lanes WHERE id = ?1",
+                            params![job.lane_run_id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .with_context(|| format!("lookup target key for nightly lane {}", job.lane_run_id))?;
+                    if target_key
+                        .as_deref()
+                        .is_some_and(|target| unhealthy_targets.contains(target))
+                    {
+                        continue;
+                    }
                     if let Some(group) = job.concurrency_group.as_deref() {
                         if running_groups.contains(group) {
                             continue;
@@ -2296,6 +2435,8 @@ impl Store {
                         .execute(
                         "UPDATE nightly_run_lanes
                          SET status = 'running',
+                             execution_reason = 'running',
+                             failure_kind = NULL,
                              log_text = NULL,
                              pikaci_run_id = NULL,
                              pikaci_target_id = NULL,
@@ -2370,32 +2511,69 @@ impl Store {
         status: &str,
         log_text: &str,
     ) -> anyhow::Result<()> {
+        let failure_kind = if status == CiLaneStatus::Failed.as_str() {
+            Some(classify_ci_failure(log_text))
+        } else {
+            None
+        };
+        self.finish_nightly_lane_run_with_kind(
+            lane_run_id,
+            claim_token,
+            status,
+            log_text,
+            failure_kind,
+        )
+    }
+
+    pub fn finish_nightly_lane_run_with_kind(
+        &self,
+        lane_run_id: i64,
+        claim_token: i64,
+        status: &str,
+        log_text: &str,
+        failure_kind: Option<CiLaneFailureKind>,
+    ) -> anyhow::Result<()> {
         self.with_connection(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("start finish nightly lane transaction")?;
-            let nightly_run_id: i64 = tx
+            let (nightly_run_id, ci_target_key): (i64, Option<String>) = tx
                 .query_row(
-                    "SELECT nightly_run_id FROM nightly_run_lanes WHERE id = ?1",
+                    "SELECT nightly_run_id, ci_target_key FROM nightly_run_lanes WHERE id = ?1",
                     params![lane_run_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .with_context(|| format!("lookup nightly run for lane {}", lane_run_id))?;
             let updated = tx
                 .execute(
                     "UPDATE nightly_run_lanes
                  SET status = ?1,
-                     log_text = ?2,
+                     failure_kind = ?2,
+                     log_text = ?3,
+                     execution_reason = 'running',
                      finished_at = CURRENT_TIMESTAMP,
                      last_heartbeat_at = CURRENT_TIMESTAMP,
                      lease_expires_at = NULL
-                 WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
-                    params![status, log_text, lane_run_id, claim_token],
+                 WHERE id = ?4 AND status = 'running' AND claim_token = ?5",
+                    params![
+                        status,
+                        failure_kind.map(|kind| kind.as_str()),
+                        log_text,
+                        lane_run_id,
+                        claim_token
+                    ],
                 )
                 .with_context(|| format!("finish nightly lane {}", lane_run_id))?;
             if updated == 0 {
                 bail!("{CI_LANE_LEASE_LOST}");
             }
+            update_target_health_after_lane_finish(
+                &tx,
+                ci_target_key.as_deref(),
+                status,
+                failure_kind,
+                Utc::now(),
+            )?;
             update_nightly_run_status(&tx, nightly_run_id)?;
             tx.commit()
                 .context("commit finish nightly lane transaction")?;
@@ -2415,7 +2593,8 @@ impl Store {
                 .execute(
                     "UPDATE nightly_run_lanes
                      SET pikaci_run_id = ?1,
-                         pikaci_target_id = ?2
+                         pikaci_target_id = ?2,
+                         ci_target_key = COALESCE(ci_target_key, ?2)
                      WHERE id = ?3 AND status = 'running' AND claim_token = ?4",
                     params![pikaci_run_id, pikaci_target_id, lane_run_id, claim_token],
                 )
@@ -2529,7 +2708,7 @@ fn list_branch_ci_run_lanes(
 ) -> anyhow::Result<Vec<BranchCiLaneRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, lane_id, title, entrypoint, status, pikaci_run_id, pikaci_target_id, log_text, retry_count, rerun_of_lane_run_id, created_at, started_at, finished_at, last_heartbeat_at, lease_expires_at
+            "SELECT id, lane_id, title, entrypoint, status, execution_reason, failure_kind, pikaci_run_id, pikaci_target_id, ci_target_key, log_text, retry_count, rerun_of_lane_run_id, created_at, started_at, finished_at, last_heartbeat_at, lease_expires_at
              FROM branch_ci_run_lanes
              WHERE branch_ci_run_id = ?1
              ORDER BY id ASC",
@@ -2537,22 +2716,27 @@ fn list_branch_ci_run_lanes(
         .context("prepare branch ci lane list query")?;
     let rows = stmt
         .query_map(params![suite_id], |row| {
+            let ci_target_key: Option<String> = row.get(9)?;
             Ok(BranchCiLaneRecord {
                 id: row.get(0)?,
                 lane_id: row.get(1)?,
                 title: row.get(2)?,
                 entrypoint: row.get(3)?,
                 status: row.get(4)?,
-                pikaci_run_id: row.get(5)?,
-                pikaci_target_id: row.get(6)?,
-                log_text: row.get(7)?,
-                retry_count: row.get(8)?,
-                rerun_of_lane_run_id: row.get(9)?,
-                created_at: row.get(10)?,
-                started_at: row.get(11)?,
-                finished_at: row.get(12)?,
-                last_heartbeat_at: row.get(13)?,
-                lease_expires_at: row.get(14)?,
+                execution_reason: parse_execution_reason(&row.get::<_, String>(5)?)?,
+                failure_kind: parse_optional_failure_kind(row.get::<_, Option<String>>(6)?)?,
+                pikaci_run_id: row.get(7)?,
+                pikaci_target_id: row.get(8)?,
+                ci_target_key,
+                target_health: None,
+                log_text: row.get(10)?,
+                retry_count: row.get(11)?,
+                rerun_of_lane_run_id: row.get(12)?,
+                created_at: row.get(13)?,
+                started_at: row.get(14)?,
+                finished_at: row.get(15)?,
+                last_heartbeat_at: row.get(16)?,
+                lease_expires_at: row.get(17)?,
             })
         })
         .context("query branch ci lane rows")?;
@@ -2560,6 +2744,7 @@ fn list_branch_ci_run_lanes(
     for row in rows {
         lanes.push(row.context("read branch ci lane row")?);
     }
+    hydrate_lane_target_health(conn, &mut lanes)?;
     Ok(lanes)
 }
 
@@ -2569,7 +2754,7 @@ fn list_nightly_run_lanes(
 ) -> anyhow::Result<Vec<NightlyLaneRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, lane_id, title, entrypoint, status, pikaci_run_id, pikaci_target_id, log_text, retry_count, rerun_of_lane_run_id, created_at, started_at, finished_at, last_heartbeat_at, lease_expires_at
+            "SELECT id, lane_id, title, entrypoint, status, execution_reason, failure_kind, pikaci_run_id, pikaci_target_id, ci_target_key, log_text, retry_count, rerun_of_lane_run_id, created_at, started_at, finished_at, last_heartbeat_at, lease_expires_at
              FROM nightly_run_lanes
              WHERE nightly_run_id = ?1
              ORDER BY id ASC",
@@ -2577,22 +2762,27 @@ fn list_nightly_run_lanes(
         .context("prepare nightly lane list query")?;
     let rows = stmt
         .query_map(params![nightly_run_id], |row| {
+            let ci_target_key: Option<String> = row.get(9)?;
             Ok(NightlyLaneRecord {
                 id: row.get(0)?,
                 lane_id: row.get(1)?,
                 title: row.get(2)?,
                 entrypoint: row.get(3)?,
                 status: row.get(4)?,
-                pikaci_run_id: row.get(5)?,
-                pikaci_target_id: row.get(6)?,
-                log_text: row.get(7)?,
-                retry_count: row.get(8)?,
-                rerun_of_lane_run_id: row.get(9)?,
-                created_at: row.get(10)?,
-                started_at: row.get(11)?,
-                finished_at: row.get(12)?,
-                last_heartbeat_at: row.get(13)?,
-                lease_expires_at: row.get(14)?,
+                execution_reason: parse_execution_reason(&row.get::<_, String>(5)?)?,
+                failure_kind: parse_optional_failure_kind(row.get::<_, Option<String>>(6)?)?,
+                pikaci_run_id: row.get(7)?,
+                pikaci_target_id: row.get(8)?,
+                ci_target_key,
+                target_health: None,
+                log_text: row.get(10)?,
+                retry_count: row.get(11)?,
+                rerun_of_lane_run_id: row.get(12)?,
+                created_at: row.get(13)?,
+                started_at: row.get(14)?,
+                finished_at: row.get(15)?,
+                last_heartbeat_at: row.get(16)?,
+                lease_expires_at: row.get(17)?,
             })
         })
         .context("query nightly lane rows")?;
@@ -2600,7 +2790,423 @@ fn list_nightly_run_lanes(
     for row in rows {
         lanes.push(row.context("read nightly lane row")?);
     }
+    hydrate_nightly_lane_target_health(conn, &mut lanes)?;
     Ok(lanes)
+}
+
+fn parse_execution_reason(raw: &str) -> rusqlite::Result<CiLaneExecutionReason> {
+    CiLaneExecutionReason::from_str(raw).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ci execution reason `{raw}`"),
+            )),
+        )
+    })
+}
+
+fn parse_optional_failure_kind(raw: Option<String>) -> rusqlite::Result<Option<CiLaneFailureKind>> {
+    raw.map(|value| {
+        CiLaneFailureKind::from_str(&value).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                value.len(),
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid ci failure kind `{value}`"),
+                )),
+            )
+        })
+    })
+    .transpose()
+}
+
+fn parse_target_health_state(raw: &str) -> rusqlite::Result<CiTargetHealthState> {
+    CiTargetHealthState::from_str(raw).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ci target health state `{raw}`"),
+            )),
+        )
+    })
+}
+
+fn load_ci_target_health_snapshots(
+    conn: &Connection,
+    target_ids: &[String],
+) -> anyhow::Result<HashMap<String, CiTargetHealthSnapshot>> {
+    if target_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (0..target_ids.len())
+        .map(|idx| format!("?{}", idx + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT target_id, state, consecutive_infra_failure_count, last_success_at, last_failure_at, last_failure_kind, cooloff_until
+         FROM ci_target_health
+         WHERE target_id IN ({placeholders})"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare ci target health query")?;
+    let mut params_dyn: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(target_ids.len());
+    for target_id in target_ids {
+        params_dyn.push(target_id);
+    }
+    let rows = stmt
+        .query_map(params_dyn.as_slice(), |row| {
+            let last_failure_kind = parse_optional_failure_kind(row.get(5)?)?;
+            Ok(CiTargetHealthSnapshot {
+                target_id: row.get(0)?,
+                state: parse_target_health_state(&row.get::<_, String>(1)?)?,
+                consecutive_infra_failure_count: row.get(2)?,
+                last_success_at: row.get(3)?,
+                last_failure_at: row.get(4)?,
+                last_failure_kind,
+                cooloff_until: row.get(6)?,
+            })
+        })
+        .context("query ci target health rows")?;
+    let mut snapshots = HashMap::new();
+    for row in rows {
+        let snapshot = row.context("read ci target health row")?;
+        snapshots.insert(snapshot.target_id.clone(), snapshot);
+    }
+    Ok(snapshots)
+}
+
+fn hydrate_lane_target_health(
+    conn: &Connection,
+    lanes: &mut [BranchCiLaneRecord],
+) -> anyhow::Result<()> {
+    let target_ids = lanes
+        .iter()
+        .filter_map(|lane| lane.ci_target_key.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let snapshots = load_ci_target_health_snapshots(conn, &target_ids)?;
+    for lane in lanes {
+        lane.target_health = lane
+            .ci_target_key
+            .as_ref()
+            .and_then(|target_id| snapshots.get(target_id).cloned());
+    }
+    Ok(())
+}
+
+fn hydrate_nightly_lane_target_health(
+    conn: &Connection,
+    lanes: &mut [NightlyLaneRecord],
+) -> anyhow::Result<()> {
+    let target_ids = lanes
+        .iter()
+        .filter_map(|lane| lane.ci_target_key.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let snapshots = load_ci_target_health_snapshots(conn, &target_ids)?;
+    for lane in lanes {
+        lane.target_health = lane
+            .ci_target_key
+            .as_ref()
+            .and_then(|target_id| snapshots.get(target_id).cloned());
+    }
+    Ok(())
+}
+
+fn current_unhealthy_target_ids(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT target_id, state, consecutive_infra_failure_count, last_success_at, last_failure_at, last_failure_kind, cooloff_until
+             FROM ci_target_health",
+        )
+        .context("prepare unhealthy ci target query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CiTargetHealthSnapshot {
+                target_id: row.get(0)?,
+                state: parse_target_health_state(&row.get::<_, String>(1)?)?,
+                consecutive_infra_failure_count: row.get(2)?,
+                last_success_at: row.get(3)?,
+                last_failure_at: row.get(4)?,
+                last_failure_kind: parse_optional_failure_kind(row.get(5)?)?,
+                cooloff_until: row.get(6)?,
+            })
+        })
+        .context("query unhealthy ci targets")?;
+    let mut unhealthy = HashSet::new();
+    for row in rows {
+        let snapshot = row.context("read unhealthy ci target row")?;
+        if snapshot.is_currently_unhealthy(now) {
+            unhealthy.insert(snapshot.target_id);
+        }
+    }
+    Ok(unhealthy)
+}
+
+fn refresh_ci_lane_execution_reasons_tx(
+    conn: &Connection,
+    ci_concurrency: Option<usize>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE branch_ci_run_lanes
+         SET execution_reason = 'running'
+         WHERE status = 'running' AND execution_reason != 'running'",
+        [],
+    )
+    .context("refresh running branch execution reasons")?;
+    conn.execute(
+        "UPDATE nightly_run_lanes
+         SET execution_reason = 'running'
+         WHERE status = 'running' AND execution_reason != 'running'",
+        [],
+    )
+    .context("refresh running nightly execution reasons")?;
+
+    let running_count = running_lane_count(conn)?;
+    let mut available_slots = ci_concurrency.map(|limit| limit.saturating_sub(running_count));
+    let mut running_groups = running_concurrency_groups(conn)?;
+    let unhealthy_targets = current_unhealthy_target_ids(conn, Utc::now())?;
+
+    refresh_queued_lane_reasons_for_table(
+        conn,
+        "nightly_run_lanes",
+        &mut available_slots,
+        &mut running_groups,
+        &unhealthy_targets,
+    )?;
+    refresh_queued_lane_reasons_for_table(
+        conn,
+        "branch_ci_run_lanes",
+        &mut available_slots,
+        &mut running_groups,
+        &unhealthy_targets,
+    )?;
+    Ok(())
+}
+
+fn refresh_queued_lane_reasons_for_table(
+    conn: &Connection,
+    table: &str,
+    available_slots: &mut Option<usize>,
+    running_groups: &mut HashSet<String>,
+    unhealthy_targets: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let sql = format!(
+        "SELECT id, execution_reason, concurrency_group, ci_target_key
+         FROM {table}
+         WHERE status = 'queued'
+         ORDER BY id ASC"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .with_context(|| format!("prepare queued execution reason query for {table}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                parse_execution_reason(&row.get::<_, String>(1)?)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .with_context(|| format!("query queued execution reasons for {table}"))?;
+
+    for row in rows {
+        let (lane_run_id, current_reason, concurrency_group, ci_target_key) =
+            row.with_context(|| format!("read queued execution reason row from {table}"))?;
+        let next_reason = if ci_target_key
+            .as_deref()
+            .is_some_and(|target_id| unhealthy_targets.contains(target_id))
+        {
+            CiLaneExecutionReason::TargetUnhealthy
+        } else if concurrency_group
+            .as_deref()
+            .is_some_and(|group| running_groups.contains(group))
+        {
+            CiLaneExecutionReason::BlockedByConcurrencyGroup
+        } else if available_slots.as_ref().is_some_and(|slots| *slots == 0) {
+            CiLaneExecutionReason::WaitingForCapacity
+        } else if current_reason == CiLaneExecutionReason::StaleRecovered {
+            CiLaneExecutionReason::StaleRecovered
+        } else {
+            CiLaneExecutionReason::Queued
+        };
+
+        if next_reason != current_reason {
+            let update_sql = format!(
+                "UPDATE {table}
+                 SET execution_reason = ?1
+                 WHERE id = ?2"
+            );
+            conn.execute(&update_sql, params![next_reason.as_str(), lane_run_id])
+                .with_context(|| {
+                    format!("update execution reason for lane {lane_run_id} in {table}")
+                })?;
+        }
+
+        if matches!(
+            next_reason,
+            CiLaneExecutionReason::Queued | CiLaneExecutionReason::StaleRecovered
+        ) {
+            if let Some(slots) = available_slots.as_mut() {
+                *slots = slots.saturating_sub(1);
+            }
+            if let Some(group) = concurrency_group {
+                running_groups.insert(group);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn running_lane_count(conn: &Connection) -> anyhow::Result<usize> {
+    let branch_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM branch_ci_run_lanes WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .context("count running branch lanes for refresh")?;
+    let nightly_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nightly_run_lanes WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .context("count running nightly lanes for refresh")?;
+    Ok((branch_count + nightly_count).max(0) as usize)
+}
+
+fn update_target_health_after_lane_finish(
+    conn: &Connection,
+    ci_target_key: Option<&str>,
+    status: &str,
+    failure_kind: Option<CiLaneFailureKind>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let Some(target_id) = ci_target_key.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let current: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT consecutive_infra_failure_count, last_success_at
+             FROM ci_target_health
+             WHERE target_id = ?1",
+            params![target_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("lookup target health for {target_id}"))?;
+    let existing_failures = current.as_ref().map(|row| row.0).unwrap_or(0);
+    let existing_last_success_at = current.as_ref().and_then(|row| row.1.clone());
+    let now_string = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    match (status, failure_kind) {
+        (value, Some(kind)) if value == CiLaneStatus::Failed.as_str() => {
+            if kind.counts_toward_target_health() {
+                let consecutive_failures = existing_failures + 1;
+                let state = if consecutive_failures >= CI_TARGET_HEALTH_INFRA_FAILURE_THRESHOLD {
+                    CiTargetHealthState::Unhealthy
+                } else {
+                    CiTargetHealthState::Healthy
+                };
+                let cooloff_until = if state == CiTargetHealthState::Unhealthy {
+                    Some(next_target_cooloff_until(now))
+                } else {
+                    None
+                };
+                conn.execute(
+                    "INSERT INTO ci_target_health(
+                        target_id,
+                        state,
+                        consecutive_infra_failure_count,
+                        last_success_at,
+                        last_failure_at,
+                        last_failure_kind,
+                        cooloff_until,
+                        updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(target_id) DO UPDATE SET
+                        state = excluded.state,
+                        consecutive_infra_failure_count = excluded.consecutive_infra_failure_count,
+                        last_success_at = excluded.last_success_at,
+                        last_failure_at = excluded.last_failure_at,
+                        last_failure_kind = excluded.last_failure_kind,
+                        cooloff_until = excluded.cooloff_until,
+                        updated_at = excluded.updated_at",
+                    params![
+                        target_id,
+                        state.as_str(),
+                        consecutive_failures,
+                        existing_last_success_at,
+                        now_string,
+                        kind.as_str(),
+                        cooloff_until,
+                        now_string,
+                    ],
+                )
+                .with_context(|| format!("record unhealthy target state for {target_id}"))?;
+            } else {
+                conn.execute(
+                    "INSERT INTO ci_target_health(
+                        target_id,
+                        state,
+                        consecutive_infra_failure_count,
+                        last_success_at,
+                        last_failure_at,
+                        last_failure_kind,
+                        cooloff_until,
+                        updated_at
+                     ) VALUES (?1, 'healthy', 0, ?2, ?3, ?4, NULL, ?3)
+                     ON CONFLICT(target_id) DO UPDATE SET
+                        state = 'healthy',
+                        consecutive_infra_failure_count = 0,
+                        last_success_at = COALESCE(excluded.last_success_at, ci_target_health.last_success_at),
+                        last_failure_at = excluded.last_failure_at,
+                        last_failure_kind = excluded.last_failure_kind,
+                        cooloff_until = NULL,
+                        updated_at = excluded.updated_at",
+                    params![target_id, existing_last_success_at, now_string, kind.as_str()],
+                )
+                .with_context(|| format!("record healthy target test failure for {target_id}"))?;
+            }
+        }
+        (value, _) if value == CiLaneStatus::Success.as_str() => {
+            conn.execute(
+                "INSERT INTO ci_target_health(
+                    target_id,
+                    state,
+                    consecutive_infra_failure_count,
+                    last_success_at,
+                    last_failure_at,
+                    last_failure_kind,
+                    cooloff_until,
+                    updated_at
+                 ) VALUES (?1, 'healthy', 0, ?2, NULL, NULL, NULL, ?2)
+                 ON CONFLICT(target_id) DO UPDATE SET
+                    state = 'healthy',
+                    consecutive_infra_failure_count = 0,
+                    last_success_at = excluded.last_success_at,
+                    cooloff_until = NULL,
+                    updated_at = excluded.updated_at",
+                params![target_id, now_string],
+            )
+            .with_context(|| format!("record healthy target success for {target_id}"))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn map_mirror_sync_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MirrorSyncRunRecord> {
@@ -2793,6 +3399,7 @@ mod tests {
 
     use super::{BranchUpsertInput, CI_LANE_LEASE_LOST};
     use crate::ci_manifest::ForgeLane;
+    use crate::ci_state::CiLaneExecutionReason;
     use crate::storage::Store;
 
     fn open_store() -> Store {
@@ -2850,6 +3457,38 @@ mod tests {
         let mut lane = sample_lane(id);
         lane.concurrency_group = Some(concurrency_group.to_string());
         lane
+    }
+
+    fn sample_lane_with_target(id: &str, target_id: &str) -> ForgeLane {
+        let mut lane = sample_lane(id);
+        lane.staged_linux_target = Some(target_id.to_string());
+        lane
+    }
+
+    fn target_health_row(
+        store: &Store,
+        target_id: &str,
+    ) -> (String, i64, Option<String>, Option<String>, Option<String>) {
+        store
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT state, consecutive_infra_failure_count, last_success_at, last_failure_kind, cooloff_until
+                     FROM ci_target_health
+                     WHERE target_id = ?1",
+                    params![target_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .expect("lookup target health row")
     }
 
     #[test]
@@ -3316,6 +3955,247 @@ mod tests {
             .expect("claim remaining jobs");
         assert_eq!(next_jobs.len(), 1);
         assert_eq!(next_jobs[0].lane_id, "linux_two");
+    }
+
+    #[test]
+    fn queue_reasons_and_unhealthy_targets_do_not_block_unrelated_claims() {
+        let store = open_store();
+        let running_branch = store
+            .upsert_branch_record(&upsert_input("feature/running", "head-running"))
+            .expect("insert running branch");
+        let blocked_branch = store
+            .upsert_branch_record(&upsert_input("feature/blocked", "head-blocked"))
+            .expect("insert blocked branch");
+        let unhealthy_branch = store
+            .upsert_branch_record(&upsert_input("feature/unhealthy", "head-unhealthy"))
+            .expect("insert unhealthy branch");
+        let ready_branch = store
+            .upsert_branch_record(&upsert_input("feature/ready", "head-ready"))
+            .expect("insert ready branch");
+        let waiting_branch = store
+            .upsert_branch_record(&upsert_input("feature/waiting", "head-waiting"))
+            .expect("insert waiting branch");
+
+        store
+            .queue_branch_ci_run_for_head(
+                running_branch.branch_id,
+                "head-running",
+                &[sample_lane_with_group("shared-holder", "shared-group")],
+            )
+            .expect("queue running branch");
+        let running_job = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim running holder")
+            .into_iter()
+            .next()
+            .expect("running holder");
+        store
+            .queue_branch_ci_run_for_head(
+                blocked_branch.branch_id,
+                "head-blocked",
+                &[sample_lane_with_group("shared-blocked", "shared-group")],
+            )
+            .expect("queue blocked branch");
+        store
+            .queue_branch_ci_run_for_head(
+                unhealthy_branch.branch_id,
+                "head-unhealthy",
+                &[sample_lane_with_target("apple-sanity", "apple-host")],
+            )
+            .expect("queue unhealthy branch");
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO ci_target_health(
+                        target_id,
+                        state,
+                        consecutive_infra_failure_count,
+                        last_failure_at,
+                        last_failure_kind,
+                        cooloff_until,
+                        updated_at
+                     ) VALUES (?1, 'unhealthy', 2, CURRENT_TIMESTAMP, 'infrastructure', datetime('now', '+15 minutes'), CURRENT_TIMESTAMP)",
+                    params!["apple-host"],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("insert unhealthy target");
+        store
+            .queue_branch_ci_run_for_head(
+                ready_branch.branch_id,
+                "head-ready",
+                &[sample_lane("ready-now")],
+            )
+            .expect("queue ready branch");
+        store
+            .queue_branch_ci_run_for_head(
+                waiting_branch.branch_id,
+                "head-waiting",
+                &[sample_lane("wait-capacity")],
+            )
+            .expect("queue waiting branch");
+
+        let claimed = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim next ready lane");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].lane_id, "ready-now");
+
+        store
+            .refresh_ci_lane_execution_reasons(Some(2))
+            .expect("refresh execution reasons");
+
+        let blocked_runs = store
+            .list_branch_ci_runs(blocked_branch.branch_id, 1)
+            .expect("list blocked runs");
+        assert_eq!(
+            blocked_runs[0].lanes[0].execution_reason,
+            CiLaneExecutionReason::BlockedByConcurrencyGroup
+        );
+        let unhealthy_runs = store
+            .list_branch_ci_runs(unhealthy_branch.branch_id, 1)
+            .expect("list unhealthy runs");
+        assert_eq!(
+            unhealthy_runs[0].lanes[0].execution_reason,
+            CiLaneExecutionReason::TargetUnhealthy
+        );
+        assert_eq!(
+            unhealthy_runs[0].lanes[0]
+                .target_health
+                .as_ref()
+                .expect("target health")
+                .consecutive_infra_failure_count,
+            2
+        );
+        let waiting_runs = store
+            .list_branch_ci_runs(waiting_branch.branch_id, 1)
+            .expect("list waiting runs");
+        assert_eq!(
+            waiting_runs[0].lanes[0].execution_reason,
+            CiLaneExecutionReason::WaitingForCapacity
+        );
+        let ready_runs = store
+            .list_branch_ci_runs(ready_branch.branch_id, 1)
+            .expect("list ready runs");
+        assert_eq!(ready_runs[0].lanes[0].status, "running");
+        assert_eq!(
+            ready_runs[0].lanes[0].execution_reason,
+            CiLaneExecutionReason::Running
+        );
+
+        store
+            .finish_branch_ci_lane_run(
+                running_job.lane_run_id,
+                running_job.claim_token,
+                "success",
+                "ok",
+            )
+            .expect("finish running holder");
+        store
+            .finish_branch_ci_lane_run(
+                claimed[0].lane_run_id,
+                claimed[0].claim_token,
+                "success",
+                "ok",
+            )
+            .expect("finish claimed ready lane");
+    }
+
+    #[test]
+    fn target_health_tracks_infra_failures_and_resets_after_success() {
+        let store = open_store();
+        let branch = store
+            .upsert_branch_record(&upsert_input("feature/target-health", "head-target-health"))
+            .expect("insert branch");
+        let lane = sample_lane_with_target("pika-rust", "pre-merge-pika-rust");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-target-health",
+                std::slice::from_ref(&lane),
+            )
+            .expect("queue ci");
+
+        let first = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim first run")
+            .into_iter()
+            .next()
+            .expect("first run");
+        store
+            .finish_branch_ci_lane_run(
+                first.lane_run_id,
+                first.claim_token,
+                "failed",
+                "ci runner error: permission denied",
+            )
+            .expect("finish first infra failure");
+        let first_health = target_health_row(&store, "pre-merge-pika-rust");
+        assert_eq!(first_health.0, "healthy");
+        assert_eq!(first_health.1, 1);
+        assert_eq!(first_health.3.as_deref(), Some("infrastructure"));
+        assert!(first_health.4.is_none());
+
+        store
+            .requeue_branch_ci_lane(branch.branch_id, first.lane_run_id)
+            .expect("requeue first lane")
+            .expect("lane exists");
+        let second = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim second run")
+            .into_iter()
+            .next()
+            .expect("second run");
+        store
+            .finish_branch_ci_lane_run(
+                second.lane_run_id,
+                second.claim_token,
+                "failed",
+                "ci runner error: unbound variable",
+            )
+            .expect("finish second infra failure");
+        let second_health = target_health_row(&store, "pre-merge-pika-rust");
+        assert_eq!(second_health.0, "unhealthy");
+        assert_eq!(second_health.1, 2);
+        assert_eq!(second_health.3.as_deref(), Some("infrastructure"));
+        assert!(second_health.4.is_some());
+
+        store
+            .requeue_branch_ci_lane(branch.branch_id, second.lane_run_id)
+            .expect("requeue second lane")
+            .expect("lane exists");
+        assert!(store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim while unhealthy")
+            .is_empty());
+
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE ci_target_health
+                     SET cooloff_until = datetime('now', '-1 minute')
+                     WHERE target_id = ?1",
+                    params!["pre-merge-pika-rust"],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("expire cooloff");
+        store
+            .refresh_ci_lane_execution_reasons(Some(1))
+            .expect("refresh after cooloff");
+        let third = store
+            .claim_pending_branch_ci_lane_runs(1, 120)
+            .expect("claim after cooloff")
+            .into_iter()
+            .next()
+            .expect("third run");
+        store
+            .finish_branch_ci_lane_run(third.lane_run_id, third.claim_token, "success", "ok")
+            .expect("finish healthy success");
+        let final_health = target_health_row(&store, "pre-merge-pika-rust");
+        assert_eq!(final_health.0, "healthy");
+        assert_eq!(final_health.1, 0);
+        assert!(final_health.2.is_some());
     }
 
     #[test]

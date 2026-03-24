@@ -2,6 +2,7 @@ mod auth;
 mod branch_store;
 mod ci;
 mod ci_manifest;
+mod ci_state;
 mod cli;
 mod config;
 mod forge;

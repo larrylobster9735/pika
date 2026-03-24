@@ -205,14 +205,85 @@ struct CiLane {
     title: String,
     entrypoint: String,
     status: String,
+    #[serde(default)]
+    execution_reason: CiLaneExecutionReason,
+    #[serde(default)]
+    failure_kind: Option<CiLaneFailureKind>,
     pikaci_run_id: Option<String>,
     pikaci_target_id: Option<String>,
+    #[serde(default)]
+    ci_target_key: Option<String>,
+    #[serde(default)]
+    target_health_state: Option<CiTargetHealthState>,
+    #[serde(default)]
+    target_health_summary: Option<String>,
     log_text: Option<String>,
     retry_count: i64,
     rerun_of_lane_run_id: Option<i64>,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum CiLaneExecutionReason {
+    #[default]
+    Queued,
+    Running,
+    BlockedByConcurrencyGroup,
+    WaitingForCapacity,
+    TargetUnhealthy,
+    StaleRecovered,
+}
+
+impl CiLaneExecutionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::BlockedByConcurrencyGroup => "blocked_by_concurrency_group",
+            Self::WaitingForCapacity => "waiting_for_capacity",
+            Self::TargetUnhealthy => "target_unhealthy",
+            Self::StaleRecovered => "stale_recovered",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::BlockedByConcurrencyGroup => "blocked by concurrency group",
+            Self::WaitingForCapacity => "waiting for capacity",
+            Self::TargetUnhealthy => "target unhealthy",
+            Self::StaleRecovered => "stale recovered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CiLaneFailureKind {
+    TestFailure,
+    Timeout,
+    Infrastructure,
+}
+
+impl CiLaneFailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TestFailure => "test failure",
+            Self::Timeout => "timeout",
+            Self::Infrastructure => "infrastructure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CiTargetHealthState {
+    Healthy,
+    Unhealthy,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -672,7 +743,12 @@ fn resolve_lane_selector<'a>(
 }
 
 fn branch_wait_snapshot(branch: &BranchDetailResponse) -> String {
-    let active = active_lane_titles(branch).join(",");
+    let active = branch
+        .ci_runs
+        .iter()
+        .flat_map(|run| run.lanes.iter().map(render_lane_snapshot_fragment))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{}|{}|{}",
         branch.branch.ci_status,
@@ -705,41 +781,94 @@ fn active_lane_titles(branch: &BranchDetailResponse) -> Vec<String> {
 }
 
 fn print_branch_status(branch: &BranchDetailResponse) {
-    println!(
+    print!("{}", render_branch_status(branch));
+}
+
+fn render_branch_status(branch: &BranchDetailResponse) -> String {
+    let mut lines = vec![format!(
         "branch #{} {} {} tutorial={} ci={}",
         branch.branch.branch_id,
         branch.branch.branch_name,
         branch.branch.branch_state,
         branch.branch.tutorial_status,
         branch.branch.ci_status
-    );
+    )];
     if let Some(run) = branch.ci_runs.first() {
-        println!(
+        lines.push(format!(
             "run #{} {} head {}",
             run.id,
             run.status,
             short_sha(&run.source_head_sha)
-        );
+        ));
         let active = active_lane_titles(branch);
         if active.is_empty() {
-            println!("active lanes: none");
+            lines.push("active lanes: none".to_string());
         } else {
-            println!("active lanes: {}", active.join(", "));
+            lines.push(format!("active lanes: {}", active.join(", ")));
         }
         for lane in &run.lanes {
-            match (&lane.pikaci_run_id, &lane.pikaci_target_id) {
-                (Some(run_id), Some(target)) => {
-                    println!("- {} {} [{} {}]", lane.lane_id, lane.status, target, run_id);
-                }
-                (Some(run_id), None) => {
-                    println!("- {} {} [pikaci {}]", lane.lane_id, lane.status, run_id);
-                }
-                _ => println!("- {} {}", lane.lane_id, lane.status),
-            }
+            lines.push(format!("- {}", render_lane_status_line(lane)));
         }
     } else {
-        println!("ci runs: none yet");
+        lines.push("ci runs: none yet".to_string());
     }
+    format!("{}\n", lines.join("\n"))
+}
+
+fn render_lane_status_line(lane: &CiLane) -> String {
+    let mut line = format!("{} {}", lane.lane_id, lane.status);
+    if matches!(lane.status.as_str(), "queued" | "running")
+        && lane.execution_reason != CiLaneExecutionReason::Queued
+        && lane.execution_reason.as_str() != lane.status
+    {
+        line.push_str(" · ");
+        line.push_str(lane.execution_reason.label());
+    }
+    if let Some(failure_kind) = lane.failure_kind {
+        line.push_str(" · failure=");
+        line.push_str(failure_kind.label());
+    }
+    if let Some(summary) = lane.target_health_summary.as_deref() {
+        line.push_str(" · ");
+        line.push_str(summary);
+    } else if lane.target_health_state == Some(CiTargetHealthState::Unhealthy) {
+        line.push_str(" · target unhealthy");
+    }
+    let target = lane
+        .pikaci_target_id
+        .as_deref()
+        .or(lane.ci_target_key.as_deref());
+    match (&lane.pikaci_run_id, target) {
+        (Some(run_id), Some(target)) => {
+            line.push_str(&format!(" [{target} {run_id}]"));
+        }
+        (Some(run_id), None) => {
+            line.push_str(&format!(" [pikaci {run_id}]"));
+        }
+        (None, Some(target)) => {
+            line.push_str(&format!(" [{target}]"));
+        }
+        (None, None) => {}
+    }
+    line
+}
+
+fn render_lane_snapshot_fragment(lane: &CiLane) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        lane.id,
+        lane.status,
+        lane.execution_reason.as_str(),
+        lane.failure_kind
+            .map(|kind| kind.label().to_string())
+            .unwrap_or_default(),
+        lane.target_health_state
+            .map(|state| match state {
+                CiTargetHealthState::Healthy => "healthy".to_string(),
+                CiTargetHealthState::Unhealthy => "unhealthy".to_string(),
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -1328,6 +1457,112 @@ mod tests {
             0,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn branch_status_renders_blocked_unhealthy_and_failure_details() {
+        let branch = BranchDetailResponse {
+            branch: BranchSummary {
+                branch_id: 7,
+                repo: "sledtools/pika".to_string(),
+                branch_name: "feature/state".to_string(),
+                title: "state".to_string(),
+                branch_state: "open".to_string(),
+                updated_at: "2026-03-24T00:00:00Z".to_string(),
+                target_branch: "master".to_string(),
+                head_sha: "deadbeefdeadbeef".to_string(),
+                merge_base_sha: "cafebabecafebabe".to_string(),
+                merge_commit_sha: None,
+                tutorial_status: "ready".to_string(),
+                ci_status: "running".to_string(),
+                error_message: None,
+            },
+            ci_runs: vec![CiRun {
+                id: 11,
+                source_head_sha: "deadbeefdeadbeef".to_string(),
+                status: "running".to_string(),
+                lane_count: 3,
+                rerun_of_run_id: None,
+                created_at: "2026-03-24T00:00:00Z".to_string(),
+                started_at: Some("2026-03-24T00:00:01Z".to_string()),
+                finished_at: None,
+                lanes: vec![
+                    CiLane {
+                        id: 91,
+                        lane_id: "wait-capacity".to_string(),
+                        title: "wait".to_string(),
+                        entrypoint: "just wait".to_string(),
+                        status: "queued".to_string(),
+                        execution_reason: CiLaneExecutionReason::WaitingForCapacity,
+                        failure_kind: None,
+                        pikaci_run_id: None,
+                        pikaci_target_id: None,
+                        ci_target_key: None,
+                        target_health_state: None,
+                        target_health_summary: None,
+                        log_text: None,
+                        retry_count: 0,
+                        rerun_of_lane_run_id: None,
+                        created_at: "2026-03-24T00:00:00Z".to_string(),
+                        started_at: None,
+                        finished_at: None,
+                    },
+                    CiLane {
+                        id: 92,
+                        lane_id: "apple-sanity".to_string(),
+                        title: "apple".to_string(),
+                        entrypoint: "just apple".to_string(),
+                        status: "queued".to_string(),
+                        execution_reason: CiLaneExecutionReason::TargetUnhealthy,
+                        failure_kind: None,
+                        pikaci_run_id: None,
+                        pikaci_target_id: None,
+                        ci_target_key: Some("apple-host".to_string()),
+                        target_health_state: Some(CiTargetHealthState::Unhealthy),
+                        target_health_summary: Some(
+                            "target apple-host unhealthy · consecutive infra failures 2 · cooloff until 2026-03-24T00:15:00Z"
+                                .to_string(),
+                        ),
+                        log_text: None,
+                        retry_count: 1,
+                        rerun_of_lane_run_id: None,
+                        created_at: "2026-03-24T00:00:00Z".to_string(),
+                        started_at: None,
+                        finished_at: None,
+                    },
+                    CiLane {
+                        id: 93,
+                        lane_id: "linux-tests".to_string(),
+                        title: "linux".to_string(),
+                        entrypoint: "just linux".to_string(),
+                        status: "failed".to_string(),
+                        execution_reason: CiLaneExecutionReason::Running,
+                        failure_kind: Some(CiLaneFailureKind::Infrastructure),
+                        pikaci_run_id: Some("pikaci-123".to_string()),
+                        pikaci_target_id: Some("pre-merge-pika-rust".to_string()),
+                        ci_target_key: Some("pre-merge-pika-rust".to_string()),
+                        target_health_state: Some(CiTargetHealthState::Healthy),
+                        target_health_summary: None,
+                        log_text: Some("ci runner error: permission denied".to_string()),
+                        retry_count: 0,
+                        rerun_of_lane_run_id: None,
+                        created_at: "2026-03-24T00:00:00Z".to_string(),
+                        started_at: Some("2026-03-24T00:00:01Z".to_string()),
+                        finished_at: Some("2026-03-24T00:02:00Z".to_string()),
+                    },
+                ],
+            }],
+        };
+
+        let rendered = render_branch_status(&branch);
+        assert!(rendered.contains("wait-capacity queued · waiting for capacity"));
+        assert!(rendered.contains("apple-sanity queued · target unhealthy"));
+        assert!(rendered.contains("target apple-host unhealthy"));
+        assert!(rendered.contains("linux-tests failed · failure=infrastructure"));
+
+        let snapshot = branch_wait_snapshot(&branch);
+        assert!(snapshot.contains("waiting_for_capacity"));
+        assert!(snapshot.contains("target_unhealthy"));
     }
 
     #[test]
