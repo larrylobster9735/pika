@@ -997,7 +997,7 @@ fn branch_page_notices(state: &AppState) -> Vec<PageNoticeView> {
             &mut notices,
             &mut seen,
             "warning",
-            "The summary generator is unhealthy. New tutorials across the forge may be delayed until it recovers.",
+            "Forge health warning: the tutorial generator worker is unhealthy. This is a forge-wide issue, so new tutorials on any branch may be delayed until it recovers.",
         );
     }
     if health.ci.state == "error" {
@@ -2547,15 +2547,10 @@ fn ci_timing_summary(
     let started_at = started_at.and_then(parse_ci_timestamp);
     let finished_at = finished_at.and_then(parse_ci_timestamp);
 
-    let queued = match (created_at, started_at) {
-        (Some(created_at), Some(started_at)) => {
-            compact_duration_part("queued", started_at.signed_duration_since(created_at))
-        }
-        (Some(created_at), None) if finished_at.is_none() => {
-            compact_duration_part("queued", now.signed_duration_since(created_at))
-        }
-        _ => None,
-    };
+    let queued = created_at.and_then(|created_at| {
+        let queued_end = started_at.or(finished_at).unwrap_or(now);
+        compact_duration_part("queued", queued_end.signed_duration_since(created_at))
+    });
 
     let ran = started_at.and_then(|started_at| {
         let end = finished_at.unwrap_or(now);
@@ -5214,6 +5209,16 @@ mod tests {
             .expect("finished summary"),
             "queued 14s · ran 31s"
         );
+        assert_eq!(
+            super::ci_timing_summary(
+                "2026-03-24T12:00:00Z",
+                None,
+                Some("2026-03-24T12:00:14Z"),
+                now,
+            )
+            .expect("finished-while-never-started summary"),
+            "queued 14s"
+        );
     }
 
     #[test]
@@ -7376,16 +7381,21 @@ paths = ["README.md", "feature.txt", "ci/forge-lanes.toml"]
             false,
             vec![PageNoticeView {
                 tone: "warning".to_string(),
-                message: "The summary generator is unhealthy. New tutorials across the forge may be delayed until it recovers.".to_string(),
+                message: "Forge health warning: the tutorial generator worker is unhealthy. This is a forge-wide issue, so new tutorials on any branch may be delayed until it recovers.".to_string(),
             }],
         )
         .expect("render detail template")
         .render()
         .expect("render detail html");
 
-        assert!(rendered.contains("The summary generator is unhealthy."));
-        assert!(rendered.contains("Branch Tutorial Generation Failed"));
-        assert!(rendered.contains("This branch tutorial is unavailable because generation failed."));
+        assert!(
+            rendered.contains("Forge health warning: the tutorial generator worker is unhealthy.")
+        );
+        assert!(rendered.contains("This is a forge-wide issue"));
+        assert!(rendered.contains("Branch-Specific Tutorial Generation Failed"));
+        assert!(rendered.contains(
+            "This branch tutorial is unavailable because generation for this branch head failed."
+        ));
     }
 
     #[test]
