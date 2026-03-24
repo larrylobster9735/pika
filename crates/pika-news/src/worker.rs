@@ -191,7 +191,7 @@ fn branch_inbox_recipients(store: &Store, config: &Config) -> anyhow::Result<Vec
             recipients.insert(normalized);
         }
     }
-    for npub in store.list_active_chat_allowlist_npubs()? {
+    for npub in store.list_branch_inbox_allowlist_npubs()? {
         if let Ok(normalized) = normalize_npub(&npub) {
             recipients.insert(normalized);
         }
@@ -248,6 +248,10 @@ mod tests {
             .public_key()
             .to_bech32()
             .expect("encode allowlisted npub");
+        let forge_writer_npub = Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("encode forge writer npub");
         let dir = tempfile::tempdir().expect("create temp dir");
         let db_path = dir.path().join("pika-news.db");
         let store = Store::open(&db_path).expect("open store");
@@ -260,6 +264,15 @@ mod tests {
                 &admin_npub,
             )
             .expect("upsert allowlist");
+        store
+            .upsert_chat_allowlist_entry(
+                &forge_writer_npub,
+                false,
+                true,
+                Some("forge-writer"),
+                &admin_npub,
+            )
+            .expect("upsert forge writer");
         let branch = store
             .upsert_branch_record(&branch_upsert_input("feature/inbox", "head-1"))
             .expect("insert branch");
@@ -306,10 +319,11 @@ mod tests {
 
         assert_eq!(
             populate_ready_branch_inbox(&store, &config, artifact_id).unwrap(),
-            3
+            4
         );
         assert_eq!(store.branch_inbox_count(&admin_npub).unwrap(), 1);
         assert_eq!(store.branch_inbox_count(&legacy_npub).unwrap(), 1);
         assert_eq!(store.branch_inbox_count(&allowlisted_npub).unwrap(), 1);
+        assert_eq!(store.branch_inbox_count(&forge_writer_npub).unwrap(), 1);
     }
 }
