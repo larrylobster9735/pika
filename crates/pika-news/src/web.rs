@@ -997,7 +997,7 @@ fn branch_page_notices(state: &AppState) -> Vec<PageNoticeView> {
             &mut notices,
             &mut seen,
             "warning",
-            "Forge health warning: the tutorial generator worker is unhealthy. This is a forge-wide issue, so new tutorials on any branch may be delayed until it recovers.",
+            "Forge health warning: the tutorial generator worker is unhealthy. New tutorials on any branch may be delayed until it recovers; this forge-wide warning does not mean this branch's last tutorial generation attempt failed.",
         );
     }
     if health.ci.state == "error" {
@@ -7290,6 +7290,80 @@ paths = ["README.md", "feature.txt", "ci/forge-lanes.toml"]
     }
 
     #[test]
+    fn branch_ci_rendering_shows_queued_duration_for_terminal_lane_without_start_time() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input(
+                "feature/queued-terminal",
+                "head-queued",
+            ))
+            .expect("insert branch");
+        store
+            .queue_branch_ci_run_for_head(
+                branch.branch_id,
+                "head-queued",
+                &[crate::ci_manifest::ForgeLane {
+                    id: "pika".to_string(),
+                    title: "pre-merge-pika".to_string(),
+                    entrypoint: "just checks::pre-merge-pika".to_string(),
+                    command: vec!["just".to_string(), "checks::pre-merge-pika".to_string()],
+                    paths: vec![],
+                    concurrency_group: None,
+                    staged_linux_target: None,
+                }],
+            )
+            .expect("queue ci");
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE branch_ci_runs
+                     SET status = 'failed',
+                         created_at = '2026-03-24T12:00:00Z',
+                         started_at = NULL,
+                         finished_at = '2026-03-24T12:00:14Z'
+                     WHERE branch_id = ?1",
+                    rusqlite::params![branch.branch_id],
+                )?;
+                conn.execute(
+                    "UPDATE branch_ci_run_lanes
+                     SET status = 'failed',
+                         created_at = '2026-03-24T12:00:00Z',
+                         started_at = NULL,
+                         finished_at = '2026-03-24T12:00:14Z',
+                         log_text = 'boom'
+                     WHERE lane_id = 'pika'",
+                    [],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("mark queued lane terminal");
+
+        let detail = store
+            .get_branch_detail(branch.branch_id)
+            .expect("branch detail")
+            .expect("detail");
+        let ci_runs = store
+            .list_branch_ci_runs(branch.branch_id, 8)
+            .expect("branch ci runs");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 24, 12, 0, 45)
+            .single()
+            .expect("valid timestamp");
+
+        let summary_html =
+            super::render_branch_ci_summary_html_at(&detail, &ci_runs, &[], false, now)
+                .expect("render branch ci summary html");
+        let live_html = super::render_branch_ci_live_html_at(&detail, &ci_runs, &[], now)
+            .expect("render branch ci live html");
+
+        assert!(summary_html.contains("queued 14s"));
+        assert!(live_html.contains("queued 14s"));
+        assert!(!live_html.contains("queued 14s · ran"));
+    }
+
+    #[test]
     fn review_mode_ci_links_preserve_inbox_context() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let db_path = dir.path().join("pika-news.db");
@@ -7381,7 +7455,7 @@ paths = ["README.md", "feature.txt", "ci/forge-lanes.toml"]
             false,
             vec![PageNoticeView {
                 tone: "warning".to_string(),
-                message: "Forge health warning: the tutorial generator worker is unhealthy. This is a forge-wide issue, so new tutorials on any branch may be delayed until it recovers.".to_string(),
+                message: "Forge health warning: the tutorial generator worker is unhealthy. New tutorials on any branch may be delayed until it recovers; this forge-wide warning does not mean this branch's last tutorial generation attempt failed.".to_string(),
             }],
         )
         .expect("render detail template")
@@ -7391,8 +7465,9 @@ paths = ["README.md", "feature.txt", "ci/forge-lanes.toml"]
         assert!(
             rendered.contains("Forge health warning: the tutorial generator worker is unhealthy.")
         );
-        assert!(rendered.contains("This is a forge-wide issue"));
+        assert!(rendered.contains("forge-wide warning does not mean"));
         assert!(rendered.contains("Branch-Specific Tutorial Generation Failed"));
+        assert!(rendered.contains("This failure is specific to the current branch head."));
         assert!(rendered.contains(
             "This branch tutorial is unavailable because generation for this branch head failed."
         ));
