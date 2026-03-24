@@ -1421,6 +1421,29 @@ impl Store {
         })
     }
 
+    pub fn list_branch_inbox_allowlist_npubs(&self) -> anyhow::Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT npub
+                     FROM chat_allowlist
+                     WHERE active = 1 OR can_forge_write = 1
+                     ORDER BY npub ASC",
+                )
+                .context("prepare branch inbox allowlist query")?;
+
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .context("query branch inbox allowlist")?;
+
+            let mut npubs = Vec::new();
+            for row in rows {
+                npubs.push(row.context("read branch inbox allowlist row")?);
+            }
+            Ok(npubs)
+        })
+    }
+
     pub fn get_chat_allowlist_entry(
         &self,
         npub: &str,
@@ -2371,6 +2394,17 @@ fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
             continue;
         }
 
+        if migration.name == "0020_ci_queue_state_and_target_health"
+            && ci_queue_state_schema_present(conn)?
+        {
+            conn.execute(
+                "INSERT INTO _pika_news_migrations(version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .with_context(|| format!("record pre-applied migration {}", migration.name))?;
+            continue;
+        }
+
         let tx = conn
             .unchecked_transaction()
             .with_context(|| format!("start migration transaction {}", migration.name))?;
@@ -2386,6 +2420,52 @@ fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn ci_queue_state_schema_present(conn: &Connection) -> anyhow::Result<bool> {
+    let branch_has_execution_reason =
+        table_has_column(conn, "branch_ci_run_lanes", "execution_reason")?;
+    let nightly_has_execution_reason =
+        table_has_column(conn, "nightly_run_lanes", "execution_reason")?;
+    let branch_has_failure_kind = table_has_column(conn, "branch_ci_run_lanes", "failure_kind")?;
+    let nightly_has_failure_kind = table_has_column(conn, "nightly_run_lanes", "failure_kind")?;
+    let has_target_health = table_exists(conn, "ci_target_health")?;
+    Ok(branch_has_execution_reason
+        && nightly_has_execution_reason
+        && branch_has_failure_kind
+        && nightly_has_failure_kind
+        && has_target_health)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .with_context(|| format!("prepare table info pragma for {table}"))?;
+    let mut rows = stmt
+        .query([])
+        .with_context(|| format!("query table info pragma for {table}"))?;
+    while let Some(row) = rows.next().context("read table info row")? {
+        let name: String = row.get(1).context("read table info column name")?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM sqlite_master
+             WHERE type = 'table' AND name = ?1
+         )",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .with_context(|| format!("query sqlite_master for table {table}"))
 }
 
 fn open_connection(path: &Path) -> anyhow::Result<Connection> {
@@ -2496,8 +2576,13 @@ fn migrations() -> Vec<Migration> {
         },
         Migration {
             version: 19,
-            name: "0019_ci_queue_state_and_target_health",
-            sql: include_str!("../migrations/0019_ci_queue_state_and_target_health.sql"),
+            name: "0019_dismiss_closed_branch_inbox",
+            sql: include_str!("../migrations/0019_dismiss_closed_branch_inbox.sql"),
+        },
+        Migration {
+            version: 20,
+            name: "0020_ci_queue_state_and_target_health",
+            sql: include_str!("../migrations/0020_ci_queue_state_and_target_health.sql"),
         },
     ]
 }
@@ -2509,9 +2594,12 @@ mod tests {
     use std::thread;
 
     use nostr::key::PublicKey;
-    use rusqlite::{params, OptionalExtension};
+    use rusqlite::{params, Connection, OptionalExtension};
 
-    use super::{ChatAllowlistEntry, InboxItem, InboxReviewContext, PrUpsertInput, Store};
+    use super::{
+        migrations, table_exists, table_has_column, ChatAllowlistEntry, InboxItem,
+        InboxReviewContext, PrUpsertInput, Store,
+    };
     use crate::branch_store::BranchUpsertInput;
 
     fn latest_artifact_id(store: &Store, pr_id: i64) -> i64 {
@@ -2674,6 +2762,69 @@ mod tests {
             .expect("verify data");
 
         fs::remove_file(db_path).expect("cleanup sqlite db file");
+    }
+
+    #[test]
+    fn queue_state_migration_applies_after_legacy_version_19() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let conn = Connection::open(&db_path).expect("open sqlite");
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _pika_news_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .expect("create migrations table");
+
+        for migration in migrations()
+            .into_iter()
+            .filter(|migration| migration.version <= 19)
+        {
+            let tx = conn
+                .unchecked_transaction()
+                .expect("start migration transaction");
+            tx.execute_batch(migration.sql).expect("apply migration");
+            tx.execute(
+                "INSERT INTO _pika_news_migrations(version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .expect("record migration");
+            tx.commit().expect("commit migration");
+        }
+        drop(conn);
+
+        let store = Store::open(&db_path).expect("open store after legacy migrations");
+        store
+            .with_connection(|conn| {
+                assert!(table_has_column(
+                    conn,
+                    "branch_ci_run_lanes",
+                    "execution_reason"
+                )?);
+                assert!(table_has_column(
+                    conn,
+                    "branch_ci_run_lanes",
+                    "failure_kind"
+                )?);
+                assert!(table_has_column(
+                    conn,
+                    "nightly_run_lanes",
+                    "execution_reason"
+                )?);
+                assert!(table_has_column(conn, "nightly_run_lanes", "failure_kind")?);
+                assert!(table_exists(conn, "ci_target_health")?);
+                let migration_name: String = conn.query_row(
+                    "SELECT name FROM _pika_news_migrations WHERE version = 20",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(migration_name, "0020_ci_queue_state_and_target_health");
+                Ok::<_, anyhow::Error>(())
+            })
+            .expect("verify queue state migration");
     }
 
     #[test]
@@ -3305,6 +3456,8 @@ mod tests {
 
         let active = store.list_active_chat_allowlist_npubs().unwrap();
         assert!(active.is_empty());
+        let reviewable = store.list_branch_inbox_allowlist_npubs().unwrap();
+        assert!(reviewable.is_empty());
     }
 
     #[test]
@@ -3328,6 +3481,10 @@ mod tests {
         assert!(store
             .is_chat_allowlist_forge_writer("npub1forgeonly")
             .unwrap());
+        assert_eq!(
+            store.list_branch_inbox_allowlist_npubs().unwrap(),
+            vec!["npub1forgeonly".to_string()]
+        );
     }
 
     #[test]

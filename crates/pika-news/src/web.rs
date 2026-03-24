@@ -4082,6 +4082,30 @@ fn require_chat_auth(
 }
 
 #[allow(clippy::result_large_err)]
+fn require_inbox_auth(
+    auth: &AuthState,
+    headers: &axum::http::HeaderMap,
+    forge_mode: bool,
+) -> Result<String, axum::response::Response> {
+    let npub = require_auth(auth, headers)?;
+    let access = auth.access_for_npub(&npub);
+    let allowed = if forge_mode {
+        access.can_chat || access.can_forge_write
+    } else {
+        access.can_chat
+    };
+    if allowed {
+        Ok(npub)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "inbox access revoked"})),
+        )
+            .into_response())
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn require_trusted_auth(
     auth: &AuthState,
     headers: &axum::http::HeaderMap,
@@ -4356,7 +4380,12 @@ async fn api_admin_allowlist_upsert_handler(
             note.as_deref(),
             &admin_npub,
         )?;
-        let backfilled = if should_backfill_managed_allowlist_entry(existing.as_ref(), active) {
+        let backfilled = if should_backfill_managed_allowlist_entry(
+            existing.as_ref(),
+            active,
+            can_forge_write,
+            forge_mode,
+        ) {
             if forge_mode {
                 store.backfill_branch_inbox_for_npub(&npub)?
             } else {
@@ -4390,8 +4419,24 @@ async fn api_admin_allowlist_upsert_handler(
 fn should_backfill_managed_allowlist_entry(
     existing: Option<&ChatAllowlistEntry>,
     active: bool,
+    can_forge_write: bool,
+    forge_mode: bool,
 ) -> bool {
-    active && existing.map(|entry| !entry.active).unwrap_or(true)
+    let was_reviewable = existing
+        .map(|entry| {
+            if forge_mode {
+                entry.active || entry.can_forge_write
+            } else {
+                entry.active
+            }
+        })
+        .unwrap_or(false);
+    let is_reviewable = if forge_mode {
+        active || can_forge_write
+    } else {
+        active
+    };
+    is_reviewable && !was_reviewable
 }
 
 #[derive(serde::Deserialize)]
@@ -4404,14 +4449,14 @@ async fn api_inbox_list_handler(
     headers: axum::http::HeaderMap,
     Query(params): Query<InboxListParams>,
 ) -> impl IntoResponse {
-    let npub = match require_chat_auth(&state.auth, &headers) {
+    let forge_mode = state.config.effective_forge_repo().is_some();
+    let npub = match require_inbox_auth(&state.auth, &headers, forge_mode) {
         Ok(n) => n,
         Err(resp) => return resp,
     };
     let page = params.page.unwrap_or(1).max(1);
     let offset = (page - 1) * 50;
     let store = state.store.clone();
-    let forge_mode = state.config.effective_forge_repo().is_some();
     match tokio::task::spawn_blocking(move || {
         let items = if forge_mode {
             store.list_branch_inbox(&npub, 50, offset)?
@@ -4447,12 +4492,12 @@ async fn api_inbox_count_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let npub = match require_chat_auth(&state.auth, &headers) {
+    let forge_mode = state.config.effective_forge_repo().is_some();
+    let npub = match require_inbox_auth(&state.auth, &headers, forge_mode) {
         Ok(n) => n,
         Err(resp) => return resp,
     };
     let store = state.store.clone();
-    let forge_mode = state.config.effective_forge_repo().is_some();
     match tokio::task::spawn_blocking(move || {
         if forge_mode {
             store.branch_inbox_count(&npub)
@@ -4488,12 +4533,12 @@ async fn api_inbox_dismiss_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<InboxDismissRequest>,
 ) -> impl IntoResponse {
-    let npub = match require_chat_auth(&state.auth, &headers) {
+    let forge_mode = state.config.effective_forge_repo().is_some();
+    let npub = match require_inbox_auth(&state.auth, &headers, forge_mode) {
         Ok(n) => n,
         Err(resp) => return resp,
     };
     let store = state.store.clone();
-    let forge_mode = state.config.effective_forge_repo().is_some();
     let dismissed = if body.all.unwrap_or(false) {
         tokio::task::spawn_blocking(move || {
             if forge_mode {
@@ -4534,12 +4579,12 @@ async fn api_inbox_neighbors_handler(
     Path(review_id): Path<i64>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let npub = match require_chat_auth(&state.auth, &headers) {
+    let forge_mode = state.config.effective_forge_repo().is_some();
+    let npub = match require_inbox_auth(&state.auth, &headers, forge_mode) {
         Ok(n) => n,
         Err(resp) => return resp,
     };
     let store = state.store.clone();
-    let forge_mode = state.config.effective_forge_repo().is_some();
     match tokio::task::spawn_blocking(move || {
         if forge_mode {
             store.branch_inbox_review_context(&npub, review_id)
@@ -4608,17 +4653,17 @@ mod tests {
 
     use super::{
         api_forge_branch_detail_handler, api_forge_branch_logs_handler,
-        api_forge_branch_resolve_handler, auth_challenge_handler, branch_ci_stream_handler,
-        build_mirror_health_status, collect_forge_startup_issues, current_forge_runtime_issues,
-        fail_branch_ci_lane_handler, fail_nightly_lane_handler, inbox_review_handler,
-        load_branch_ci_live_snapshot, load_nightly_live_snapshot, markdown_to_safe_html,
-        next_branch_ci_live_snapshot, next_nightly_live_snapshot, nightly_stream_handler,
-        recover_branch_ci_run_handler, render_branch_ci_template_with_notices,
-        render_detail_template, render_detail_template_with_notices, render_nightly_template,
-        rerun_branch_ci_lane_handler, rerun_nightly_lane_handler,
-        should_backfill_managed_allowlist_entry, verify_signature, wake_ci_handler, AppState,
-        CiLiveUpdates, ForgeBranchLogsQuery, ForgeBranchResolveQuery, ForgeHealthState,
-        PageNoticeView, ReviewModeQuery,
+        api_forge_branch_resolve_handler, api_inbox_count_handler, api_inbox_list_handler,
+        auth_challenge_handler, branch_ci_stream_handler, build_mirror_health_status,
+        collect_forge_startup_issues, current_forge_runtime_issues, fail_branch_ci_lane_handler,
+        fail_nightly_lane_handler, inbox_review_handler, load_branch_ci_live_snapshot,
+        load_nightly_live_snapshot, markdown_to_safe_html, next_branch_ci_live_snapshot,
+        next_nightly_live_snapshot, nightly_stream_handler, recover_branch_ci_run_handler,
+        render_branch_ci_template_with_notices, render_detail_template,
+        render_detail_template_with_notices, render_nightly_template, rerun_branch_ci_lane_handler,
+        rerun_nightly_lane_handler, should_backfill_managed_allowlist_entry, verify_signature,
+        wake_ci_handler, AppState, CiLiveUpdates, ForgeBranchLogsQuery, ForgeBranchResolveQuery,
+        ForgeHealthState, InboxListParams, PageNoticeView, ReviewModeQuery,
     };
     use crate::auth::AuthState;
     use crate::branch_store::{BranchUpsertInput, MirrorStatusRecord, MirrorSyncRunRecord};
@@ -5023,9 +5068,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_allowlist_backfills_only_for_new_active_entries() {
-        assert!(should_backfill_managed_allowlist_entry(None, true));
-        assert!(!should_backfill_managed_allowlist_entry(None, false));
+    fn managed_allowlist_backfills_only_for_new_reviewable_entries() {
+        assert!(should_backfill_managed_allowlist_entry(
+            None, true, false, false
+        ));
+        assert!(!should_backfill_managed_allowlist_entry(
+            None, false, false, false
+        ));
 
         let existing_active = ChatAllowlistEntry {
             npub: "npub1existing".to_string(),
@@ -5037,21 +5086,98 @@ mod tests {
         };
         assert!(!should_backfill_managed_allowlist_entry(
             Some(&existing_active),
-            true
+            true,
+            false,
+            false
         ));
         assert!(!should_backfill_managed_allowlist_entry(
             Some(&existing_active),
+            false,
+            false,
             false
         ));
 
         let existing_inactive = ChatAllowlistEntry {
             active: false,
+            can_forge_write: false,
             ..existing_active
         };
         assert!(should_backfill_managed_allowlist_entry(
             Some(&existing_inactive),
+            true,
+            false,
+            false
+        ));
+
+        let existing_forge_only = ChatAllowlistEntry {
+            active: false,
+            can_forge_write: true,
+            ..existing_inactive
+        };
+        assert!(should_backfill_managed_allowlist_entry(
+            None, false, true, true
+        ));
+        assert!(!should_backfill_managed_allowlist_entry(
+            Some(&existing_forge_only),
+            false,
+            true,
             true
         ));
+    }
+
+    #[tokio::test]
+    async fn forge_only_writer_can_list_branch_inbox() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("pika-news.db");
+        let store = Store::open(&db_path).expect("open store");
+        let branch = store
+            .upsert_branch_record(&branch_upsert_input("feature/forge-only-inbox", "head-1"))
+            .expect("insert branch");
+        let artifact_id = store
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT id
+                     FROM branch_artifact_versions
+                     WHERE branch_id = ?1
+                     ORDER BY version DESC
+                     LIMIT 1",
+                    rusqlite::params![branch.branch_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("branch artifact id");
+        let forge_only = "npub1umzqpag02ldgc9v8cww29vfmcqcrf28cyvd53ewhrk6zmgafdz9qaqfc58";
+        store
+            .mark_branch_generation_ready(
+                artifact_id,
+                r#"{"executive_summary":"ok","media_links":[],"steps":[]}"#,
+                "<p>ok</p>",
+                "head-1",
+                "diff",
+            )
+            .expect("mark ready");
+        store
+            .upsert_chat_allowlist_entry(forge_only, false, true, Some("forge-only"), TRUSTED_NPUB)
+            .expect("upsert forge-only writer");
+        store
+            .backfill_branch_inbox_for_npub(forge_only)
+            .expect("backfill inbox");
+
+        let state = test_state(store.clone(), forge_test_config());
+        let headers = trusted_headers(&store, forge_only);
+        let response = api_inbox_list_handler(
+            State(state.clone()),
+            headers.clone(),
+            Query(InboxListParams { page: Some(1) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let count_response = api_inbox_count_handler(State(state), headers)
+            .await
+            .into_response();
+        assert_eq!(count_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

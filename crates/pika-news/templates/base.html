@@ -203,7 +203,7 @@
             })
             .then(function (data) {
               if (!data) return;
-              if (!data.can_chat) {
+              if (!(data.can_chat || data.can_forge_write)) {
                 clearAuth();
                 return;
               }
