@@ -139,6 +139,9 @@ fn run_ci_pass_with_timing_at(
     if let Ok(nightlies_scheduled) = nightly_schedule_result.as_ref() {
         result.nightlies_scheduled = *nightlies_scheduled;
     }
+    store
+        .refresh_ci_lane_execution_reasons(ci_concurrency)
+        .context("refresh ci execution reasons before ci pass")?;
 
     let (tx, rx) = mpsc::channel::<anyhow::Result<LaneJobOutcome>>();
     let mut active_workers = 0_usize;
@@ -147,12 +150,21 @@ fn run_ci_pass_with_timing_at(
         while has_capacity(ci_concurrency, active_workers) {
             let claim_limit = next_claim_limit(store, ci_concurrency, active_workers)?;
             if claim_limit == 0 {
+                store
+                    .refresh_ci_lane_execution_reasons(ci_concurrency)
+                    .context("refresh ci execution reasons with no available worker slots")?;
                 break;
             }
             let claimed_jobs = claim_lane_jobs(store, lease_secs, claim_limit)?;
             if claimed_jobs.is_empty() {
+                store
+                    .refresh_ci_lane_execution_reasons(ci_concurrency)
+                    .context("refresh ci execution reasons with no claimable lanes")?;
                 break;
             }
+            store
+                .refresh_ci_lane_execution_reasons(ci_concurrency)
+                .context("refresh ci execution reasons after claims")?;
             for job in claimed_jobs {
                 result.claimed += 1;
                 active_workers += 1;
@@ -204,6 +216,9 @@ fn run_ci_pass_with_timing_at(
         active_workers -= 1;
         result.succeeded += outcome.succeeded;
         result.failed += outcome.failed;
+        store
+            .refresh_ci_lane_execution_reasons(ci_concurrency)
+            .context("refresh ci execution reasons after worker completion")?;
     }
 
     nightly_schedule_result?;
@@ -238,11 +253,17 @@ fn schedule_ci_pass_with_timing_at(
     if let Ok(nightlies_scheduled) = nightly_schedule_result.as_ref() {
         result.nightlies_scheduled = *nightlies_scheduled;
     }
+    store
+        .refresh_ci_lane_execution_reasons(ci_concurrency)
+        .context("refresh ci execution reasons before scheduler pass")?;
 
     let claim_limit = next_scheduler_claim_limit(store, ci_concurrency)?;
     if claim_limit > 0 {
         let claimed_jobs = claim_lane_jobs(store, lease_secs, claim_limit)?;
         result.claimed = claimed_jobs.len();
+        store
+            .refresh_ci_lane_execution_reasons(ci_concurrency)
+            .context("refresh ci execution reasons after scheduler claims")?;
         for job in claimed_jobs {
             launch_claimed_job(
                 store.clone(),
@@ -254,6 +275,10 @@ fn schedule_ci_pass_with_timing_at(
                 wake_notify.clone(),
             );
         }
+    } else {
+        store
+            .refresh_ci_lane_execution_reasons(ci_concurrency)
+            .context("refresh ci execution reasons with no scheduler capacity")?;
     }
 
     nightly_schedule_result?;

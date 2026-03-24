@@ -2494,6 +2494,11 @@ fn migrations() -> Vec<Migration> {
             name: "0018_ci_lane_pikaci_metadata",
             sql: include_str!("../migrations/0018_ci_lane_pikaci_metadata.sql"),
         },
+        Migration {
+            version: 19,
+            name: "0019_ci_queue_state_and_target_health",
+            sql: include_str!("../migrations/0019_ci_queue_state_and_target_health.sql"),
+        },
     ]
 }
 

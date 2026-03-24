@@ -51,6 +51,21 @@
     <article class="lane {% if lane.status == "failed" %}failed{% endif %}">
       <p><strong>{{ lane.title }}</strong> · <span class="lane-status-badge {{ lane.status_badge_class }}">{{ lane.status }}</span> · <code>{{ lane.entrypoint }}</code></p>
       <p class="muted">lane id <code>{{ lane.lane_id }}</code> · retries {{ lane.retry_count }} · queued {{ lane.created_at }}</p>
+      {% if lane.status == "queued" || lane.status == "running" %}
+      <p class="muted">state {{ lane.execution_reason_label }}</p>
+      {% endif %}
+      {% match lane.failure_kind_label %}
+      {% when Some with (failure_kind_label) %}
+      <p class="muted">failure classification {{ failure_kind_label }}</p>
+      {% when None %}{% endmatch %}
+      {% match lane.ci_target_key %}
+      {% when Some with (ci_target_key) %}
+      <p class="muted">target <code>{{ ci_target_key }}</code></p>
+      {% when None %}{% endmatch %}
+      {% match lane.target_health_summary %}
+      {% when Some with (target_health_summary) %}
+      <p class="muted">{{ target_health_summary }}</p>
+      {% when None %}{% endmatch %}
       {% match lane.operator_hint %}
       {% when Some with (operator_hint) %}
       <p class="muted">{{ operator_hint }}</p>
